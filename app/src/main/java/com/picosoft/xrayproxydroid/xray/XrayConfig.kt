@@ -29,6 +29,11 @@ object XrayConfig {
             "?sni=HL-FREEDOM-0.UNDEF.NETWORK&host=hl-freedom-0.undef.network" +
             "&security=tls&type=ws&path=%2Ff2fc2a1f#HLVPN_08-15EU_FREE"
 
+    /** Тестовая ss-ссылка (SIP002, base64 user-info) для проверки ShadowsocksParser. */
+    const val TEST_SS_LINK =
+        "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpXU3lMNFhUd05zZHY@108.181.121.226:8388" +
+            "?#%D0%94%D1%80%D1%83%D0%B3%D0%BE%D0%B5%2013"
+
     /** Тестовая vmess-ссылка (base64-JSON) для проверки VmessParser end-to-end. */
     const val TEST_VMESS_LINK =
         "vmess://ewogICJ2IjogIjIiLAogICJwcyI6ICJcdUQ4M0NcdURERURcdUQ4M0NcdURERjAgSG9uZyBLb25nLCBIb25nIEtvbmcgfCBbQkxdIiwKICAiYWRkIjogImNlMGdlZHB4d291NmNxb24udi4zZG5zLnZpcCIsCiAgInBvcnQiOiAiNDQzIiwKICAiaWQiOiAiZjIzYmI0MjdjMWY5NDM3Mzg3NmMyZjQzZTlmNzkwZjMiLAogICJhaWQiOiAiMCIsCiAgInNjeSI6ICJhdXRvIiwKICAibmV0IjogIndzIiwKICAidHlwZSI6ICJub25lIiwKICAiaG9zdCI6ICJjRTBnZWRQWHdPVTZjcW9OLnYuM2Rucy52aXAiLAogICJwYXRoIjogIi93cy12bWVzcyIsCiAgInRscyI6ICJ0bHMiLAogICJzbmkiOiAiY0UwZ2VkUFh3T1U2Y3FvTi52LjNkbnMudmlwIiwKICAiYWxwbiI6ICIiLAogICJmcCI6ICIiLAogICJpbnNlY3VyZSI6ICIwIiwKICAidmNuIjogIiIsCiAgInBjcyI6ICIiCn0="

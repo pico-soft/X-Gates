@@ -12,7 +12,7 @@ object ServerLinkParser {
         "vless://" to VlessParser,
         "trojan://" to TrojanParser,
         "vmess://" to VmessParser,
-        // "ss://"     to ShadowsocksParser,  // TODO
+        "ss://" to ShadowsocksParser,
     )
 
     private val KNOWN_UNSUPPORTED = setOf(

@@ -23,7 +23,7 @@ object XrayConfigBuilder {
             Protocol.VLESS -> vlessOutbound(p)
             Protocol.TROJAN -> trojanOutbound(p)
             Protocol.VMESS -> vmessOutbound(p)
-            else -> throw IllegalArgumentException("protocol not implemented yet: ${p.protocol}")
+            Protocol.SHADOWSOCKS -> shadowsocksOutbound(p)
         }
 
         return """
@@ -92,6 +92,22 @@ object XrayConfigBuilder {
                       { "id": ${j(p.credential)}, "alterId": 0, "security": ${j(p.method ?: "auto")}, "level": 0 }
                     ]
                   }
+                ]
+              },
+              "streamSettings": ${streamSettings(p)}
+            }
+        """.trimIndent()
+    }
+
+    private fun shadowsocksOutbound(p: ServerProfile): String {
+        // settings.servers с method+password; транспорт — чистый tcp.
+        return """
+            {
+              "tag": "proxy",
+              "protocol": "shadowsocks",
+              "settings": {
+                "servers": [
+                  { "address": ${j(p.address)}, "port": ${p.port}, "method": ${j(p.method ?: "")}, "password": ${j(p.credential)}, "level": 0 }
                 ]
               },
               "streamSettings": ${streamSettings(p)}
