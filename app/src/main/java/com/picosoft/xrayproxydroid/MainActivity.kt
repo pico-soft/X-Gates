@@ -41,8 +41,7 @@ import com.picosoft.xrayproxydroid.service.ProxyState
 import com.picosoft.xrayproxydroid.service.XrayProxyService
 import com.picosoft.xrayproxydroid.subscription.SubscriptionManager
 import com.picosoft.xrayproxydroid.ui.theme.XrayProxyDroidTheme
-import com.picosoft.xrayproxydroid.xray.ServerSpeedTester
-import com.picosoft.xrayproxydroid.xray.ServerTester
+import com.picosoft.xrayproxydroid.xray.FullTestRunner
 import com.picosoft.xrayproxydroid.xray.XrayConfigBuilder
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
 
@@ -63,11 +62,11 @@ class MainActivity : ComponentActivity() {
 private fun serverLabel(p: ServerProfile): String =
     "${p.protocol}  ·  ${p.remarks.ifBlank { p.address }}  ·  ${p.address}:${p.port}"
 
-/** Подпись задержки: "123 ms" / "✗" (мёртвый) / "—" (не тестирован). */
+/** Подпись задержки: "123 мс" / "✗" (мёртвый) / "—" (не тестирован). */
 private fun pingLabel(ms: Int?): String = when {
     ms == null -> "—"
     ms < 0 -> "✗"
-    else -> "$ms ms"
+    else -> "$ms мс"
 }
 
 /** Цвет задержки по порогам. */
@@ -79,11 +78,11 @@ private fun pingColor(ms: Int?): Color = when {
     else -> Color(0xFFBF360C)         // тёмно-оранжевый
 }
 
-/** Подпись скорости: "178.0 Mbps" / "✗" (0/ошибка) / "—" (не тестирован). */
+/** Подпись скорости: "178.0 Мбит/с" / "✗" (0/ошибка) / "—" (не тестирован). */
 private fun speedLabel(mbps: Double?): String = when {
     mbps == null -> "—"
     mbps <= 0 -> "✗"
-    else -> "$mbps Mbps"
+    else -> "$mbps Мбит/с"
 }
 
 /** Цвет скорости по порогам (Mbps): >5 зелёный, 1–5 оранжевый, <1 тёмно-оранжевый, ≤0 красный. */
@@ -107,16 +106,12 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     var servers by remember { mutableStateOf(SubscriptionManager.allServers(context)) }
 
     var pingResults by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
-    var testing by remember { mutableStateOf(false) }
-    var testProgress by remember { mutableStateOf("") }
-    var testHandle by remember { mutableStateOf<ServerTester.TestHandle?>(null) }
-    val pending = remember { LinkedHashMap<String, Int>() }
 
     var speedResults by remember { mutableStateOf<Map<String, Double>>(emptyMap()) }
-    var speedTesting by remember { mutableStateOf(false) }
-    var speedProgress by remember { mutableStateOf("") }
-    var speedHandle by remember { mutableStateOf<ServerSpeedTester.Handle?>(null) }
-    val speedPending = remember { LinkedHashMap<String, Double>() }
+
+    var fullTesting by remember { mutableStateOf(false) }
+    var fullPhase by remember { mutableStateOf("") }
+    var fullHandle by remember { mutableStateOf<FullTestRunner.Handle?>(null) }
 
     val notifPermLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -138,7 +133,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
 
     fun startServer(p: ServerProfile) {
         val cfg = runCatching { XrayConfigBuilder.build(p) }.getOrElse {
-            subStatus = "build error: ${it.message}"
+            subStatus = "ошибка конфига: ${it.message}"
             return
         }
         ensureNotifPermission()
@@ -149,108 +144,66 @@ private fun BootScreen(modifier: Modifier = Modifier) {
 
     fun onAddRefresh() {
         val url = subUrl.trim()
-        if (url.isEmpty()) { subStatus = "enter subscription url"; return }
-        subStatus = "fetching…"
+        if (url.isEmpty()) { subStatus = "введите адрес подписки"; return }
+        subStatus = "загрузка…"
         Thread {
             SubscriptionManager.add(context, url)
             val s = SubscriptionManager.refresh(context, url)
             activity.runOnUiThread {
-                subStatus = if (s.ok) "added=${s.added}  dup=${s.duplicates}  unsupported=${s.unsupported}  invalid=${s.invalid}"
-                            else "error: ${s.error}"
+                subStatus = if (s.ok) "добавлено=${s.added}  дубли=${s.duplicates}  неподдерж=${s.unsupported}  ошибок=${s.invalid}"
+                            else "ошибка: ${s.error}"
                 reloadServers()
             }
         }.start()
     }
 
-    fun flushPending() {
-        val batch = synchronized(pending) { HashMap(pending).also { pending.clear() } }
-        if (batch.isNotEmpty()) Thread { SubscriptionManager.applyPingResults(context, batch) }.start()
-    }
+    // Полный адаптивный тест: ping → speed по живым → early-connect первого рабочего → апгрейд.
+    fun onFullTest() {
+        if (fullTesting) return
+        val all = servers
+        if (all.isEmpty()) { subStatus = "нет серверов"; return }
+        fullTesting = true
+        fullPhase = "запуск…"
+        pingResults = emptyMap(); speedResults = emptyMap()
 
-    fun flushSpeedPending() {
-        val batch = synchronized(speedPending) { HashMap(speedPending).also { speedPending.clear() } }
-        if (batch.isNotEmpty()) Thread { SubscriptionManager.applySpeedResults(context, batch) }.start()
-    }
-
-    // Батч скорости: top-20 живых по пингу (pingMs>=0, возр. пинга), ПОСЛЕДОВАТЕЛЬНО.
-    fun onTestSpeed() {
-        if (speedTesting) return
-        val top = servers.filter { (effPing(it) ?: -1) >= 0 }.sortedBy { effPing(it) }.take(20)
-        if (top.isEmpty()) { subStatus = "no alive server — run Test all (ping) first"; return }
-        speedTesting = true
-        speedProgress = "0 / ${top.size}"
-        speedResults = emptyMap()
-        synchronized(speedPending) { speedPending.clear() }
-
-        speedHandle = ServerSpeedTester.testAll(
+        fullHandle = FullTestRunner.run(
             context = context,
-            servers = top,
-            onResult = { p, mbps ->
-                val key = SubscriptionManager.serverKey(p)
-                activity.runOnUiThread { speedResults = speedResults + (key to mbps) }
-                val flush = synchronized(speedPending) { speedPending[key] = mbps; speedPending.size >= 10 }
-                if (flush) flushSpeedPending()
+            allServers = all,
+            onPhase = { ph -> activity.runOnUiThread { fullPhase = ph } },
+            onPingResult = { p, ms ->
+                activity.runOnUiThread { pingResults = pingResults + (SubscriptionManager.serverKey(p) to ms) }
             },
-            onProgress = { done, total -> activity.runOnUiThread { speedProgress = "$done / $total" } },
-            onFinish = {
-                flushSpeedPending()
-                Thread.sleep(150)
+            onSpeedResult = { p, mbps ->
+                activity.runOnUiThread { speedResults = speedResults + (SubscriptionManager.serverKey(p) to mbps) }
+            },
+            connect = { p -> activity.runOnUiThread { startServer(p) } },
+            onDone = { r ->
                 activity.runOnUiThread {
-                    speedTesting = false; speedProgress = "done"; speedHandle = null
-                    reloadServers()
+                    val pSnap = pingResults; val sSnap = speedResults        // снимок state на main
+                    Thread {
+                        SubscriptionManager.applyPingResults(context, pSnap) // персист пинга
+                        SubscriptionManager.applySpeedResults(context, sSnap) // персист скорости
+                        activity.runOnUiThread {
+                            fullTesting = false; fullHandle = null
+                            fullPhase = if (r.cancelled) "отменено"
+                                else "готово: быстрейший ${r.fastest?.remarks?.ifBlank { r.fastest.address } ?: "—"} ${r.fastestMbps} Мбит/с"
+                            reloadServers()
+                        }
+                    }.start()
                 }
-            }
+            },
         )
     }
 
-    fun onCancelSpeed() {
-        speedHandle?.cancel(); speedHandle = null
-        speedTesting = false; speedProgress = "cancelled"
-        flushSpeedPending()
-        Thread { Thread.sleep(150); activity.runOnUiThread { reloadServers() } }.start()
-    }
-
-    fun onTestAll() {
-        if (testing) return
-        val list = servers
-        if (list.isEmpty()) { subStatus = "no servers"; return }
-        testing = true
-        testProgress = "0 / ${list.size}"
-        pingResults = emptyMap()
-        synchronized(pending) { pending.clear() }
-
-        testHandle = ServerTester.testAll(
-            context = context,
-            servers = list,
-            concurrency = 8,
-            onResult = { p, ms ->
-                val key = SubscriptionManager.serverKey(p)
-                val v = ms.toInt()
-                activity.runOnUiThread { pingResults = pingResults + (key to v) }
-                val flush = synchronized(pending) { pending[key] = v; pending.size >= 20 }
-                if (flush) flushPending()
-            },
-            onProgress = { done, total ->
-                activity.runOnUiThread { testProgress = "$done / $total" }
-            },
-            onFinish = {
-                flushPending()
-                Thread.sleep(150)
-                activity.runOnUiThread {
-                    testing = false; testProgress = "done"; testHandle = null
-                    reloadServers()
-                }
-            }
-        )
-    }
-
-    fun onCancelTest() {
-        testHandle?.cancel()
-        testHandle = null
-        testing = false
-        testProgress = "cancelled"
-        flushPending()
-        Thread { Thread.sleep(150); activity.runOnUiThread { reloadServers() } }.start()
+    fun onCancelFull() {
+        fullHandle?.cancel(); fullHandle = null
+        fullTesting = false; fullPhase = "отменено"
+        val pSnap = pingResults; val sSnap = speedResults
+        Thread {
+            SubscriptionManager.applyPingResults(context, pSnap)
+            SubscriptionManager.applySpeedResults(context, sSnap)
+            activity.runOnUiThread { reloadServers() }
+        }.start()
     }
 
     // Сортировка как Termux sort_servers_by_speed: скорость>0 (убыв.) → живые по пингу (возр.) → остальные.
@@ -279,50 +232,39 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         OutlinedTextField(
             value = subUrl,
             onValueChange = { subUrl = it },
-            label = { Text("subscription url") },
+            label = { Text("Адрес подписки") },
             singleLine = true,
             modifier = Modifier.fillMaxWidth()
         )
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Button(onClick = { onAddRefresh() }) { Text("Add & refresh") }
-            Button(onClick = { reloadServers() }) { Text("Reload") }
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Button(onClick = { onAddRefresh() }) { Text("Обновить подписку") }
+            Text("серверов: ${servers.size}", style = MaterialTheme.typography.bodyMedium)
         }
         if (subStatus.isNotEmpty()) Text(subStatus, style = MaterialTheme.typography.bodySmall)
 
-        // Test all / Cancel — кнопка отдельно, прогресс/счётчик отдельным текстом.
+        // Полный адаптивный тест — одной кнопкой (пинг → скорость → авто-подключение → апгрейд).
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            if (testing) {
-                Button(onClick = { onCancelTest() }) { Text("Cancel") }
-                Text("ping $testProgress", style = MaterialTheme.typography.titleMedium)
+            if (fullTesting) {
+                Button(onClick = { onCancelFull() }) { Text("Прервать тест") }
             } else {
-                Button(onClick = { onTestAll() }) { Text("Test all (ping)") }
-                Text("servers: ${servers.size}", style = MaterialTheme.typography.bodyMedium)
+                Button(onClick = { onFullTest() }) { Text("Полный тест") }
             }
-        }
-
-        // Test speed (top-20 живых по пингу) / Cancel — отдельный ряд.
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            if (speedTesting) {
-                Button(onClick = { onCancelSpeed() }) { Text("Cancel") }
-                Text("speed $speedProgress", style = MaterialTheme.typography.titleMedium)
-            } else {
-                Button(onClick = { onTestSpeed() }) { Text("Test speed (top-20)") }
-            }
+            Text(fullPhase, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
         }
 
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Button(onClick = { onStop() }) { Text("Stop") }
+            Button(onClick = { onStop() }) { Text("Стоп") }
             Text(
-                "running: ${proxy.running}" + (proxy.label?.let { "  ·  $it" } ?: ""),
+                "статус: ${if (proxy.running) "активен" else "остановлен"}" + (proxy.label?.let { "  ·  $it" } ?: ""),
                 style = MaterialTheme.typography.bodySmall,
                 modifier = Modifier.weight(1f)
             )
@@ -376,7 +318,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                         }
                     }
                     Button(onClick = { startServer(p) }) {
-                        Text(if (isActive) "running" else "Start")
+                        Text(if (isActive) "активен" else "Подключить")
                     }
                 }
             }

@@ -37,8 +37,8 @@ object NotificationHelper {
 
         return NotificationCompat.Builder(service, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_proxy)
-            .setContentTitle("Proxy active")
-            .setContentText(label ?: "xray running")
+            .setContentTitle("Прокси активен")
+            .setContentText(label ?: "xray работает")
             .setOngoing(true)
             .setShowWhen(false)
             .setOnlyAlertOnce(true)
@@ -46,7 +46,7 @@ object NotificationHelper {
             // Минуем Android 12+ FGS deferral — показываем нотификацию сразу.
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setContentIntent(contentIntent)
-            .addAction(0, "Stop", stopIntent)
+            .addAction(0, "Стоп", stopIntent)
             .build()
     }
 
