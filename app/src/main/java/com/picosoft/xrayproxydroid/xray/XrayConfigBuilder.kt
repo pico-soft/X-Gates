@@ -16,26 +16,51 @@ object XrayConfigBuilder {
     /** Транспорты, которые умеем собирать сейчас (xhttp/kcp/quic — отложены). */
     private val SUPPORTED_NETWORKS = setOf("tcp", "ws", "grpc")
 
-    fun build(p: ServerProfile): String {
-        require(p.network in SUPPORTED_NETWORKS) { "unsupported transport: ${p.network}" }
+    /** Боевой конфиг: общий inbound (socks 10815 + http 10816) + outbound сервера. */
+    fun build(p: ServerProfile): String = """
+        {
+          "log": { "loglevel": "warning" },
+          ${XrayConfig.inbounds()},
+          "outbounds": [
+            ${outboundFor(p)},
+            { "tag": "direct", "protocol": "freedom" }
+          ]
+        }
+    """.trimIndent()
 
-        val outbound = when (p.protocol) {
+    /**
+     * Конфиг для throughput-теста: ЕДИНСТВЕННЫЙ socks-inbound на переданном ЭФЕМЕРНОМ порту
+     * (НЕ 10815/10816 — чтобы temp-инстанс не конфликтовал с активным прокси) + outbound сервера.
+     * Поднимается локальным CoreController, качаем пробник через этот socks, затем stopLoop.
+     */
+    fun buildForSpeedTest(p: ServerProfile, socksPort: Int): String = """
+        {
+          "log": { "loglevel": "warning" },
+          "inbounds": [
+            {
+              "tag": "socks-in",
+              "listen": "127.0.0.1",
+              "port": $socksPort,
+              "protocol": "socks",
+              "settings": { "auth": "noauth", "udp": true }
+            }
+          ],
+          "outbounds": [
+            ${outboundFor(p)},
+            { "tag": "direct", "protocol": "freedom" }
+          ]
+        }
+    """.trimIndent()
+
+    /** Outbound сервера по протоколу (единый для боевого и speed-test конфигов). */
+    private fun outboundFor(p: ServerProfile): String {
+        require(p.network in SUPPORTED_NETWORKS) { "unsupported transport: ${p.network}" }
+        return when (p.protocol) {
             Protocol.VLESS -> vlessOutbound(p)
             Protocol.TROJAN -> trojanOutbound(p)
             Protocol.VMESS -> vmessOutbound(p)
             Protocol.SHADOWSOCKS -> shadowsocksOutbound(p)
         }
-
-        return """
-            {
-              "log": { "loglevel": "warning" },
-              ${XrayConfig.inbounds()},
-              "outbounds": [
-                $outbound,
-                { "tag": "direct", "protocol": "freedom" }
-              ]
-            }
-        """.trimIndent()
     }
 
     // --- outbound по протоколу (единый vnext/users для vless+vmess) ---

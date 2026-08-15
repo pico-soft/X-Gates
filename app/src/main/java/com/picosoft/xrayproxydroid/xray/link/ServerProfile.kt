@@ -57,6 +57,11 @@ data class ServerProfile(
     // --- результаты теста задержки (динамика; backward-compat: дефолты + ignoreUnknownKeys) ---
     /** Задержка real ping в мс; ≥0 — жив, -1 — мёртвый, null — не тестировался. */
     val pingMs: Int? = null,
-    /** Метка времени последнего замера ("yyyy-MM-dd HH:mm"); null — не тестировался. */
+    /** Метка времени последнего пинг-замера ("yyyy-MM-dd HH:mm"); null — не тестировался. */
     val lastTestedTs: String? = null,
+
+    /** Пропускная способность туннеля в Mbps; >0 — скорость, 0 — нет throughput, -1 — ошибка, null — не тестировался. */
+    val speedMbps: Double? = null,
+    /** Метка времени последнего замера скорости; null — не тестировался. */
+    val speedTestedTs: String? = null,
 )

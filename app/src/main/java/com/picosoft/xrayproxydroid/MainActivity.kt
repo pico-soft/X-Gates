@@ -41,6 +41,7 @@ import com.picosoft.xrayproxydroid.service.ProxyState
 import com.picosoft.xrayproxydroid.service.XrayProxyService
 import com.picosoft.xrayproxydroid.subscription.SubscriptionManager
 import com.picosoft.xrayproxydroid.ui.theme.XrayProxyDroidTheme
+import com.picosoft.xrayproxydroid.xray.ServerSpeedTester
 import com.picosoft.xrayproxydroid.xray.ServerTester
 import com.picosoft.xrayproxydroid.xray.XrayConfigBuilder
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
@@ -78,6 +79,22 @@ private fun pingColor(ms: Int?): Color = when {
     else -> Color(0xFFBF360C)         // тёмно-оранжевый
 }
 
+/** Подпись скорости: "178.0 Mbps" / "✗" (0/ошибка) / "—" (не тестирован). */
+private fun speedLabel(mbps: Double?): String = when {
+    mbps == null -> "—"
+    mbps <= 0 -> "✗"
+    else -> "$mbps Mbps"
+}
+
+/** Цвет скорости по порогам (Mbps): >5 зелёный, 1–5 оранжевый, <1 тёмно-оранжевый, ≤0 красный. */
+private fun speedColor(mbps: Double?): Color = when {
+    mbps == null -> Color(0xFF9E9E9E)  // серый — не тестирован
+    mbps <= 0 -> Color(0xFFD32F2F)     // красный — нет throughput/ошибка
+    mbps < 1 -> Color(0xFFBF360C)      // тёмно-оранжевый
+    mbps < 5 -> Color(0xFFF57C00)      // оранжевый
+    else -> Color(0xFF2E7D32)          // зелёный
+}
+
 @Composable
 private fun BootScreen(modifier: Modifier = Modifier) {
     val context = LocalContext.current
@@ -95,6 +112,12 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     var testHandle by remember { mutableStateOf<ServerTester.TestHandle?>(null) }
     val pending = remember { LinkedHashMap<String, Int>() }
 
+    var speedResults by remember { mutableStateOf<Map<String, Double>>(emptyMap()) }
+    var speedTesting by remember { mutableStateOf(false) }
+    var speedProgress by remember { mutableStateOf("") }
+    var speedHandle by remember { mutableStateOf<ServerSpeedTester.Handle?>(null) }
+    val speedPending = remember { LinkedHashMap<String, Double>() }
+
     val notifPermLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { }
@@ -111,6 +134,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     fun reloadServers() { servers = SubscriptionManager.allServers(context) }
 
     fun effPing(p: ServerProfile): Int? = pingResults[SubscriptionManager.serverKey(p)] ?: p.pingMs
+    fun effSpeed(p: ServerProfile): Double? = speedResults[SubscriptionManager.serverKey(p)] ?: p.speedMbps
 
     fun startServer(p: ServerProfile) {
         val cfg = runCatching { XrayConfigBuilder.build(p) }.getOrElse {
@@ -141,6 +165,49 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     fun flushPending() {
         val batch = synchronized(pending) { HashMap(pending).also { pending.clear() } }
         if (batch.isNotEmpty()) Thread { SubscriptionManager.applyPingResults(context, batch) }.start()
+    }
+
+    fun flushSpeedPending() {
+        val batch = synchronized(speedPending) { HashMap(speedPending).also { speedPending.clear() } }
+        if (batch.isNotEmpty()) Thread { SubscriptionManager.applySpeedResults(context, batch) }.start()
+    }
+
+    // Батч скорости: top-20 живых по пингу (pingMs>=0, возр. пинга), ПОСЛЕДОВАТЕЛЬНО.
+    fun onTestSpeed() {
+        if (speedTesting) return
+        val top = servers.filter { (effPing(it) ?: -1) >= 0 }.sortedBy { effPing(it) }.take(20)
+        if (top.isEmpty()) { subStatus = "no alive server — run Test all (ping) first"; return }
+        speedTesting = true
+        speedProgress = "0 / ${top.size}"
+        speedResults = emptyMap()
+        synchronized(speedPending) { speedPending.clear() }
+
+        speedHandle = ServerSpeedTester.testAll(
+            context = context,
+            servers = top,
+            onResult = { p, mbps ->
+                val key = SubscriptionManager.serverKey(p)
+                activity.runOnUiThread { speedResults = speedResults + (key to mbps) }
+                val flush = synchronized(speedPending) { speedPending[key] = mbps; speedPending.size >= 10 }
+                if (flush) flushSpeedPending()
+            },
+            onProgress = { done, total -> activity.runOnUiThread { speedProgress = "$done / $total" } },
+            onFinish = {
+                flushSpeedPending()
+                Thread.sleep(150)
+                activity.runOnUiThread {
+                    speedTesting = false; speedProgress = "done"; speedHandle = null
+                    reloadServers()
+                }
+            }
+        )
+    }
+
+    fun onCancelSpeed() {
+        speedHandle?.cancel(); speedHandle = null
+        speedTesting = false; speedProgress = "cancelled"
+        flushSpeedPending()
+        Thread { Thread.sleep(150); activity.runOnUiThread { reloadServers() } }.start()
     }
 
     fun onTestAll() {
@@ -186,13 +253,21 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         Thread { Thread.sleep(150); activity.runOnUiThread { reloadServers() } }.start()
     }
 
-    // Живая сортировка: живые по возрастанию мс, затем мёртвые, затем непротестированные.
-    val shown = servers.sortedWith(
-        compareBy(
-            { val m = effPing(it); if (m == null) 2 else if (m < 0) 1 else 0 },
-            { effPing(it)?.takeIf { v -> v >= 0 } ?: Int.MAX_VALUE }
-        )
-    )
+    // Сортировка как Termux sort_servers_by_speed: скорость>0 (убыв.) → живые по пингу (возр.) → остальные.
+    val shown = servers.sortedWith(Comparator { a, b ->
+        fun rank(p: ServerProfile): Int {
+            val s = effSpeed(p) ?: 0.0
+            val pg = effPing(p) ?: -1
+            return if (s > 0) 0 else if (pg >= 0) 1 else 2
+        }
+        val ra = rank(a); val rb = rank(b)
+        if (ra != rb) ra - rb
+        else when (ra) {
+            0 -> effSpeed(b)!!.compareTo(effSpeed(a)!!)   // скорость убыв.
+            1 -> effPing(a)!!.compareTo(effPing(b)!!)     // пинг возр.
+            else -> 0
+        }
+    })
 
     Column(
         modifier = modifier
@@ -221,10 +296,23 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         ) {
             if (testing) {
                 Button(onClick = { onCancelTest() }) { Text("Cancel") }
-                Text(testProgress, style = MaterialTheme.typography.titleMedium)
+                Text("ping $testProgress", style = MaterialTheme.typography.titleMedium)
             } else {
-                Button(onClick = { onTestAll() }) { Text("Test all") }
+                Button(onClick = { onTestAll() }) { Text("Test all (ping)") }
                 Text("servers: ${servers.size}", style = MaterialTheme.typography.bodyMedium)
+            }
+        }
+
+        // Test speed (top-20 живых по пингу) / Cancel — отдельный ряд.
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            if (speedTesting) {
+                Button(onClick = { onCancelSpeed() }) { Text("Cancel") }
+                Text("speed $speedProgress", style = MaterialTheme.typography.titleMedium)
+            } else {
+                Button(onClick = { onTestSpeed() }) { Text("Test speed (top-20)") }
             }
         }
 
@@ -254,6 +342,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                 val label = serverLabel(p)
                 val isActive = proxy.running && proxy.label == label
                 val ms = effPing(p)
+                val sp = effSpeed(p)
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -267,21 +356,25 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text((if (isActive) "● " else "") + label)
-                        p.lastTestedTs?.let {
+                        // Метрики: пинг + скорость (крупные, жирные, цветные) + время.
+                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                             Text(
-                                it,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = Color(0xFF9E9E9E)
+                                pingLabel(ms),
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = pingColor(ms)
                             )
+                            Text(
+                                speedLabel(sp),
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = speedColor(sp)
+                            )
+                            (p.speedTestedTs ?: p.lastTestedTs)?.let {
+                                Text(it, style = MaterialTheme.typography.bodySmall, color = Color(0xFF9E9E9E))
+                            }
                         }
                     }
-                    // Пинг — крупный, жирный, цветной.
-                    Text(
-                        text = pingLabel(ms),
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = pingColor(ms)
-                    )
                     Button(onClick = { startServer(p) }) {
                         Text(if (isActive) "running" else "Start")
                     }
