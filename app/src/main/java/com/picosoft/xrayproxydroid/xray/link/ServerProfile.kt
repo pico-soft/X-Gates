@@ -53,4 +53,10 @@ data class ServerProfile(
 
     /** Исходная ссылка — для отладки/переэкспорта. */
     val raw: String = "",
+
+    // --- результаты теста задержки (динамика; backward-compat: дефолты + ignoreUnknownKeys) ---
+    /** Задержка real ping в мс; ≥0 — жив, -1 — мёртвый, null — не тестировался. */
+    val pingMs: Int? = null,
+    /** Метка времени последнего замера ("yyyy-MM-dd HH:mm"); null — не тестировался. */
+    val lastTestedTs: String? = null,
 )

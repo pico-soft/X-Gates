@@ -28,12 +28,11 @@ object XrayController {
         get() = controller?.isRunning == true
 
     /**
-     * Инициализация окружения libv2ray. Вызывается один раз, идемпотентна.
-     * assetPath указываем на filesDir — для freedom-конфига geo-файлы не нужны,
-     * но initCoreEnv ожидает валидный путь.
+     * Инициализация окружения libv2ray. Идемпотентна, потокобезопасна.
+     * Нужна и для start(), и для measureOutboundDelay() (замер требует env даже без запущенного прокси).
      */
     @Synchronized
-    private fun initEnv(context: Context) {
+    fun ensureEnv(context: Context) {
         if (envInitialized) return
         Seq.setContext(context.applicationContext)
         Libv2ray.initCoreEnv(context.filesDir.absolutePath, "")
@@ -49,7 +48,7 @@ object XrayController {
     @Synchronized
     fun start(context: Context, configJson: String): Boolean {
         if (isRunning) return true
-        initEnv(context)
+        ensureEnv(context)
         val core = Libv2ray.newCoreController(CoreCallback())
         controller = core
         core.startLoop(configJson, NO_TUN_FD)
@@ -67,6 +66,26 @@ object XrayController {
             Log.w(TAG, "stopLoop error", e)
         } finally {
             controller = null
+        }
+    }
+
+    /**
+     * Real ping: задержка через outbound переданного конфига БЕЗ запуска loop.
+     * `Libv2ray.measureOutboundDelay` обнуляет inbounds и поднимает временный инстанс —
+     * не трогает активный прокси и не занимает порты, потому безопасно и параллельно.
+     *
+     * НЕ @Synchronized — чтобы батч из нескольких замеров шёл параллельно; env-init внутри
+     * ([ensureEnv]) потокобезопасен сам по себе.
+     *
+     * @return задержку в мс (≥0) или -1 при недоступности/ошибке (мёртвый сервер).
+     */
+    fun measureOutboundDelay(context: Context, configJson: String, url: String): Long {
+        ensureEnv(context)
+        return try {
+            Libv2ray.measureOutboundDelay(configJson, url)
+        } catch (e: Exception) {
+            Log.d(TAG, "measureOutboundDelay failed: ${e.message}")
+            -1L
         }
     }
 
