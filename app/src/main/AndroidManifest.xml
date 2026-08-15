@@ -5,6 +5,12 @@
     <!-- Required for xray to create/listen on TCP sockets (inet GID); without it socket() → EPERM -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Foreground service, чтобы xray жил в фоне (non-VPN, тип specialUse) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Runtime на Android 13+ (при отказе прокси работает, нотификация скрыта) -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -26,6 +32,15 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name=".service.XrayProxyService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Local SOCKS/HTTP proxy (xray-core), no VpnService" />
+        </service>
     </application>
 
 </manifest>
