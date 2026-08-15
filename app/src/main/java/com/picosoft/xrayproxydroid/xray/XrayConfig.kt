@@ -17,6 +17,18 @@ object XrayConfig {
     /** Слушаем только петлю — модель локального прокси, без VpnService. */
     const val LISTEN = "127.0.0.1"
 
+    /** Тестовая vless-ссылка для проверки парсера end-to-end (тот же сервер, что в Этапе 2). */
+    const val TEST_VLESS_LINK =
+        "vless://13a0205c-107a-4c7a-954e-2b5fcb235449@polniybak.info:443" +
+            "?encryption=none&security=tls&sni=polniybak.info&fp=firefox" +
+            "&type=ws&path=%2Fnotvlessklyanus#polniybak-test"
+
+    /** Тестовая trojan-ссылка для проверки TrojanParser end-to-end. */
+    const val TEST_TROJAN_LINK =
+        "trojan://XZixM2ikOov3k4fSfAEF4Z6d4@hl-freedom-0.undef.network:443" +
+            "?sni=HL-FREEDOM-0.UNDEF.NETWORK&host=hl-freedom-0.undef.network" +
+            "&security=tls&type=ws&path=%2Ff2fc2a1f#HLVPN_08-15EU_FREE"
+
     // --- Захардкоженный тестовый VLESS-сервер (парсер vless:// будет отдельным этапом) ---
     // vless://…@polniybak.info:443?encryption=none&security=tls&sni=polniybak.info
     //          &fp=firefox&type=ws&path=%2Fnotvlessklyanus
@@ -36,7 +48,7 @@ object XrayConfig {
      * Общая inbound-часть: socks на SOCKS_PORT + http на HTTP_PORT, оба на 127.0.0.1.
      * Идентична для обоих режимов, чтобы сравнивать только outbound.
      */
-    private fun inbounds(): String = """
+    internal fun inbounds(): String = """
         "inbounds": [
           {
             "tag": "socks-in",

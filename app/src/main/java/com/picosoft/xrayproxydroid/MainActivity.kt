@@ -1,6 +1,7 @@
 package com.picosoft.xrayproxydroid
 
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -22,7 +23,10 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.picosoft.xrayproxydroid.ui.theme.XrayProxyDroidTheme
 import com.picosoft.xrayproxydroid.xray.XrayConfig
+import com.picosoft.xrayproxydroid.xray.XrayConfigBuilder
 import com.picosoft.xrayproxydroid.xray.XrayController
+import com.picosoft.xrayproxydroid.xray.link.ParseResult
+import com.picosoft.xrayproxydroid.xray.link.ServerLinkParser
 import java.net.InetSocketAddress
 import java.net.Socket
 
@@ -80,6 +84,24 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         }.start()
     }
 
+    // Прогон реальной ссылки через весь конвейер: parse → build → start.
+    fun onStartFromLink(link: String) {
+        when (val r = ServerLinkParser.parse(link)) {
+            is ParseResult.Supported -> {
+                runCatching { XrayConfigBuilder.build(r.profile) }.fold(
+                    onSuccess = { cfg ->
+                        // Лог для сравнения глазами с хардкод-конфигом Этапа 2 (XrayConfig.vlessConfigJson).
+                        Log.i("XrayLink", "generated config from link:\n$cfg")
+                        onStart("link:${r.profile.protocol.name.lowercase()}", cfg)
+                    },
+                    onFailure = { status = "build error: ${it.message}" }
+                )
+            }
+            is ParseResult.Unsupported -> status = "unsupported: ${r.scheme} (needs sing-box)"
+            is ParseResult.Invalid -> status = "invalid link: ${r.reason}"
+        }
+    }
+
     fun onStop() {
         status = "stopping…"
         Thread {
@@ -104,6 +126,10 @@ private fun BootScreen(modifier: Modifier = Modifier) {
             Button(onClick = { onStart("vless", XrayConfig.vlessConfigJson()) }) {
                 Text("Start vless")
             }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Button(onClick = { onStartFromLink(XrayConfig.TEST_VLESS_LINK) }) { Text("Start from link") }
+            Button(onClick = { onStartFromLink(XrayConfig.TEST_TROJAN_LINK) }) { Text("Start trojan link") }
         }
         Button(onClick = { onStop() }) { Text("Stop") }
         Text("running: $running   mode: $mode")
