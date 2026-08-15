@@ -1,6 +1,7 @@
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.kotlin.serialization)
 }
 
 android {
@@ -48,6 +49,9 @@ android {
 dependencies {
     // xray-core wrapper (AndroidLibXrayLite), prebuilt AAR from GitHub releases.
     implementation(files("libs/libv2ray.aar"))
+
+    // Хранение подписок/серверов в JSON (filesDir).
+    implementation(libs.kotlinx.serialization.json)
 
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.activity.compose)
