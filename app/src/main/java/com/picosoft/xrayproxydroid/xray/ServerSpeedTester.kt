@@ -11,6 +11,7 @@ import java.net.Proxy
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URL
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.roundToInt
 
 /**
@@ -103,6 +104,44 @@ object ServerSpeedTester {
             return -1.0
         } finally {
             try { core.stopLoop() } catch (e: Exception) { /* ignore */ }
+        }
+    }
+
+    interface Handle {
+        fun cancel()
+    }
+
+    /**
+     * Батч скорости — ПОСЛЕДОВАТЕЛЬНО (каждый замер насыщает канал → параллель исказит).
+     * Прогрессивный [onResult] на каждый сервер сразу; [onProgress]; по завершении [onFinish].
+     * Отмена ([Handle.cancel]) — флаг между серверами (текущий замер доработает свои ~6с).
+     * Колбэки на фоновом потоке — UI-маршалинг на вызывающем.
+     */
+    fun testAll(
+        context: Context,
+        servers: List<ServerProfile>,
+        warmupMs: Int = DEFAULT_WARMUP_MS,
+        measureMs: Int = DEFAULT_MEASURE_MS,
+        onResult: (ServerProfile, Double) -> Unit,
+        onProgress: (done: Int, total: Int) -> Unit,
+        onFinish: () -> Unit = {},
+    ): Handle {
+        val appCtx = context.applicationContext
+        val cancelled = AtomicBoolean(false)
+        val total = servers.size
+        Thread {
+            var done = 0
+            for (p in servers) {
+                if (cancelled.get()) break
+                val mbps = measureSpeed(appCtx, p, warmupMs, measureMs)
+                if (cancelled.get()) break
+                onResult(p, mbps)
+                onProgress(++done, total)
+            }
+            if (!cancelled.get()) onFinish()
+        }.start()
+        return object : Handle {
+            override fun cancel() { cancelled.set(true) }
         }
     }
 

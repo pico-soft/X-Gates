@@ -68,6 +68,20 @@ object SubscriptionManager {
         SubscriptionStore.save(context, updated)
     }
 
+    /** Пакетно применить скорости (ключ→Mbps) и сохранить один раз. Аналог [applyPingResults]. */
+    fun applySpeedResults(context: Context, speedByKey: Map<String, Double>) {
+        if (speedByKey.isEmpty()) return
+        val ts = now()
+        val subs = SubscriptionStore.load(context)
+        val updated = subs.map { sub ->
+            sub.copy(servers = sub.servers.map { s ->
+                val mbps = speedByKey[serverKey(s)]
+                if (mbps != null) s.copy(speedMbps = mbps, speedTestedTs = ts) else s
+            })
+        }
+        SubscriptionStore.save(context, updated)
+    }
+
     /** Добавить подписку (dedup по url). Имя по умолчанию — из URL. true если добавили. */
     fun add(context: Context, url: String, name: String? = null): Boolean {
         val u = url.trim()
