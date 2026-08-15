@@ -22,6 +22,7 @@ object XrayConfigBuilder {
         val outbound = when (p.protocol) {
             Protocol.VLESS -> vlessOutbound(p)
             Protocol.TROJAN -> trojanOutbound(p)
+            Protocol.VMESS -> vmessOutbound(p)
             else -> throw IllegalArgumentException("protocol not implemented yet: ${p.protocol}")
         }
 
@@ -69,6 +70,28 @@ object XrayConfigBuilder {
               "settings": {
                 "servers": [
                   { "address": ${j(p.address)}, "port": ${p.port}, "password": ${j(p.credential)}, "level": 0 }
+                ]
+              },
+              "streamSettings": ${streamSettings(p)}
+            }
+        """.trimIndent()
+    }
+
+    private fun vmessOutbound(p: ServerProfile): String {
+        // Единый vnext/users (как vless), но с alterId:0 (AEAD) и security = шифр (scy).
+        return """
+            {
+              "tag": "proxy",
+              "protocol": "vmess",
+              "settings": {
+                "vnext": [
+                  {
+                    "address": ${j(p.address)},
+                    "port": ${p.port},
+                    "users": [
+                      { "id": ${j(p.credential)}, "alterId": 0, "security": ${j(p.method ?: "auto")}, "level": 0 }
+                    ]
+                  }
                 ]
               },
               "streamSettings": ${streamSettings(p)}

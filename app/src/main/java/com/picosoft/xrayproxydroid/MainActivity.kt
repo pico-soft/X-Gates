@@ -131,6 +131,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
             Button(onClick = { onStartFromLink(XrayConfig.TEST_VLESS_LINK) }) { Text("Start from link") }
             Button(onClick = { onStartFromLink(XrayConfig.TEST_TROJAN_LINK) }) { Text("Start trojan link") }
         }
+        Button(onClick = { onStartFromLink(XrayConfig.TEST_VMESS_LINK) }) { Text("Start vmess link") }
         Button(onClick = { onStop() }) { Text("Stop") }
         Text("running: $running   mode: $mode")
         Text(status)

@@ -11,7 +11,7 @@ object ServerLinkParser {
     private val SUPPORTED: Map<String, LinkParser> = mapOf(
         "vless://" to VlessParser,
         "trojan://" to TrojanParser,
-        // "vmess://"  to VmessParser,        // TODO
+        "vmess://" to VmessParser,
         // "ss://"     to ShadowsocksParser,  // TODO
     )
 

@@ -29,6 +29,10 @@ object XrayConfig {
             "?sni=HL-FREEDOM-0.UNDEF.NETWORK&host=hl-freedom-0.undef.network" +
             "&security=tls&type=ws&path=%2Ff2fc2a1f#HLVPN_08-15EU_FREE"
 
+    /** Тестовая vmess-ссылка (base64-JSON) для проверки VmessParser end-to-end. */
+    const val TEST_VMESS_LINK =
+        "vmess://ewogICJ2IjogIjIiLAogICJwcyI6ICJcdUQ4M0NcdURERURcdUQ4M0NcdURERjAgSG9uZyBLb25nLCBIb25nIEtvbmcgfCBbQkxdIiwKICAiYWRkIjogImNlMGdlZHB4d291NmNxb24udi4zZG5zLnZpcCIsCiAgInBvcnQiOiAiNDQzIiwKICAiaWQiOiAiZjIzYmI0MjdjMWY5NDM3Mzg3NmMyZjQzZTlmNzkwZjMiLAogICJhaWQiOiAiMCIsCiAgInNjeSI6ICJhdXRvIiwKICAibmV0IjogIndzIiwKICAidHlwZSI6ICJub25lIiwKICAiaG9zdCI6ICJjRTBnZWRQWHdPVTZjcW9OLnYuM2Rucy52aXAiLAogICJwYXRoIjogIi93cy12bWVzcyIsCiAgInRscyI6ICJ0bHMiLAogICJzbmkiOiAiY0UwZ2VkUFh3T1U2Y3FvTi52LjNkbnMudmlwIiwKICAiYWxwbiI6ICIiLAogICJmcCI6ICIiLAogICJpbnNlY3VyZSI6ICIwIiwKICAidmNuIjogIiIsCiAgInBjcyI6ICIiCn0="
+
     // --- Захардкоженный тестовый VLESS-сервер (парсер vless:// будет отдельным этапом) ---
     // vless://…@polniybak.info:443?encryption=none&security=tls&sni=polniybak.info
     //          &fp=firefox&type=ws&path=%2Fnotvlessklyanus
