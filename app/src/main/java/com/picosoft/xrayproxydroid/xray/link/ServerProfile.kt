@@ -1,12 +1,17 @@
 package com.picosoft.xrayproxydroid.xray.link
 
+import kotlinx.serialization.Serializable
+
 /** Протоколы, которые исполняет наш xray-core. Hysteria2/TUIC сюда НЕ входят (sing-box, будущий этап). */
+@Serializable
 enum class Protocol { VLESS, VMESS, TROJAN, SHADOWSOCKS }
 
 /**
  * Нормализованный сервер: результат разбора одной ссылки, вход для [XrayConfigBuilder].
  * Поля — общий знаменатель ss/vless/vmess/trojan; лишние для конкретного протокола остаются null.
+ * @Serializable — сохраняется внутри подписки в subscriptions.json.
  */
+@Serializable
 data class ServerProfile(
     val protocol: Protocol,
     val remarks: String,
