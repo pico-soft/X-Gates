@@ -17,6 +17,13 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // xray-core (libv2ray.aar) ships native libgojni.so per ABI.
+        // arm64-v8a — основная цель (Samsung); armeabi-v7a — старые устройства;
+        // x86_64 — временно для эмулятора.
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+        }
     }
 
     buildTypes {
@@ -33,9 +40,15 @@ android {
     buildFeatures {
         compose = true
     }
+
+    // libv2ray.aar лежит в app/libs; забираем и его нативные .so оттуда.
+    sourceSets["main"].jniLibs.srcDirs("libs")
 }
 
 dependencies {
+    // xray-core wrapper (AndroidLibXrayLite), prebuilt AAR from GitHub releases.
+    implementation(files("libs/libv2ray.aar"))
+
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.compose.material3)
