@@ -42,17 +42,17 @@ object XrayController {
     }
 
     /**
-     * Запуск ядра с тестовым конфигом. Возвращает true, если после старта
-     * isRunning == true. Бросает исключение при ошибке конфига/старта —
-     * вызывающий код должен показать его в UI.
+     * Запуск ядра с переданным конфигом (freedom или vless — решает вызывающий).
+     * Возвращает true, если после старта isRunning == true. Бросает исключение
+     * при ошибке конфига/старта — вызывающий код должен показать его в UI.
      */
     @Synchronized
-    fun start(context: Context): Boolean {
+    fun start(context: Context, configJson: String): Boolean {
         if (isRunning) return true
         initEnv(context)
         val core = Libv2ray.newCoreController(CoreCallback())
         controller = core
-        core.startLoop(XrayConfig.testConfigJson(), NO_TUN_FD)
+        core.startLoop(configJson, NO_TUN_FD)
         Log.i(TAG, "startLoop done, isRunning=${core.isRunning}")
         return core.isRunning
     }

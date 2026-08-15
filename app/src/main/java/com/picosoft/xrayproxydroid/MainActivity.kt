@@ -45,25 +45,33 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     val context = LocalContext.current
     var status by remember { mutableStateOf("idle") }
     var running by remember { mutableStateOf(false) }
+    var mode by remember { mutableStateOf("-") }
 
     // Старт/стоп ядра — на фоновом потоке (нативный вызов не на main).
     fun refresh() {
         running = XrayController.isRunning
     }
 
-    fun onStart() {
-        status = "starting…"
+    // modeName — что показать в статусе; configJson — какой конфиг поднять.
+    fun onStart(modeName: String, configJson: String) {
+        if (XrayController.isRunning) {
+            status = "already running (mode: $mode) — press Stop first"
+            return
+        }
+        mode = modeName
+        status = "starting… (mode: $modeName)"
         Thread {
-            val result = runCatching { XrayController.start(context) }
+            val result = runCatching { XrayController.start(context, configJson) }
             val text = result.fold(
                 onSuccess = { ok ->
                     val socks = probePort(XrayConfig.SOCKS_PORT)
                     val http = probePort(XrayConfig.HTTP_PORT)
-                    "isRunning=$ok\n" +
+                    "mode: $modeName\n" +
+                        "isRunning=$ok\n" +
                         "socks ${XrayConfig.SOCKS_PORT}: ${mark(socks)}\n" +
                         "http  ${XrayConfig.HTTP_PORT}: ${mark(http)}"
                 },
-                onFailure = { "ERROR: ${it.message}" }
+                onFailure = { "mode: $modeName\nERROR: ${it.message}" }
             )
             (context as ComponentActivity).runOnUiThread {
                 status = text
@@ -77,7 +85,8 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         Thread {
             XrayController.stop()
             (context as ComponentActivity).runOnUiThread {
-                status = "stopped"
+                status = "stopped (was: $mode)"
+                mode = "-"
                 refresh()
             }
         }.start()
@@ -89,10 +98,15 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     ) {
         Text("xray-core boot test")
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Button(onClick = { onStart() }) { Text("Start") }
-            Button(onClick = { onStop() }) { Text("Stop") }
+            Button(onClick = { onStart("freedom", XrayConfig.freedomConfigJson()) }) {
+                Text("Start freedom")
+            }
+            Button(onClick = { onStart("vless", XrayConfig.vlessConfigJson()) }) {
+                Text("Start vless")
+            }
         }
-        Text("running: $running")
+        Button(onClick = { onStop() }) { Text("Stop") }
+        Text("running: $running   mode: $mode")
         Text(status)
     }
 }
