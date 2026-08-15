@@ -1,10 +1,10 @@
 package com.picosoft.xrayproxydroid.xray
 
 /**
- * Порты и минимальный тестовый конфиг xray-core.
+ * Порты, тестовый сервер и конфиги xray-core.
  *
- * Все порты — константы, по коду никаких магических чисел: и конфиг, и любые
- * будущие проверки портов ссылаются только сюда.
+ * Все порты и параметры сервера — константы, по коду никаких магических значений:
+ * конфиги и проверки портов ссылаются только сюда.
  */
 object XrayConfig {
 
@@ -17,32 +17,91 @@ object XrayConfig {
     /** Слушаем только петлю — модель локального прокси, без VpnService. */
     const val LISTEN = "127.0.0.1"
 
+    // --- Захардкоженный тестовый VLESS-сервер (парсер vless:// будет отдельным этапом) ---
+    // vless://…@polniybak.info:443?encryption=none&security=tls&sni=polniybak.info
+    //          &fp=firefox&type=ws&path=%2Fnotvlessklyanus
+    private object Vless {
+        const val ADDRESS = "polniybak.info"
+        const val PORT = 443
+        const val ID = "13a0205c-107a-4c7a-954e-2b5fcb235449"
+        const val ENCRYPTION = "none"
+        const val SNI = "polniybak.info"
+        const val FINGERPRINT = "firefox"
+        const val WS_PATH = "/notvlessklyanus"
+        const val WS_HOST = "polniybak.info"
+        const val ALLOW_INSECURE = false
+    }
+
     /**
-     * Минимальный конфиг для проверки «xray стартует из APK и держит порты»:
-     * два локальных inbound (socks + http) и один freedom-outbound.
-     * Реальный сервер не нужен — трафик уходит напрямую (freedom).
+     * Общая inbound-часть: socks на SOCKS_PORT + http на HTTP_PORT, оба на 127.0.0.1.
+     * Идентична для обоих режимов, чтобы сравнивать только outbound.
      */
-    fun testConfigJson(): String = """
+    private fun inbounds(): String = """
+        "inbounds": [
+          {
+            "tag": "socks-in",
+            "listen": "$LISTEN",
+            "port": $SOCKS_PORT,
+            "protocol": "socks",
+            "settings": { "auth": "noauth", "udp": true }
+          },
+          {
+            "tag": "http-in",
+            "listen": "$LISTEN",
+            "port": $HTTP_PORT,
+            "protocol": "http",
+            "settings": {}
+          }
+        ]
+    """.trimIndent()
+
+    /**
+     * Режим freedom: прямой выход, трафик НЕ проксируется. Эталон для сравнения —
+     * внешний IP должен остаться оператора.
+     */
+    fun freedomConfigJson(): String = """
         {
           "log": { "loglevel": "warning" },
-          "inbounds": [
-            {
-              "tag": "socks-in",
-              "listen": "$LISTEN",
-              "port": $SOCKS_PORT,
-              "protocol": "socks",
-              "settings": { "auth": "noauth", "udp": true }
-            },
-            {
-              "tag": "http-in",
-              "listen": "$LISTEN",
-              "port": $HTTP_PORT,
-              "protocol": "http",
-              "settings": {}
-            }
-          ],
+          ${inbounds()},
           "outbounds": [
             { "tag": "direct", "protocol": "freedom" }
+          ]
+        }
+    """.trimIndent()
+
+    /**
+     * Режим vless: трафик идёт через тестовый сервер (VLESS over WS over TLS).
+     * Плоский формат settings — сверен с парсером xray-core из нашего AAR.
+     * Внешний IP через прокси должен стать IP сервера.
+     */
+    fun vlessConfigJson(): String = """
+        {
+          "log": { "loglevel": "warning" },
+          ${inbounds()},
+          "outbounds": [
+            {
+              "tag": "proxy",
+              "protocol": "vless",
+              "settings": {
+                "address": "${Vless.ADDRESS}",
+                "port": ${Vless.PORT},
+                "id": "${Vless.ID}",
+                "encryption": "${Vless.ENCRYPTION}"
+              },
+              "streamSettings": {
+                "network": "ws",
+                "security": "tls",
+                "tlsSettings": {
+                  "allowInsecure": ${Vless.ALLOW_INSECURE},
+                  "serverName": "${Vless.SNI}",
+                  "fingerprint": "${Vless.FINGERPRINT}"
+                },
+                "wsSettings": {
+                  "path": "${Vless.WS_PATH}",
+                  "host": "${Vless.WS_HOST}"
+                }
+              }
+            }
           ]
         }
     """.trimIndent()
