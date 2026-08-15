@@ -31,6 +31,28 @@ object SubscriptionManager {
     fun allServers(context: Context): List<ServerProfile> =
         SubscriptionStore.load(context).flatMap { it.servers }
 
+    /** Стабильный ключ сервера (без динамических полей теста) — для привязки результатов пинга. */
+    fun serverKey(p: ServerProfile): String =
+        "${p.protocol}|${p.address}|${p.port}|${p.credential}"
+
+    /**
+     * Пакетно применить задержки (ключ [serverKey] → мс) к сохранённым серверам и сохранить
+     * ОДИН раз. Батчируем, чтобы не писать subscriptions.json на каждый из ~101 результатов.
+     * Непереданные серверы не трогаем (частичный результат при отмене сохраняется).
+     */
+    fun applyPingResults(context: Context, pingByKey: Map<String, Int>) {
+        if (pingByKey.isEmpty()) return
+        val ts = now()
+        val subs = SubscriptionStore.load(context)
+        val updated = subs.map { sub ->
+            sub.copy(servers = sub.servers.map { s ->
+                val ms = pingByKey[serverKey(s)]
+                if (ms != null) s.copy(pingMs = ms, lastTestedTs = ts) else s
+            })
+        }
+        SubscriptionStore.save(context, updated)
+    }
+
     /** Добавить подписку (dedup по url). Имя по умолчанию — из URL. true если добавили. */
     fun add(context: Context, url: String, name: String? = null): Boolean {
         val u = url.trim()
