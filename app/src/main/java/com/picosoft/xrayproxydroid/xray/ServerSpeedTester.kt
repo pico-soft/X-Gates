@@ -12,6 +12,7 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.roundToInt
 
 /**
@@ -25,6 +26,9 @@ import kotlin.math.roundToInt
 object ServerSpeedTester {
 
     private const val TAG = "ServerSpeedTester"
+
+    /** Сколько замеров идёт ОДНОВРЕМЕННО (диагностика: делят ли канал). В батче должно быть 1. */
+    private val concurrentMeasures = AtomicInteger(0)
 
     // Time-based замер: качаем ~фиксированное ВРЕМЯ, не до конца файла (подход Б).
     /** Прогрев — отбрасываем (TCP slow-start ещё не разогнался). */
@@ -77,33 +81,47 @@ object ServerSpeedTester {
     ): Double {
         XrayController.ensureEnv(context)
 
-        val port = freePort() ?: return -1.0
-        val cfg = try {
-            XrayConfigBuilder.buildForSpeedTest(profile, port)
-        } catch (e: Exception) {
-            Log.d(TAG, "buildForSpeedTest failed: ${e.message}")
-            return -1.0
-        }
-
-        val core = Libv2ray.newCoreController(NoopCallback())
+        val name = profile.remarks.ifBlank { profile.address }
+        val concurrent = concurrentMeasures.incrementAndGet()   // сколько замеров идёт параллельно ПРЯМО СЕЙЧАС
+        Log.i(TAG, "── measure START «$name» ${profile.address}:${profile.port} net=${profile.network} sec=${profile.security} · параллельно=$concurrent")
+        val t0 = System.nanoTime()
         try {
-            core.startLoop(cfg, 0)
-            if (!core.isRunning) return -1.0
-            if (!awaitPort(port, deadlineMs = 2_000)) {
-                Log.d(TAG, "temp socks port $port not ready")
+            val port = freePort() ?: run { Log.i(TAG, "«$name» freePort FAIL"); return -1.0 }
+            val cfg = try {
+                XrayConfigBuilder.buildForSpeedTest(profile, port)
+            } catch (e: Exception) {
+                Log.i(TAG, "«$name» buildForSpeedTest FAIL: ${e.message}")
                 return -1.0
             }
-            for (probe in tunnelProbes) {
-                val mbps = downloadMbps(probe, port, warmupMs, measureMs)
-                Log.i(TAG, "probe=$probe port=$port → $mbps Mbps")
-                if (mbps > 0) return mbps
+
+            val core = Libv2ray.newCoreController(NoopCallback())
+            try {
+                core.startLoop(cfg, 0)
+                if (!core.isRunning) { Log.i(TAG, "«$name» core not running"); return -1.0 }
+                val portReady = awaitPort(port, deadlineMs = 2_000)
+                val upMs = (System.nanoTime() - t0) / 1_000_000
+                if (!portReady) {
+                    Log.i(TAG, "«$name» temp-инстанс порт $port НЕ готов за ${upMs}мс")
+                    return -1.0
+                }
+                Log.i(TAG, "«$name» temp-инстанс поднят за ${upMs}мс (порт=$port)")
+                for (probe in tunnelProbes) {
+                    val mbps = downloadMbps(probe, port, warmupMs, measureMs, name)
+                    if (mbps > 0) {
+                        Log.i(TAG, "── measure DONE «$name» = $mbps Mbps (probe=$probe)")
+                        return mbps
+                    }
+                }
+                Log.i(TAG, "── measure DONE «$name» = 0.0 (все пробники впустую)")
+                return 0.0
+            } catch (e: Exception) {
+                Log.i(TAG, "«$name» measureSpeed error: ${e.message}")
+                return -1.0
+            } finally {
+                try { core.stopLoop() } catch (e: Exception) { /* ignore */ }
             }
-            return 0.0
-        } catch (e: Exception) {
-            Log.d(TAG, "measureSpeed error: ${e.message}")
-            return -1.0
         } finally {
-            try { core.stopLoop() } catch (e: Exception) { /* ignore */ }
+            concurrentMeasures.decrementAndGet()
         }
     }
 
@@ -173,22 +191,24 @@ object ServerSpeedTester {
      * но каждый покажет СВОЮ реальную скорость, а не таймаут. Файл заведомо не докачивается за окно.
      * 0.0 — недоступен/ничего не пришло.
      */
-    private fun downloadMbps(probe: String, socksPort: Int, warmupMs: Int, measureMs: Int): Double {
+    private fun downloadMbps(probe: String, socksPort: Int, warmupMs: Int, measureMs: Int, name: String): Double {
         val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", socksPort))
         val conn = (URL(probe).openConnection(proxy) as HttpURLConnection).apply {
             connectTimeout = CONNECT_TIMEOUT_MS
             readTimeout = warmupMs + measureMs + 2_000
             setRequestProperty("User-Agent", "v2rayNG/1.8.0")
         }
-        // ДИАГНОСТИКА: HTTP-код + длина через туннель (200? 403? connect-fail? 0 байт?).
+        // ДИАГНОСТИКА: время до заголовков (TLS/REALITY-хендшейк через туннель) + HTTP-код.
+        val reqStart = System.nanoTime()
         val code = try {
             conn.responseCode
         } catch (e: Exception) {
-            Log.i(TAG, "probe=$probe CONNECT-FAIL ${e.javaClass.simpleName}: ${e.message}")
+            Log.i(TAG, "«$name» probe=$probe CONNECT-FAIL ${e.javaClass.simpleName}: ${e.message}")
             conn.disconnect()
             return 0.0
         }
-        Log.i(TAG, "probe=$probe http=$code contentLength=${conn.contentLengthLong}")
+        val headerMs = (System.nanoTime() - reqStart) / 1_000_000
+        Log.i(TAG, "«$name» probe=$probe http=$code хендшейк+заголовки=${headerMs}мс contentLength=${conn.contentLengthLong}")
         if (code !in 200..299) {
             conn.disconnect()
             return 0.0
@@ -198,6 +218,7 @@ object ServerSpeedTester {
         var firstNanos = 0L
         var lastNanos = 0L
         var eof = false
+        var readErr: String? = null
         val start = System.nanoTime()
         val warmupEnd = start + warmupMs * 1_000_000L
         val measureEnd = warmupEnd + measureMs * 1_000_000L
@@ -205,7 +226,7 @@ object ServerSpeedTester {
             conn.inputStream.use { input ->
                 val buf = ByteArray(64 * 1024)
                 while (System.nanoTime() < measureEnd) {
-                    val n = try { input.read(buf) } catch (e: Exception) { break }
+                    val n = try { input.read(buf) } catch (e: Exception) { readErr = "${e.javaClass.simpleName}: ${e.message}"; break }
                     if (n < 0) { eof = true; break }               // файл кончился раньше окна
                     val now = System.nanoTime()
                     if (firstNanos == 0L) firstNanos = now
@@ -215,23 +236,34 @@ object ServerSpeedTester {
                 }
             }
         } catch (e: Exception) {
-            Log.d(TAG, "download $probe failed: ${e.message}")
+            readErr = "${e.javaClass.simpleName}: ${e.message}"
         } finally {
             conn.disconnect()
         }
 
+        val ttfbMs = if (firstNanos != 0L) (firstNanos - start) / 1_000_000 else -1
         val measuredBytes = totalBytes - warmupBytes
+        val windowMs: Long
         val mbps = when {
             // Нормально: окно заполнено (big-file), прогрев отброшен.
-            !eof && measuredBytes > 0 && lastNanos > warmupEnd ->
+            !eof && measuredBytes > 0 && lastNanos > warmupEnd -> {
+                windowMs = (lastNanos - warmupEnd) / 1_000_000
                 measuredBytes * 8.0 / ((lastNanos - warmupEnd) / 1e9) / 1_000_000.0
+            }
             // Файл кончился раньше окна (мал/быстрый сервер) → мерим ВЕСЬ скачанный за фактическое время.
-            totalBytes > 0 && lastNanos > firstNanos ->
+            totalBytes > 0 && lastNanos > firstNanos -> {
+                windowMs = (lastNanos - firstNanos) / 1_000_000
                 totalBytes * 8.0 / ((lastNanos - firstNanos) / 1e9) / 1_000_000.0
-            else -> 0.0
+            }
+            else -> { windowMs = 0; 0.0 }
         }
         val rounded = (mbps * 100).roundToInt() / 100.0
-        Log.i(TAG, "probe=$probe total=$totalBytes warmup=$warmupBytes measured=$measuredBytes eof=$eof → $rounded Mbps")
+        Log.i(
+            TAG,
+            "«$name» probe=$probe → $rounded Mbps | ttfb=${ttfbMs}мс окно=${windowMs}мс " +
+                "всего_байт=$totalBytes прогрев_байт=$warmupBytes измерено_байт=$measuredBytes eof=$eof" +
+                (readErr?.let { " ошибка_чтения=[$it]" } ?: "")
+        )
         return rounded
     }
 

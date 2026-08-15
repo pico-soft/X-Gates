@@ -32,6 +32,7 @@ class XrayProxyService : Service() {
     private fun handleStart(intent: Intent) {
         val config = intent.getStringExtra(EXTRA_CONFIG)
         val label = intent.getStringExtra(EXTRA_LABEL)
+        val serverKey = intent.getStringExtra(EXTRA_SERVERKEY)
         if (config.isNullOrEmpty()) {
             stopSelfAndForeground()
             return
@@ -39,7 +40,7 @@ class XrayProxyService : Service() {
 
         // В foreground нужно уйти в течение ~5с после старта — иначе ANR.
         startForeground(NotificationHelper.NOTIFICATION_ID, NotificationHelper.buildNotification(this, label))
-        ProxyState.update(running = false, label = label, message = "запуск…")
+        ProxyState.update(running = false, label = label, serverKey = serverKey, message = "запуск…")
 
         Thread {
             if (XrayController.isRunning) XrayController.stop()   // авто-переключение сервера
@@ -50,16 +51,16 @@ class XrayProxyService : Service() {
                         val socks = probe(XrayConfig.SOCKS_PORT)
                         val http = probe(XrayConfig.HTTP_PORT)
                         ProxyState.update(
-                            running = true, label = label,
-                            message = "socks ${XrayConfig.SOCKS_PORT}: ${mark(socks)}  ·  http ${XrayConfig.HTTP_PORT}: ${mark(http)}"  // порты — токены
+                            running = true, label = label, serverKey = serverKey,
+                            message = "", socksOk = socks, httpOk = http,   // порты — отдельными флагами (одна строка в UI)
                         )
                     } else {
-                        ProxyState.update(running = false, label = label, message = "ядро не запустилось")
+                        ProxyState.update(running = false, label = label, serverKey = serverKey, message = "ядро не запустилось")
                         stopSelfAndForeground()
                     }
                 },
                 onFailure = { e ->
-                    ProxyState.update(running = false, label = label, message = "ОШИБКА: ${e.message}")
+                    ProxyState.update(running = false, label = label, serverKey = serverKey, message = "ОШИБКА: ${e.message}")
                     stopSelfAndForeground()
                 }
             )
@@ -69,7 +70,7 @@ class XrayProxyService : Service() {
     private fun handleStop() {
         Thread {
             XrayController.stop()
-            ProxyState.update(running = false, label = null, message = "остановлено")
+            ProxyState.update(running = false, label = null, serverKey = null, message = "остановлено")
             stopSelfAndForeground()
         }.start()
     }
@@ -84,7 +85,7 @@ class XrayProxyService : Service() {
         // Страховка: если сервис уничтожают — гасим ядро.
         if (XrayController.isRunning) XrayController.stop()
         if (ProxyState.state.value.running) {
-            ProxyState.update(running = false, label = null, message = "остановлено")
+            ProxyState.update(running = false, label = null, serverKey = null, message = "остановлено")
         }
     }
 
@@ -94,20 +95,20 @@ class XrayProxyService : Service() {
         false
     }
 
-    private fun mark(open: Boolean) = if (open) "✓" else "✗"
-
     companion object {
         const val ACTION_START = "com.picosoft.xrayproxydroid.action.START"
         const val ACTION_STOP = "com.picosoft.xrayproxydroid.action.STOP"
         const val EXTRA_CONFIG = "config"
         const val EXTRA_LABEL = "label"
+        const val EXTRA_SERVERKEY = "serverKey"
 
         /** Запуск сервиса с готовым конфигом (из видимой Activity — startForegroundService разрешён). */
-        fun start(context: Context, config: String, label: String) {
+        fun start(context: Context, config: String, label: String, serverKey: String) {
             val intent = Intent(context, XrayProxyService::class.java)
                 .setAction(ACTION_START)
                 .putExtra(EXTRA_CONFIG, config)
                 .putExtra(EXTRA_LABEL, label)
+                .putExtra(EXTRA_SERVERKEY, serverKey)
             ContextCompat.startForegroundService(context, intent)
         }
 

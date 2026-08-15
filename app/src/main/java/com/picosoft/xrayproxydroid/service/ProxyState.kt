@@ -7,8 +7,11 @@ import kotlinx.coroutines.flow.asStateFlow
 /** Снимок состояния прокси для UI. */
 data class ProxyStatus(
     val running: Boolean = false,
-    val label: String? = null,     // remark/адрес активного сервера
-    val message: String = "idle",  // человекочитаемый статус (порты/ошибка)
+    val label: String? = null,      // remark/адрес активного сервера — ТОЛЬКО для показа
+    val serverKey: String? = null,  // полная идентичность активного профиля — для подсветки (не label!)
+    val message: String = "idle",   // человекочитаемый статус (ошибка/этап); порты — отдельно
+    val socksOk: Boolean = false,   // локальный SOCKS-сокет слушает
+    val httpOk: Boolean = false,    // локальный HTTP-сокет слушает
 )
 
 /**
@@ -19,7 +22,15 @@ object ProxyState {
     private val _state = MutableStateFlow(ProxyStatus())
     val state: StateFlow<ProxyStatus> = _state.asStateFlow()
 
-    fun update(running: Boolean, label: String?, message: String) {
-        _state.value = ProxyStatus(running, label, message)
+    /** serverKey пишется АТОМАРНО вместе с running (одним ProxyStatus) — без промежуточных состояний. */
+    fun update(
+        running: Boolean,
+        label: String?,
+        serverKey: String?,
+        message: String,
+        socksOk: Boolean = false,
+        httpOk: Boolean = false,
+    ) {
+        _state.value = ProxyStatus(running, label, serverKey, message, socksOk, httpOk)
     }
 }
