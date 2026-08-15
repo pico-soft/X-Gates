@@ -39,7 +39,7 @@ class XrayProxyService : Service() {
 
         // В foreground нужно уйти в течение ~5с после старта — иначе ANR.
         startForeground(NotificationHelper.NOTIFICATION_ID, NotificationHelper.buildNotification(this, label))
-        ProxyState.update(running = false, label = label, message = "starting…")
+        ProxyState.update(running = false, label = label, message = "запуск…")
 
         Thread {
             if (XrayController.isRunning) XrayController.stop()   // авто-переключение сервера
@@ -51,15 +51,15 @@ class XrayProxyService : Service() {
                         val http = probe(XrayConfig.HTTP_PORT)
                         ProxyState.update(
                             running = true, label = label,
-                            message = "socks ${XrayConfig.SOCKS_PORT}: ${mark(socks)}  ·  http ${XrayConfig.HTTP_PORT}: ${mark(http)}"
+                            message = "socks ${XrayConfig.SOCKS_PORT}: ${mark(socks)}  ·  http ${XrayConfig.HTTP_PORT}: ${mark(http)}"  // порты — токены
                         )
                     } else {
-                        ProxyState.update(running = false, label = label, message = "core not running")
+                        ProxyState.update(running = false, label = label, message = "ядро не запустилось")
                         stopSelfAndForeground()
                     }
                 },
                 onFailure = { e ->
-                    ProxyState.update(running = false, label = label, message = "ERROR: ${e.message}")
+                    ProxyState.update(running = false, label = label, message = "ОШИБКА: ${e.message}")
                     stopSelfAndForeground()
                 }
             )
@@ -69,7 +69,7 @@ class XrayProxyService : Service() {
     private fun handleStop() {
         Thread {
             XrayController.stop()
-            ProxyState.update(running = false, label = null, message = "stopped")
+            ProxyState.update(running = false, label = null, message = "остановлено")
             stopSelfAndForeground()
         }.start()
     }
@@ -84,7 +84,7 @@ class XrayProxyService : Service() {
         // Страховка: если сервис уничтожают — гасим ядро.
         if (XrayController.isRunning) XrayController.stop()
         if (ProxyState.state.value.running) {
-            ProxyState.update(running = false, label = null, message = "stopped")
+            ProxyState.update(running = false, label = null, message = "остановлено")
         }
     }
 
