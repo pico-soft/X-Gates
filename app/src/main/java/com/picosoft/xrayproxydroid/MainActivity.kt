@@ -41,6 +41,7 @@ import com.picosoft.xrayproxydroid.service.ProxyState
 import com.picosoft.xrayproxydroid.service.XrayProxyService
 import com.picosoft.xrayproxydroid.subscription.SubscriptionManager
 import com.picosoft.xrayproxydroid.ui.theme.XrayProxyDroidTheme
+import com.picosoft.xrayproxydroid.xray.ServerSpeedTester
 import com.picosoft.xrayproxydroid.xray.ServerTester
 import com.picosoft.xrayproxydroid.xray.XrayConfigBuilder
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
@@ -143,6 +144,21 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         if (batch.isNotEmpty()) Thread { SubscriptionManager.applyPingResults(context, batch) }.start()
     }
 
+    // ВРЕМЕННО (диагностика): меряет ЛУЧШИЙ по пингу живой сервер (min pingMs, >=0),
+    // а не первый в списке — нужно для чистой диагностики пробников на заведомо живом.
+    fun onSpeedTestBest() {
+        val best = servers.filter { (effPing(it) ?: -1) >= 0 }.minByOrNull { effPing(it)!! }
+        if (best == null) { subStatus = "no alive server — run Test all (ping) first"; return }
+        val ping = effPing(best)
+        subStatus = "speed test (best ping ${ping}ms): ${best.remarks.ifBlank { best.address }} …"
+        Thread {
+            val mbps = ServerSpeedTester.measureSpeed(context, best)
+            activity.runOnUiThread {
+                subStatus = "speed(${best.address}:${best.port}, ping=${ping}ms) = $mbps Mbps · active running=${proxy.running}"
+            }
+        }.start()
+    }
+
     fun onTestAll() {
         if (testing) return
         val list = servers
@@ -224,6 +240,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                 Text(testProgress, style = MaterialTheme.typography.titleMedium)
             } else {
                 Button(onClick = { onTestAll() }) { Text("Test all") }
+                Button(onClick = { onSpeedTestBest() }) { Text("Speed(best)") }
                 Text("servers: ${servers.size}", style = MaterialTheme.typography.bodyMedium)
             }
         }
