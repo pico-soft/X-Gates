@@ -1,9 +1,14 @@
 package com.picosoft.xrayproxydroid
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -20,6 +25,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -28,14 +34,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import com.picosoft.xrayproxydroid.service.ProxyState
+import com.picosoft.xrayproxydroid.service.XrayProxyService
 import com.picosoft.xrayproxydroid.subscription.SubscriptionManager
 import com.picosoft.xrayproxydroid.ui.theme.XrayProxyDroidTheme
-import com.picosoft.xrayproxydroid.xray.XrayConfig
 import com.picosoft.xrayproxydroid.xray.XrayConfigBuilder
-import com.picosoft.xrayproxydroid.xray.XrayController
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
-import java.net.InetSocketAddress
-import java.net.Socket
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -51,58 +56,51 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+/** Стабильная метка сервера — и для отображения в списке, и как label активного в ProxyState. */
+private fun serverLabel(p: ServerProfile): String =
+    "${p.protocol}  ·  ${p.remarks.ifBlank { p.address }}  ·  ${p.address}:${p.port}"
+
 @Composable
 private fun BootScreen(modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val activity = context as ComponentActivity
 
-    var status by remember { mutableStateOf("idle") }
-    var running by remember { mutableStateOf(false) }
-    var activeServer by remember { mutableStateOf<ServerProfile?>(null) }
+    // Состояние прокси едет из сервиса через общий StateFlow (один процесс).
+    val proxy by ProxyState.state.collectAsState()
 
     var subUrl by remember { mutableStateOf("https://maxim-zodchy.ru/sub-black.php") }
     var subStatus by remember { mutableStateOf("") }
     var servers by remember { mutableStateOf(SubscriptionManager.allServers(context)) }
 
-    fun refresh() { running = XrayController.isRunning }
+    // Runtime-разрешение на нотификацию (Android 13+). Отказ не блокирует — прокси headless.
+    val notifPermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* granted or not — всё равно стартуем */ }
+
+    fun ensureNotifPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
     fun reloadServers() { servers = SubscriptionManager.allServers(context) }
 
-    // Запуск выбранного сервера. Если что-то уже работает — авто-переключение: stop старого → start нового.
+    // Запуск сервера ЧЕРЕЗ сервис. Повторный вызов с другим сервером = авто-переключение
+    // (сервис сам stop→start по новому ACTION_START) — здесь никакого guard-а «already running».
     fun startServer(p: ServerProfile) {
         val cfg = runCatching { XrayConfigBuilder.build(p) }.getOrElse {
             subStatus = "build error: ${it.message}"
             return
         }
-        status = "starting ${p.remarks.ifBlank { p.address }}…"
-        Thread {
-            if (XrayController.isRunning) XrayController.stop()      // переключение
-            val res = runCatching { XrayController.start(context, cfg) }
-            val socks = probePort(XrayConfig.SOCKS_PORT)
-            val http = probePort(XrayConfig.HTTP_PORT)
-            activity.runOnUiThread {
-                res.fold(
-                    onSuccess = { ok ->
-                        activeServer = if (ok) p else null
-                        status = "isRunning=$ok\n" +
-                            "socks ${XrayConfig.SOCKS_PORT}: ${mark(socks)}\n" +
-                            "http  ${XrayConfig.HTTP_PORT}: ${mark(http)}"
-                    },
-                    onFailure = { activeServer = null; status = "ERROR: ${it.message}" }
-                )
-                refresh()
-            }
-        }.start()
+        ensureNotifPermission()
+        XrayProxyService.start(context, cfg, serverLabel(p))
     }
 
-    fun onStop() {
-        status = "stopping…"
-        Thread {
-            XrayController.stop()
-            activity.runOnUiThread { activeServer = null; status = "stopped"; refresh() }
-        }.start()
-    }
+    fun onStop() { XrayProxyService.stop(context) }
 
-    // Добавить подписку и обновить (скачать→декод→парс→сохранить) — в фоне.
     fun onAddRefresh() {
         val url = subUrl.trim()
         if (url.isEmpty()) { subStatus = "enter subscription url"; return }
@@ -143,7 +141,8 @@ private fun BootScreen(modifier: Modifier = Modifier) {
             verticalArrangement = Arrangement.spacedBy(2.dp)
         ) {
             items(servers) { p ->
-                val isActive = running && p == activeServer
+                val label = serverLabel(p)
+                val isActive = proxy.running && proxy.label == label
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -156,8 +155,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Text(
-                        text = (if (isActive) "● " else "") +
-                            "${p.protocol}  ·  ${p.remarks.ifBlank { p.address }}  ·  ${p.address}:${p.port}",
+                        text = (if (isActive) "● " else "") + label,
                         modifier = Modifier.weight(1f)
                     )
                     Button(onClick = { startServer(p) }) {
@@ -170,16 +168,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         HorizontalDivider()
 
         Button(onClick = { onStop() }) { Text("Stop") }
-        Text("running: $running")
-        Text(status)
+        Text("running: ${proxy.running}" + (proxy.label?.let { "   ·   $it" } ?: ""))
+        Text(proxy.message)
     }
-}
-
-private fun mark(open: Boolean) = if (open) "LISTENING ✓" else "closed ✗"
-
-/** Быстрая проверка, что порт на 127.0.0.1 действительно слушается. */
-private fun probePort(port: Int): Boolean = try {
-    Socket().use { it.connect(InetSocketAddress(XrayConfig.LISTEN, port), 500); true }
-} catch (e: Exception) {
-    false
 }
