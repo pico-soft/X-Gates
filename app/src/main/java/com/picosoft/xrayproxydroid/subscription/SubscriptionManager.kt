@@ -15,6 +15,7 @@ data class RefreshSummary(
     val added: Int = 0,
     val unsupported: Int = 0,   // hysteria2/tuic… — распознаны, но не наше ядро
     val invalid: Int = 0,       // битые/неизвестные строки
+    val duplicates: Int = 0,    // повторы того же сервера в самой подписке — отброшены
     val error: String? = null,
 )
 
@@ -31,9 +32,23 @@ object SubscriptionManager {
     fun allServers(context: Context): List<ServerProfile> =
         SubscriptionStore.load(context).flatMap { it.servers }
 
-    /** Стабильный ключ сервера (без динамических полей теста) — для привязки результатов пинга. */
-    fun serverKey(p: ServerProfile): String =
-        "${p.protocol}|${p.address}|${p.port}|${p.credential}"
+    /**
+     * Ключ ПОЛНОЙ идентичности соединения — для дедупа импорта И привязки pingMs.
+     *
+     * ВАЖНО: НЕ только protocol+address+port+credential — иначе склеиваются серверы,
+     * различающиеся транспортом (network/security/sni/path/host/flow/reality/grpc/alpn)
+     * или fp: это РАЗНЫЕ конфиги на одном endpoint (проверено на реальной подписке —
+     * 12 транспортно-разных + 17 fp-разных групп, 0 полных дублей). fp включён (вариант A):
+     * под DPI разные отпечатки проходят по-разному, автовыбор должен тестировать каждый.
+     * Исключены только динамика/метки: remarks, raw, pingMs, lastTestedTs.
+     */
+    fun serverKey(p: ServerProfile): String = listOf(
+        p.protocol.name, p.address, p.port.toString(), p.credential,
+        p.method.orEmpty(), p.flow.orEmpty(),
+        p.security, p.sni.orEmpty(), p.fingerprint.orEmpty(), p.alpn.orEmpty(),
+        p.network, p.path.orEmpty(), p.hostHeader.orEmpty(), p.serviceName.orEmpty(),
+        p.publicKey.orEmpty(), p.shortId.orEmpty(), p.spiderX.orEmpty(),
+    ).joinToString("|")
 
     /**
      * Пакетно применить задержки (ключ [serverKey] → мс) к сохранённым серверам и сохранить
@@ -90,11 +105,14 @@ object SubscriptionManager {
         val lines = SubscriptionDecoder.decode(body)
 
         val profiles = ArrayList<ServerProfile>()
+        val seen = HashSet<String>()          // дедуп внутри подписки по serverKey
         var unsupported = 0
         var invalid = 0
+        var duplicates = 0
         for (line in lines) {
             when (val r = ServerLinkParser.parse(line)) {
-                is ParseResult.Supported -> profiles.add(r.profile)
+                is ParseResult.Supported ->
+                    if (seen.add(serverKey(r.profile))) profiles.add(r.profile) else duplicates++
                 is ParseResult.Unsupported -> unsupported++
                 is ParseResult.Invalid -> invalid++
             }
@@ -113,7 +131,10 @@ object SubscriptionManager {
         if (idx >= 0) subs[idx] = updated else subs.add(updated)
         SubscriptionStore.save(context, subs)
 
-        return RefreshSummary(ok = true, added = profiles.size, unsupported = unsupported, invalid = invalid)
+        return RefreshSummary(
+            ok = true, added = profiles.size,
+            unsupported = unsupported, invalid = invalid, duplicates = duplicates,
+        )
     }
 
     // --- helpers ---
