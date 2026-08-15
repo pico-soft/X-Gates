@@ -131,7 +131,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
             SubscriptionManager.add(context, url)
             val s = SubscriptionManager.refresh(context, url)
             activity.runOnUiThread {
-                subStatus = if (s.ok) "added=${s.added}  unsupported=${s.unsupported}  invalid=${s.invalid}"
+                subStatus = if (s.ok) "added=${s.added}  dup=${s.duplicates}  unsupported=${s.unsupported}  invalid=${s.invalid}"
                             else "error: ${s.error}"
                 reloadServers()
             }
