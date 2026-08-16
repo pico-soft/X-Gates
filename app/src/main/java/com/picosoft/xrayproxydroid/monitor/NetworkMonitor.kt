@@ -235,7 +235,8 @@ object NetworkMonitor {
             .filter { ServerFilter.isSelectable(it, it.speedMbps, settings, bl) }
             .maxByOrNull { it.speedMbps ?: 0.0 }
             ?: return "переключаться некуда — нет живых кандидатов (нужен полный тест). Причина: $reason"
-        val name = best.remarks.ifBlank { best.address }
+        // Имя через оверрайд (пользовательское, если задано) — журнал показывает то же, что видит юзер.
+        val name = bl.customName(SubscriptionManager.serverKey(best)) ?: best.remarks.ifBlank { best.address }
         val sp = best.speedMbps?.let { fmt(it) } ?: "скорость неизв."
         return "переключился бы на «$name» ($sp), потому что $reason ($failures циклов подряд)"
     }

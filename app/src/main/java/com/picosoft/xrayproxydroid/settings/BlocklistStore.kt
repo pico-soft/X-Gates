@@ -33,30 +33,56 @@ data class BlockedServer(
  * Хранится ОТДЕЛЬНЫМ файлом (blocklist.json в filesDir), НЕ внутри профилей и НЕ в кэше подписки:
  * refresh подписки перезаписывает список серверов целиком и стёр бы правила ([overrides-and-blocklist-spec]).
  */
+/**
+ * Пользовательское переименование сервера (оверрайд по serverKey). [originalName] — имя провайдера на
+ * момент переименования: нужно и для диалога («Имя от сервера: …»), и чтобы список читался, когда
+ * сервер пропал из подписки, и для «применить ко всем с таким же ИСХОДНЫМ именем».
+ */
+@Serializable
+data class ServerRename(
+    val serverKey: String,
+    val customName: String,
+    val originalName: String,
+    val renamedAt: Long = 0L,
+)
+
 @Serializable
 data class Blocklist(
     val words: List<String> = emptyList(),
     val servers: List<BlockedServer> = emptyList(),
+    val renames: List<ServerRename> = emptyList(),   // добавлено в Промпт 44 (старый JSON читается — default)
 ) {
     private val blockedKeys: Set<String> get() = servers.mapTo(HashSet()) { it.serverKey }
+    private val nameByKey: Map<String, String> get() = renames.associate { it.serverKey to it.customName }
 
     fun isServerBlocked(serverKey: String): Boolean = serverKey in blockedKeys
 
-    /** Правило-слово блокирует имя = подстрока, регистронезависимо (1:1 с эталоном). */
-    fun matchesWord(name: String): Boolean {
-        val n = name.lowercase()
-        return words.any { it.isNotBlank() && n.contains(it) }
+    /** Пользовательское имя для [serverKey] или null, если не переименован. */
+    fun customName(serverKey: String): String? = nameByKey[serverKey]
+
+    /**
+     * Правило-слово блокирует, если оно подстрока ЛЮБОГО из переданных имён (исходного И пользовательского),
+     * регистронезависимо (подстрока — 1:1 с эталоном). Проверять ОБА имени обязательно (см. пункт D2 спеки):
+     * иначе переименование молча снимало бы блокировку, а заблокировать по своему имени было бы нельзя.
+     */
+    fun matchesWord(vararg names: String?): Boolean {
+        if (words.isEmpty()) return false
+        val ns = names.filterNotNull().map { it.lowercase() }
+        return words.any { w -> w.isNotBlank() && ns.any { it.contains(w) } }
     }
 
-    /** ЕДИНЫЙ предикат блокировки: точечно по ключу ИЛИ по слову в имени. */
-    fun isBlocked(name: String, serverKey: String): Boolean =
-        isServerBlocked(serverKey) || matchesWord(name)
+    /** ЕДИНЫЙ предикат блокировки: точечно по ключу ИЛИ по слову в исходном/пользовательском имени. */
+    fun isBlocked(originalName: String, customName: String?, serverKey: String): Boolean =
+        isServerBlocked(serverKey) || matchesWord(originalName, customName)
 
-    /** Сколько имён из [names] блокирует конкретное слово (для счётчика у чипа; 0 → вероятно опечатка). */
-    fun countForWord(word: String, names: List<String>): Int {
+    /**
+     * Сколько серверов блокирует слово (для счётчика у чипа; 0 → вероятно опечатка). [names] — пары
+     * (исходное имя, пользовательское или null): учитываем ОБА, чтобы счётчик не разошёлся с фактом (D3).
+     */
+    fun countForWord(word: String, names: List<Pair<String, String?>>): Int {
         val w = word.lowercase()
         if (w.isBlank()) return 0
-        return names.count { it.lowercase().contains(w) }
+        return names.count { (o, c) -> o.lowercase().contains(w) || (c != null && c.lowercase().contains(w)) }
     }
 }
 
@@ -142,5 +168,25 @@ object BlocklistStore {
         save(context, current().let {
             it.copy(servers = it.servers.filterNot { s -> s.serverKey == serverKey })
         })
+    }
+
+    /**
+     * Переименовать. [keysWithOriginal] — пары (serverKey, исходное имя): один элемент = один сервер,
+     * несколько = «применить ко всем с таким же исходным именем». Пустое [customName] = СБРОС (удаляем
+     * записи для этих ключей). Одна запись в файл на всю операцию (batch), без множественных сохранений.
+     */
+    fun rename(context: Context, keysWithOriginal: List<Pair<String, String>>, customName: String, nowMs: Long) {
+        val trimmed = customName.trim()
+        val keys = keysWithOriginal.mapTo(HashSet()) { it.first }
+        val cur = current()
+        val without = cur.renames.filterNot { it.serverKey in keys }
+        val next = if (trimmed.isEmpty()) without
+                   else without + keysWithOriginal.map { (k, orig) -> ServerRename(k, trimmed, orig, nowMs) }
+        save(context, cur.copy(renames = next))
+    }
+
+    /** Сброс пользовательского имени одного сервера («Вернуть имя от сервера»). */
+    fun clearName(context: Context, serverKey: String) {
+        save(context, current().let { it.copy(renames = it.renames.filterNot { r -> r.serverKey == serverKey }) })
     }
 }

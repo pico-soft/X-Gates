@@ -22,10 +22,13 @@ object ServerFilter {
 
     /**
      * ЧЕТВЁРТЫЙ отсев — стоп-лист: заблокирован по слову в ИМЕНИ или точечно по serverKey.
-     * Имя для слов = отображаемое (remarks, при пустом — адрес), как в эталоне (по NAME).
+     * Слово ищем И в исходном имени провайдера, И в пользовательском (D2): иначе переименование
+     * молча снимало бы блокировку.
      */
-    fun isBlocked(p: ServerProfile, b: Blocklist): Boolean =
-        b.isBlocked(p.remarks.ifBlank { p.address }, SubscriptionManager.serverKey(p))
+    fun isBlocked(p: ServerProfile, b: Blocklist): Boolean {
+        val key = SubscriptionManager.serverKey(p)
+        return b.isBlocked(p.remarks.ifBlank { p.address }, b.customName(key), key)
+    }
 
     /** Виден в «Живые»: не заблокирован + протокол разрешён + пинг жив + скорость пригодна ИЛИ ещё не мерена. */
     fun isVisible(p: ServerProfile, pingMs: Int?, speedMbps: Double?, s: AppSettings, b: Blocklist): Boolean =

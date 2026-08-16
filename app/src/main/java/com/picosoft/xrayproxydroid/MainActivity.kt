@@ -43,6 +43,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
@@ -156,8 +157,11 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
     val blocklist by BlocklistStore.state.collectAsState()
     val allServers = remember(settings, blocklist) { SubscriptionManager.allServers(context) }
     val protocolCounts = remember(allServers) { allServers.groupingBy { it.protocol }.eachCount() }
-    // Имена всех серверов — для счётчика «сколько блокирует слово» у чипов стоп-листа.
-    val serverNames = remember(allServers) { allServers.map { it.remarks.ifBlank { it.address } } }
+    // Пары (исходное имя, пользовательское) всех серверов — для счётчика «сколько блокирует слово»
+    // у чипов стоп-листа: учитываем ОБА имени (D3), иначе счётчик разойдётся с фактической блокировкой.
+    val serverNames = remember(allServers, blocklist) {
+        allServers.map { providerName(it) to blocklist.customName(SubscriptionManager.serverKey(it)) }
+    }
     val monitorLog by MonitorLog.state.collectAsState()
     // Состояние раскрытия — на уровне вкладки (стабильное позиционное scoping), все свёрнуты по умолчанию.
     var settingsExpanded by rememberSaveable { mutableStateOf(false) }
@@ -266,11 +270,18 @@ private fun CompactBottomBar(selected: Int, onSelect: (Int) -> Unit) {
     }
 }
 
-private fun serverLabel(p: ServerProfile): String =
-    "${p.protocol}  ·  ${p.remarks.ifBlank { p.address }}  ·  ${p.address}:${p.port}"
+private fun serverLabel(p: ServerProfile, bl: Blocklist): String =
+    "${p.protocol}  ·  ${displayName(p, bl)}  ·  ${p.address}:${p.port}"
 
-/** Короткое имя сервера для строки списка (без адреса/порта — они уходят во вторую строку). */
-private fun serverName(p: ServerProfile): String = p.remarks.ifBlank { p.address }
+/** Имя ОТ ПРОВАЙДЕРА, как пришло (без оверрайда). Модель не мутируем — remarks остаются исходными. */
+private fun providerName(p: ServerProfile): String = p.remarks.ifBlank { p.address }
+
+/**
+ * ЕДИНАЯ точка показа имени: пользовательское, если задано, иначе имя провайдера. Через неё обязаны
+ * идти ВСЕ листинги/статус/нотификация/журнал — прямое чтение remarks для показа не заводить.
+ */
+private fun displayName(p: ServerProfile, bl: Blocklist): String =
+    bl.customName(SubscriptionManager.serverKey(p)) ?: providerName(p)
 
 /** Мелкая подпись: протокол · network · security (для строк с одинаковым именем и для статус-бокса). */
 private fun protoNetSec(p: ServerProfile): String = "${p.protocol} · ${p.network} · ${p.security}"
@@ -281,9 +292,11 @@ private fun protoNetSec(p: ServerProfile): String = "${p.protocol} · ${p.networ
  * Если и эта подпись совпала внутри группы — добавляем последние 4 символа serverKey (гарантия уникальности).
  * Уникальные имена в map не попадают.
  */
-private fun buildDiscriminators(servers: List<ServerProfile>): Map<String, String> {
+private fun buildDiscriminators(servers: List<ServerProfile>, bl: Blocklist): Map<String, String> {
     val result = HashMap<String, String>()
-    for ((_, group) in servers.groupBy { serverName(it) }) {
+    // Повторы считаем по ОТОБРАЖАЕМОМУ имени (D1): переименовал один из одноимённых — их стало меньше,
+    // у переименованного суффикс уже не нужен.
+    for ((_, group) in servers.groupBy { displayName(it, bl) }) {
         if (group.size < 2) continue
         val ambiguous = group.map(::protoNetSec).toSet().size < group.size
         for (p in group) {
@@ -332,6 +345,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     var subRefreshCancel by remember { mutableStateOf(false) }
     var pendingDelete by remember { mutableStateOf<SubSource?>(null) }
     var renameSource by remember { mutableStateOf<SubSource?>(null) }
+    var renameProfile by remember { mutableStateOf<ServerProfile?>(null) }   // диалог переименования сервера
     // Раскрытие сворачиваемых секций главной — на уровне экрана (стабильно, переживает переключение вкладок).
     var allServersExpanded by rememberSaveable { mutableStateOf(false) }
     var subscriptionsExpanded by rememberSaveable { mutableStateOf(false) }
@@ -376,7 +390,8 @@ private fun BootScreen(modifier: Modifier = Modifier) {
             return
         }
         ensureNotifPermission()
-        XrayProxyService.start(context, cfg, serverLabel(p), SubscriptionManager.serverKey(p))
+        // Нотификация сервиса показывает label → передаём displayName (учитывает переименование).
+        XrayProxyService.start(context, cfg, serverLabel(p, blocklist), SubscriptionManager.serverKey(p))
     }
 
     fun onStop() { XrayProxyService.stop(context) }
@@ -589,7 +604,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     }
 
     // Дискриминаторы для одинаковых имён (serverKey → суффикс).
-    val discriminators = remember(servers) { buildDiscriminators(servers) }
+    val discriminators = remember(servers, blocklist) { buildDiscriminators(servers, blocklist) }
 
     // Внешний IP запрашиваем при появлении подключения / смене активного сервера (даём туннелю осесть).
     LaunchedEffect(proxy.running, proxy.serverKey) {
@@ -647,7 +662,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                 verified = ipVerified,
                 ipText = externalIp,
                 onRefreshIp = { refreshIp() },
-                serverName = activeServer?.let { serverName(it) } ?: proxy.label,
+                serverName = activeServer?.let { displayName(it, blocklist) } ?: proxy.label,
                 subtitle = activeServer?.let { protoNetSec(it) },
                 speedMbps = activeServer?.let { effSpeed(it) },
                 hidden = activeHidden,
@@ -710,6 +725,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
             val isActive = proxy.running && proxy.serverKey == SubscriptionManager.serverKey(p)
             ServerRow(
                 profile = p,
+                name = displayName(p, blocklist),
                 isActive = isActive,
                 speedMbps = effSpeed(p),
                 caption = discriminators[SubscriptionManager.serverKey(p)] ?: "",
@@ -738,6 +754,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                     val isActive = proxy.running && proxy.serverKey == SubscriptionManager.serverKey(p)
                     ServerRow(
                         profile = p,
+                        name = displayName(p, blocklist),
                         isActive = isActive,
                         speedMbps = effSpeed(p),
                         caption = discriminators[SubscriptionManager.serverKey(p)] ?: "",
@@ -775,22 +792,46 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         }
     }
 
-    // Диалог деталей сервера (долгое нажатие) + отладочный «Перемерить» + точечная блокировка.
+    // Диалог деталей сервера (долгое нажатие) + отладочный «Перемерить» + блокировка + переименование.
     detailProfile?.let { p ->
         val pKey = SubscriptionManager.serverKey(p)
         ServerDetailDialog(
             profile = p,
+            name = displayName(p, blocklist),
+            originalName = providerName(p),
+            hasCustomName = blocklist.customName(pKey) != null,
             remeasureStatus = remeasureStatus,
             remeasuring = remeasuring,
             blockedByKey = blocklist.isServerBlocked(pKey),
-            blockedByWord = blocklist.matchesWord(serverName(p)),
+            blockedByWord = blocklist.matchesWord(providerName(p), blocklist.customName(pKey)),
             onToggleBlock = {
                 if (blocklist.isServerBlocked(pKey)) BlocklistStore.unblockServer(context, pKey)
-                else BlocklistStore.blockServer(context, pKey, serverName(p), System.currentTimeMillis())
+                else BlocklistStore.blockServer(context, pKey, displayName(p, blocklist), System.currentTimeMillis())
                 detailProfile = null; remeasureStatus = ""
             },
+            onRename = { renameProfile = p; detailProfile = null; remeasureStatus = "" },
+            onResetName = { BlocklistStore.clearName(context, pKey); detailProfile = null; remeasureStatus = "" },
             onRemeasure = { onRemeasure(p) },
             onDismiss = { detailProfile = null; remeasureStatus = "" },
+        )
+    }
+
+    // Переименование сервера: поле с текущим именем + опция «применить ко всем с таким же исходным именем».
+    renameProfile?.let { p ->
+        val pKey = SubscriptionManager.serverKey(p)
+        val original = providerName(p)
+        val sameOriginal = servers.filter { providerName(it) == original }
+        RenameServerDialog(
+            currentName = displayName(p, blocklist),
+            originalName = original,
+            sameNameCount = sameOriginal.size,
+            onSave = { newName, applyAll ->
+                val targets = if (applyAll) sameOriginal else listOf(p)
+                val keysWithOriginal = targets.map { SubscriptionManager.serverKey(it) to providerName(it) }
+                BlocklistStore.rename(context, keysWithOriginal, newName, System.currentTimeMillis())
+                renameProfile = null
+            },
+            onDismiss = { renameProfile = null },
         )
     }
 
@@ -1034,6 +1075,7 @@ private fun ServerTableHeader() {
 @Composable
 private fun ServerRow(
     profile: ServerProfile,
+    name: String,
     isActive: Boolean,
     speedMbps: Double?,
     caption: String,
@@ -1057,7 +1099,7 @@ private fun ServerRow(
             // Имя полностью (перенос при длинном) + мелко caption под ним.
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    (if (isActive) "● " else "") + serverName(profile),
+                    (if (isActive) "● " else "") + name,
                     fontSize = TABLE_FONT,
                     fontWeight = if (isActive) FontWeight.Bold else FontWeight.Normal,
                 )
@@ -1141,20 +1183,27 @@ private fun StubText() {
 @Composable
 private fun ServerDetailDialog(
     profile: ServerProfile,
+    name: String,
+    originalName: String,
+    hasCustomName: Boolean,
     remeasureStatus: String,
     remeasuring: Boolean,
     blockedByKey: Boolean,
     blockedByWord: Boolean,
     onToggleBlock: () -> Unit,
+    onRename: () -> Unit,
+    onResetName: () -> Unit,
     onRemeasure: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     fun v(s: String?) = s?.ifBlank { "—" } ?: "—"
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(serverName(profile)) },
+        title = { Text(name) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                // «Имя от сервера» — ВСЕГДА и НЕИЗМЕННО, даже когда задано своё (требование Elyor).
+                DetailRow("Имя от сервера", originalName)
                 DetailRow("Протокол", profile.protocol.name)
                 DetailRow("Адрес", "${profile.address}:${profile.port}")
                 DetailRow("Транспорт", profile.network)
@@ -1172,6 +1221,15 @@ private fun ServerDetailDialog(
                     )
                 }
                 Spacer(Modifier.height(8.dp))
+                // Переименование (оверрайд по serverKey; remarks провайдера не трогаем).
+                OutlinedButton(onClick = onRename, modifier = Modifier.fillMaxWidth()) {
+                    Text("✎ Переименовать")
+                }
+                if (hasCustomName) {
+                    TextButton(onClick = onResetName, modifier = Modifier.fillMaxWidth()) {
+                        Text("Вернуть имя от сервера")
+                    }
+                }
                 // Точечная блокировка ИМЕННО этого serverKey (не всех одноимённых).
                 OutlinedButton(onClick = onToggleBlock, modifier = Modifier.fillMaxWidth()) {
                     Text(if (blockedByKey) "Убрать из стоп-листа" else "🚫 В стоп-лист")
@@ -1192,6 +1250,47 @@ private fun ServerDetailDialog(
             }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Закрыть") } },
+    )
+}
+
+/**
+ * Диалог переименования сервера. Пустое имя = сброс к имени от провайдера. При группе одноимённых
+ * (>1 с тем же ИСХОДНЫМ именем) — опция «применить ко всем» (например, четыре гонконгских варианта).
+ */
+@Composable
+private fun RenameServerDialog(
+    currentName: String,
+    originalName: String,
+    sameNameCount: Int,
+    onSave: (name: String, applyAll: Boolean) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var text by remember { mutableStateOf(currentName) }
+    var applyAll by remember { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Переименовать сервер") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Имя от сервера: $originalName", style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it },
+                    singleLine = true,
+                    placeholder = { Text(originalName) },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text("Пустое имя = вернуть имя от сервера.", style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
+                if (sameNameCount > 1) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Checkbox(checked = applyAll, onCheckedChange = { applyAll = it })
+                        Text("Применить ко всем с таким же именем ($sameNameCount)", style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = { onSave(text, applyAll) }) { Text("Сохранить") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
     )
 }
 
@@ -1302,7 +1401,7 @@ private fun SettingsSection(
 @Composable
 private fun BlocklistSection(
     blocklist: Blocklist,
-    serverNames: List<String>,
+    serverNames: List<Pair<String, String?>>,   // (исходное, пользовательское) — счётчик учитывает оба
     onAddWord: (String) -> Unit,
     onRemoveWord: (String) -> Unit,
     onUnblockServer: (String) -> Unit,
