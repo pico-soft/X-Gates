@@ -53,6 +53,15 @@ data class AppSettings(
     // При старте приложения: авто-обновить подписки и сразу запустить полный тест (подключиться к
     // быстрейшему). ДЕФОЛТ включён — это ожидаемое поведение; отключаемо здесь для ручного контроля.
     val autoStartOnLaunch: Boolean = true,
+
+    // --- Автомониторинг (этап 1: наблюдение + журнал, БЕЗ переключений) ---
+    // ДЕФОЛТ ВЫКЛ на этом этапе: сначала убеждаемся по журналу, что монитор думает правильно.
+    val monitorEnabled: Boolean = false,
+    val monitorIntervalSec: Int = 120,          // период цикла, с (эталон monitor_interval=120, мин 60)
+    val monitorDirectThreshold: Double = 1.0,   // порог прямого канала, Мбит/с (эталон direct_speed_threshold)
+    val monitorTunnelThreshold: Double = 1.0,   // порог туннеля, Мбит/с (эталон tunnel_speed_threshold)
+    // Сколько неудач ПОДРЯД считать падением. В эталоне решение за 1 цикл (счётчика нет) — наш анти-дребезг.
+    val monitorFailuresToVerdict: Int = 2,
 ) {
     // Производные (в единицах, которые нужны коду).
     val speedWarmupMs: Int get() = (speedWarmupSec * 1_000).roundToInt()

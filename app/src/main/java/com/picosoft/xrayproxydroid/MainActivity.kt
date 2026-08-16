@@ -74,11 +74,16 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import kotlin.math.roundToInt
 import com.picosoft.xrayproxydroid.service.LastServerStore
 import com.picosoft.xrayproxydroid.service.ProxyState
 import com.picosoft.xrayproxydroid.service.XrayProxyService
+import com.picosoft.xrayproxydroid.monitor.MonitorCoordinator
+import com.picosoft.xrayproxydroid.monitor.MonitorEvent
+import com.picosoft.xrayproxydroid.monitor.MonitorLog
 import com.picosoft.xrayproxydroid.settings.AppSettings
 import com.picosoft.xrayproxydroid.settings.Blocklist
 import com.picosoft.xrayproxydroid.settings.BlocklistStore
@@ -102,6 +107,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         SettingsStore.init(applicationContext)   // загрузить настройки до первого замера
         BlocklistStore.init(applicationContext)  // стоп-лист (первый запуск → засев дефолтом RU/BY)
+        MonitorLog.init(applicationContext)      // журнал автомониторинга (переживает перезапуск)
         SubscriptionManager.init(applicationContext)   // миграция старой подписки в мультиподписки (однократно)
         TrafficTracker.init(applicationContext)  // загрузить дневные корзины трафика
         enableEdgeToEdge()
@@ -152,6 +158,7 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
     val protocolCounts = remember(allServers) { allServers.groupingBy { it.protocol }.eachCount() }
     // Имена всех серверов — для счётчика «сколько блокирует слово» у чипов стоп-листа.
     val serverNames = remember(allServers) { allServers.map { it.remarks.ifBlank { it.address } } }
+    val monitorLog by MonitorLog.state.collectAsState()
     // Состояние раскрытия — на уровне вкладки (стабильное позиционное scoping), все свёрнуты по умолчанию.
     var settingsExpanded by rememberSaveable { mutableStateOf(false) }
     var blocklistExpanded by rememberSaveable { mutableStateOf(false) }
@@ -183,7 +190,16 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
                 )
             }
         }
-        item { CollapsibleSection("🛡️ Автомониторинг", monitorExpanded, { monitorExpanded = !monitorExpanded }) { StubText() } }
+        item {
+            CollapsibleSection("🛡️ Автомониторинг", monitorExpanded, { monitorExpanded = !monitorExpanded }) {
+                MonitorSection(
+                    settings = settings,
+                    onChange = { SettingsStore.update(context, it) },
+                    log = monitorLog,
+                    onClearLog = { MonitorLog.clear(context) },
+                )
+            }
+        }
         item {
             CollapsibleSection("Трафик", trafficExpanded, { trafficExpanded = !trafficExpanded }) { TrafficSection() }
         }
@@ -492,6 +508,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         val all = servers
         if (all.isEmpty()) { subStatus = "нет серверов"; return }
         fullTesting = true
+        MonitorCoordinator.fullTestRunning = true   // монитор молчит, пока идёт ручной тест
         TestProgress.startIndeterminate("запуск…")   // до первого done/total — indeterminate
         pingResults = emptyMap(); speedResults = emptyMap()
 
@@ -516,6 +533,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                         SubscriptionManager.applySpeedResults(context, sSnap) // персист скорости
                         activity.runOnUiThread {
                             fullTesting = false; fullHandle = null
+                            MonitorCoordinator.fullTestRunning = false   // тест закончился — монитор снова может работать
                             TestProgress.finish(                             // бар гаснет, итог остаётся текстом
                                 if (r.cancelled) "отменено"
                                 else "готово: быстрейший ${r.fastest?.remarks?.ifBlank { r.fastest.address } ?: "—"} ${r.fastestMbps} Мбит/с"
@@ -531,6 +549,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     fun onCancelFull() {
         fullHandle?.cancel(); fullHandle = null
         fullTesting = false
+        MonitorCoordinator.fullTestRunning = false   // отмена теста — монитор снова может работать
         TestProgress.finish("отменено")
         val pSnap = pingResults; val sSnap = speedResults
         Thread {
@@ -1361,6 +1380,80 @@ private fun WordChip(word: String, count: Int, onRemove: () -> Unit) {
             color = Color(0xFFEF5350),
             modifier = Modifier.clip(RoundedCornerShape(8.dp)).clickable { onRemove() }.padding(horizontal = 4.dp),
         )
+    }
+}
+
+// Формат времени для журнала монитора (только main-поток композиции → один экземпляр безопасен).
+private val monitorTimeFmt = SimpleDateFormat("dd.MM HH:mm:ss", Locale.getDefault())
+
+/**
+ * Секция «🛡️ Автомониторинг» — этап 1: наблюдение + журнал, БЕЗ переключений.
+ * Настройки (через SettingsStore) + журнал последних событий (свежие сверху).
+ */
+@Composable
+private fun MonitorSection(
+    settings: AppSettings,
+    onChange: (AppSettings) -> Unit,
+    log: List<MonitorEvent>,
+    onClearLog: () -> Unit,
+) {
+    val d = SettingsStore.DEFAULTS
+    Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            "Этап 1: монитор только НАБЛЮДАЕТ и пишет журнал (что сделал бы). Серверы НЕ переключает.",
+            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+        )
+        BoolSettingRow("Автомониторинг", settings.monitorEnabled, d.monitorEnabled) {
+            onChange(settings.copy(monitorEnabled = it))
+        }
+        IntSettingRow("Интервал цикла", "с", settings.monitorIntervalSec, d.monitorIntervalSec, 60, 3600) {
+            onChange(settings.copy(monitorIntervalSec = it))
+        }
+        DoubleSettingRow("Порог прямого канала", "Мбит/с", settings.monitorDirectThreshold, d.monitorDirectThreshold, 0.1, 100.0) {
+            onChange(settings.copy(monitorDirectThreshold = it))
+        }
+        DoubleSettingRow("Порог туннеля", "Мбит/с", settings.monitorTunnelThreshold, d.monitorTunnelThreshold, 0.1, 100.0) {
+            onChange(settings.copy(monitorTunnelThreshold = it))
+        }
+        IntSettingRow("Неудач подряд = падение", "", settings.monitorFailuresToVerdict, d.monitorFailuresToVerdict, 1, 10) {
+            onChange(settings.copy(monitorFailuresToVerdict = it))
+        }
+
+        Spacer(Modifier.height(4.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            SettingsGroupLabel("Журнал (${log.size})")
+            if (log.isNotEmpty()) TextButton(onClick = onClearLog) { Text("Очистить") }
+        }
+        if (log.isEmpty()) {
+            Text(
+                "Пока пусто. Включите автомониторинг — события появятся здесь.",
+                style = MaterialTheme.typography.bodyMedium, color = TABLE_GRAY,
+            )
+        } else {
+            log.asReversed().forEach { MonitorLogRow(it) }   // свежие сверху
+        }
+    }
+}
+
+/** Одна запись журнала: время + вердикт, под ним состояния сигналов и (если есть) гипотетическое действие. */
+@Composable
+private fun MonitorLogRow(e: MonitorEvent) {
+    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+        Text(
+            "${monitorTimeFmt.format(Date(e.ts))} · ${e.verdict}",
+            style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold,
+        )
+        Text(
+            "прямой: ${e.direct} · туннель: ${e.tunnel}",
+            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+        )
+        if (e.wouldDo.isNotEmpty()) {
+            Text("→ ${e.wouldDo}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+        }
     }
 }
 

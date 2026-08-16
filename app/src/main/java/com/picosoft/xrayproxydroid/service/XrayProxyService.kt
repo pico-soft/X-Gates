@@ -6,10 +6,17 @@ import android.content.Intent
 import android.os.IBinder
 import android.util.Log
 import androidx.core.content.ContextCompat
+import com.picosoft.xrayproxydroid.monitor.NetworkMonitor
 import com.picosoft.xrayproxydroid.settings.SettingsStore
 import com.picosoft.xrayproxydroid.traffic.TrafficTracker
 import com.picosoft.xrayproxydroid.xray.XrayConfig
 import com.picosoft.xrayproxydroid.xray.XrayController
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import java.net.InetSocketAddress
 import java.net.Socket
 
@@ -22,6 +29,10 @@ import java.net.Socket
 class XrayProxyService : Service() {
 
     @Volatile private var polling = false
+
+    // Корутина автомониторинга (наблюдение + журнал). Живёт ТОЛЬКО пока сервис/туннель активны.
+    private val monitorScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var monitorJob: Job? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -65,6 +76,7 @@ class XrayProxyService : Service() {
                         )
                         LastServerStore.save(applicationContext, serverKey)   // запомнить для автозапуска
                         startTrafficPolling()
+                        startMonitor()   // цикл наблюдения (само-гейтится по настройке monitorEnabled)
                     } else {
                         ProxyState.update(running = false, label = label, serverKey = serverKey, message = "ядро не запустилось")
                         stopSelfAndForeground()
@@ -78,7 +90,19 @@ class XrayProxyService : Service() {
         }.start()
     }
 
+    /** Запустить цикл наблюдения (идемпотентно). Само-гейтится: если monitorEnabled=false — просто спит. */
+    private fun startMonitor() {
+        if (monitorJob?.isActive == true) return
+        monitorJob = monitorScope.launch { NetworkMonitor.loop(applicationContext) }
+    }
+
+    private fun stopMonitor() {
+        monitorJob?.cancel()
+        monitorJob = null
+    }
+
     private fun handleStop() {
+        stopMonitor()
         Thread {
             polling = false
             XrayController.queryTunnelDelta()?.let { TrafficTracker.addTunnel(it.first, it.second) }  // финальный замер туннеля
@@ -116,6 +140,7 @@ class XrayProxyService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         polling = false
+        monitorScope.cancel()   // погасить цикл наблюдения вместе с сервисом
         // Страховка: если сервис уничтожают — гасим ядро.
         if (XrayController.isRunning) {
             XrayController.queryTunnelDelta()?.let { TrafficTracker.addTunnel(it.first, it.second) }
