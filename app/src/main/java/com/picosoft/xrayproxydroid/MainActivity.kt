@@ -68,7 +68,16 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.layout.size
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
+import kotlin.math.cos
+import kotlin.math.sin
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
@@ -87,6 +96,7 @@ import kotlin.math.roundToInt
 import com.picosoft.xrayproxydroid.service.LastServerStore
 import com.picosoft.xrayproxydroid.service.ProxyState
 import com.picosoft.xrayproxydroid.service.SystemVpnState
+import com.picosoft.xrayproxydroid.service.VpnStatus
 import com.picosoft.xrayproxydroid.service.XrayProxyService
 import com.picosoft.xrayproxydroid.monitor.LogEvent
 import com.picosoft.xrayproxydroid.monitor.MonitorCoordinator
@@ -151,6 +161,7 @@ private fun AppRoot() {
         stateHolder.SaveableStateProvider(tab) {
             when (tab) {
                 0 -> BootScreen(modifier = Modifier.padding(innerPadding))
+                1 -> SubscriptionsScreen(modifier = Modifier.padding(innerPadding))
                 else -> SettingsTab(modifier = Modifier.padding(innerPadding))
             }
         }
@@ -201,6 +212,7 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
     }
     val monitorLog by MonitorLog.state.collectAsState()
     val heartbeat by MonitorStatus.state.collectAsState()
+    val vpnStatus by SystemVpnState.state.collectAsState()   // сообщение о системном VPN — здесь, на цветном поле
     // Состояние раскрытия — на уровне вкладки (стабильное позиционное scoping), все свёрнуты по умолчанию.
     var settingsExpanded by rememberSaveable { mutableStateOf(false) }
     var blocklistExpanded by rememberSaveable { mutableStateOf(false) }
@@ -211,6 +223,10 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
         contentPadding = PaddingValues(vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
+        // Сообщение о системном VPN — на цветном поле, только эта надпись (перенесено с Главной).
+        if (vpnStatus.relation != VpnRelation.NONE) {
+            item { VpnStatusCard(vpnStatus, onRetry = { XrayProxyService.retryVpnBypass(context) }) }
+        }
         item {
             CollapsibleSection("⚙️ Настройки", settingsExpanded, { settingsExpanded = !settingsExpanded }) {
                 SettingsSection(
@@ -250,14 +266,119 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
 }
 
 /**
- * Компактная нижняя панель: Row из двух равных элементов, высота ~[BOTTOM_BAR_HEIGHT].
- * Мелкие подписи, без иконок; активная вкладка — цвет текста + тонкая полоса сверху (без заливки).
- * Системный отступ навигации (WindowInsets.navigationBars) добавляется ОТДЕЛЬНО, не входит в 28dp.
- * cappedDensity НЕ применяем; при крупных шрифтах высота растёт (heightIn min), подпись не обрезается.
+ * Вкладка «Подписки» (отдельная, Промпт 68): список источников + добавить URL/вставить/из файла,
+ * вкл/выкл, удалить, переименовать, обновить все. Логика перенесена сюда с Главной. Своё состояние
+ * `sources`; при возврате на Главную список серверов подхватится свежим (BootScreen перечитывает).
+ */
+@Composable
+private fun SubscriptionsScreen(modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    val activity = context as ComponentActivity
+    var sources by remember { mutableStateOf(SubscriptionManager.sources(context)) }
+    var pendingDelete by remember { mutableStateOf<SubSource?>(null) }
+    var renameSource by remember { mutableStateOf<SubSource?>(null) }
+    var status by remember { mutableStateOf("") }
+    var refreshing by remember { mutableStateOf(false) }
+
+    fun reload() { sources = SubscriptionManager.sources(context) }
+
+    fun onImportFile(uri: android.net.Uri) {
+        Thread {
+            val body = runCatching {
+                context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+            }.getOrNull().orEmpty()
+            if (body.isBlank()) { activity.runOnUiThread { status = "файл пуст/не прочитан" }; return@Thread }
+            val name = uri.lastPathSegment?.substringAfterLast('/') ?: "файл"
+            val (_, s) = SubscriptionManager.addLocalFromBody(context, body, name)
+            activity.runOnUiThread {
+                status = "из файла: +${s.added}  дубли=${s.duplicates}  неподдерж=${s.unsupported}  ошибок=${s.invalid}"; reload()
+            }
+        }.start()
+    }
+    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri -> if (uri != null) onImportFile(uri) }
+
+    fun onAddUrl(url: String, name: String) {
+        if (url.isBlank()) { status = "введите URL"; return }
+        Thread {
+            val id = SubscriptionManager.addUrl(context, url, name)
+            if (id == null) { activity.runOnUiThread { status = "дубликат URL или пусто"; reload() }; return@Thread }
+            val s = SubscriptionManager.refreshOne(context, id)
+            activity.runOnUiThread {
+                status = if (s.ok) "добавлено: +${s.added}" else "источник добавлен, обновление: ${s.error}"; reload()
+            }
+        }.start()
+    }
+    fun onAddPaste(text: String) {
+        if (text.isBlank()) { status = "вставьте ссылки"; return }
+        Thread {
+            val (_, s) = SubscriptionManager.addLocalFromBody(context, text)
+            activity.runOnUiThread {
+                status = "вставка: +${s.added}  дубли=${s.duplicates}  неподдерж=${s.unsupported}  ошибок=${s.invalid}"; reload()
+            }
+        }.start()
+    }
+    fun onRefreshAll() {
+        if (refreshing) return
+        if (sources.none { it.enabled && it.url.isNotBlank() }) { status = "нет включённых подписок с URL"; return }
+        refreshing = true; status = "обновление…"
+        Thread {
+            val res = SubscriptionManager.refreshAllEnabled(context, cancelled = { false }, onEach = { _, _ -> activity.runOnUiThread { reload() } })
+            val okN = res.values.count { it.ok }; val failN = res.values.count { !it.ok }
+            activity.runOnUiThread { refreshing = false; status = "обновлено: $okN ок, $failN ошибок"; reload() }
+        }.start()
+    }
+
+    LazyColumn(
+        modifier = modifier.fillMaxSize().padding(horizontal = 14.dp),
+        contentPadding = PaddingValues(vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        item { Text("Подписки (${sources.size})", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold) }
+        item {
+            OutlinedButton(onClick = { onRefreshAll() }, enabled = !refreshing, modifier = Modifier.fillMaxWidth()) {
+                Text(if (refreshing) "Обновление…" else "↻ Обновить все")
+            }
+        }
+        item {
+            SubscriptionsSection(
+                sources = sources,
+                onAddUrl = { url, name -> onAddUrl(url, name) },
+                onAddPaste = { onAddPaste(it) },
+                onImportFile = { filePicker.launch("*/*") },
+                onToggle = { id, en -> SubscriptionManager.setEnabled(context, id, en); reload() },
+                onDeleteRequest = { pendingDelete = it },
+                onRenameRequest = { renameSource = it },
+            )
+        }
+        if (status.isNotEmpty()) item { Text(status, style = MaterialTheme.typography.bodySmall) }
+    }
+
+    renameSource?.let { src ->
+        RenameSourceDialog(
+            source = src,
+            onSave = { SubscriptionManager.rename(context, src.id, it); renameSource = null; reload() },
+            onDismiss = { renameSource = null },
+        )
+    }
+    pendingDelete?.let { src ->
+        val lost = remember(src) { SubscriptionManager.serversLostOnRemove(context, src.id) }
+        AlertDialog(
+            onDismissRequest = { pendingDelete = null },
+            title = { Text("Удалить источник?") },
+            text = { Text("«${src.name}»\nИсчезнет серверов: $lost (только те, которых нет в других подписках).") },
+            confirmButton = { TextButton(onClick = { SubscriptionManager.remove(context, src.id); pendingDelete = null; reload() }) { Text("Удалить") } },
+            dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("Отмена") } },
+        )
+    }
+}
+
+/**
+ * Компактная нижняя панель: три вкладки ИКОНКАМИ без подписей (Промпт 68) — 🏠 Главная · 🔗 Подписки ·
+ * ⚙️ Настройки. Активная: тонкая полоса-индикатор сверху + полная непрозрачность (неактивные приглушены).
+ * Системный отступ навигации — отдельным инсетом. cappedDensity — чтобы эмодзи не распухали при крупном шрифте.
  */
 @Composable
 private fun CompactBottomBar(selected: Int, onSelect: (Int) -> Unit) {
-    val labels = listOf("Главная", "Настройки")
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -271,38 +392,74 @@ private fun CompactBottomBar(selected: Int, onSelect: (Int) -> Unit) {
                 .height(1.dp)
                 .background(MaterialTheme.colorScheme.outlineVariant),
         )
-        // Подпись при крупных системных шрифтах не режем высотой — ограничиваем масштаб (cappedDensity).
-        CompositionLocalProvider(LocalDensity provides cappedDensity()) {
-            Row(
-                modifier = Modifier.fillMaxWidth().height(BOTTOM_BAR_HEIGHT),   // ФИКС. высота — панель тонкая
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                labels.forEachIndexed { i, label ->
-                    val active = i == selected
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)                 // weight — ТОЛЬКО ширина; высоту НЕ трогаем
-                            .clickable { onSelect(i) },
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            // тонкая полоса-индикатор ВНУТРИ вкладки (прозрачна у неактивной — layout не прыгает)
-                            Box(
-                                modifier = Modifier
-                                    .width(24.dp)
-                                    .height(2.dp)
-                                    .background(if (active) MaterialTheme.colorScheme.primary else Color.Transparent),
-                            )
-                            Spacer(Modifier.height(2.dp))
-                            Text(
-                                label,
-                                fontSize = 11.sp,
-                                maxLines = 1,
-                                color = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
-                                fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
-                            )
-                        }
+        val activeColor = MaterialTheme.colorScheme.primary
+        val inactiveColor = MaterialTheme.colorScheme.onSurfaceVariant
+        Row(
+            modifier = Modifier.fillMaxWidth().height(BOTTOM_BAR_HEIGHT),   // ФИКС. высота — панель тонкая
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            for (i in 0..2) {
+                val active = i == selected
+                Box(
+                    modifier = Modifier
+                        .weight(1f)                 // weight — ТОЛЬКО ширина; высоту НЕ трогаем
+                        .clickable { onSelect(i) },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    // Иконка меньше высоты панели → сверху/снизу остаются поля. Активность: цвет + полоса.
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Box(
+                            modifier = Modifier
+                                .width(22.dp)
+                                .height(2.dp)
+                                .background(if (active) activeColor else Color.Transparent),
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        NavIcon(i, if (active) activeColor else inactiveColor, size = 18.dp)
                     }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Монохромные FLAT-иконки нижней навигации, нарисованы Canvas (тонируются переданным цветом → активность
+ * = цветом + полосой сверху). 0 = домик, 1 = листок с текстовыми строчками (подписки), 2 = шестерёнка.
+ */
+@Composable
+private fun NavIcon(index: Int, color: Color, size: androidx.compose.ui.unit.Dp) {
+    Canvas(Modifier.size(size)) {
+        val s = this.size.minDimension
+        val sw = s * 0.10f
+        val stroke = Stroke(width = sw, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        when (index) {
+            0 -> {   // домик: крыша (полилиния) + корпус + дверь
+                drawPath(Path().apply {
+                    moveTo(s * 0.16f, s * 0.47f); lineTo(s * 0.50f, s * 0.16f); lineTo(s * 0.84f, s * 0.47f)
+                }, color, style = stroke)
+                drawPath(Path().apply {
+                    moveTo(s * 0.27f, s * 0.44f); lineTo(s * 0.27f, s * 0.84f)
+                    lineTo(s * 0.73f, s * 0.84f); lineTo(s * 0.73f, s * 0.44f)
+                }, color, style = stroke)
+                drawLine(color, Offset(s * 0.50f, s * 0.84f), Offset(s * 0.50f, s * 0.63f), sw)
+            }
+            1 -> {   // листок с текстовыми строчками (подписки)
+                drawRoundRect(
+                    color, topLeft = Offset(s * 0.24f, s * 0.12f), size = Size(s * 0.52f, s * 0.76f),
+                    cornerRadius = CornerRadius(s * 0.07f, s * 0.07f), style = stroke,
+                )
+                val x1 = s * 0.34f; val x2 = s * 0.66f
+                for (y in listOf(0.34f, 0.50f, 0.66f)) drawLine(color, Offset(x1, s * y), Offset(x2, s * y), sw * 0.9f)
+            }
+            else -> {   // шестерёнка: кольцо + отверстие + 8 зубьев
+                val c = Offset(s / 2f, s / 2f); val r = s * 0.25f; val tooth = s * 0.10f
+                drawCircle(color, r, c, style = stroke)
+                drawCircle(color, r * 0.42f, c, style = stroke)
+                for (k in 0 until 8) {
+                    val a = Math.toRadians(k * 45.0)
+                    val dx = cos(a).toFloat(); val dy = sin(a).toFloat()
+                    drawLine(color, Offset(c.x + dx * r, c.y + dy * r), Offset(c.x + dx * (r + tooth), c.y + dy * (r + tooth)), sw * 1.3f)
                 }
             }
         }
@@ -377,19 +534,15 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     val proxy by ProxyState.state.collectAsState()
     val settings by SettingsStore.state.collectAsState()   // живое применение порогов в UI
     val blocklist by BlocklistStore.state.collectAsState() // стоп-лист: пересчёт списков при изменении
-    val vpnStatus by SystemVpnState.state.collectAsState() // чужой системный VPN: активен / идём мимо
 
     var subStatus by remember { mutableStateOf("") }
     var servers by remember { mutableStateOf(SubscriptionManager.allServers(context)) }
     var sources by remember { mutableStateOf(SubscriptionManager.sources(context)) }
     var refreshingSubs by remember { mutableStateOf(false) }
     var subRefreshCancel by remember { mutableStateOf(false) }
-    var pendingDelete by remember { mutableStateOf<SubSource?>(null) }
-    var renameSource by remember { mutableStateOf<SubSource?>(null) }
     var renameProfile by remember { mutableStateOf<ServerProfile?>(null) }   // диалог переименования сервера
-    // Раскрытие сворачиваемых секций главной — на уровне экрана (стабильно, переживает переключение вкладок).
+    // Раскрытие «Все серверы» — на уровне экрана (стабильно, переживает переключение вкладок).
     var allServersExpanded by rememberSaveable { mutableStateOf(false) }
-    var subscriptionsExpanded by rememberSaveable { mutableStateOf(false) }
 
     var pingResults by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
 
@@ -511,66 +664,9 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         }.start()
     }
 
-    fun onAddUrl(url: String, name: String) {
-        if (url.isBlank()) { subStatus = "введите URL"; return }
-        Thread {
-            val id = SubscriptionManager.addUrl(context, url, name)
-            if (id == null) { activity.runOnUiThread { subStatus = "дубликат URL или пусто"; reloadSources() }; return@Thread }
-            val s = SubscriptionManager.refreshOne(context, id)
-            activity.runOnUiThread {
-                subStatus = if (s.ok) "добавлено: +${s.added}" else "источник добавлен, обновление: ${s.error}"
-                reloadSources(); reloadServers()
-            }
-        }.start()
-    }
-
-    fun onAddPaste(text: String) {
-        if (text.isBlank()) { subStatus = "вставьте ссылки"; return }
-        Thread {
-            val (_, s) = SubscriptionManager.addLocalFromBody(context, text)
-            activity.runOnUiThread {
-                subStatus = "вставка: +${s.added}  дубли=${s.duplicates}  неподдерж=${s.unsupported}  ошибок=${s.invalid}"
-                reloadSources(); reloadServers()
-            }
-        }.start()
-    }
-
-    fun onImportFile(uri: android.net.Uri) {
-        Thread {
-            val body = runCatching {
-                context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
-            }.getOrNull().orEmpty()
-            if (body.isBlank()) { activity.runOnUiThread { subStatus = "файл пуст/не прочитан" }; return@Thread }
-            val name = uri.lastPathSegment?.substringAfterLast('/') ?: "файл"
-            val (_, s) = SubscriptionManager.addLocalFromBody(context, body, name)
-            activity.runOnUiThread {
-                subStatus = "из файла: +${s.added}  дубли=${s.duplicates}  неподдерж=${s.unsupported}  ошибок=${s.invalid}"
-                reloadSources(); reloadServers()
-            }
-        }.start()
-    }
-
-    fun onToggleSource(id: String, enabled: Boolean) {
-        SubscriptionManager.setEnabled(context, id, enabled)
-        reloadSources(); reloadServers()
-    }
-
-    fun onDeleteSource(src: SubSource) {
-        SubscriptionManager.remove(context, src.id)
-        pendingDelete = null
-        reloadSources(); reloadServers()
-    }
-
-    fun onRenameSource(id: String, name: String) {
-        SubscriptionManager.rename(context, id, name)
-        renameSource = null
-        reloadSources()
-    }
-
-    // Пикер файла (объявлен после onImportFile — локальные функции без forward-reference).
-    val filePickerLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.GetContent()
-    ) { uri -> if (uri != null) onImportFile(uri) }
+    // Управление подписками (добавить/вставить/файл/переключить/удалить/переименовать) переехало на
+    // ОТДЕЛЬНУЮ вкладку «Подписки» ([SubscriptionsScreen]). Здесь остаётся только onRefreshAll (кнопка
+    // «↻ Подписки» на панели действий + автозапуск).
 
     // Полный адаптивный тест: ping → speed по живым → early-connect первого рабочего → апгрейд.
     fun onFullTest() {
@@ -703,7 +799,6 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     val surface = MaterialTheme.colorScheme.surface
     val liveBg = lerp(surface, MaterialTheme.colorScheme.tertiaryContainer, 0.18f)   // светло-зелёный тон
     val allBg = lerp(surface, MaterialTheme.colorScheme.secondaryContainer, 0.18f)   // серо-голубой тон
-    val subsBg = lerp(surface, MaterialTheme.colorScheme.primaryContainer, 0.14f)    // сиреневый тон
     val divCol = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.10f)             // волосок-разделитель
 
     // Единый LazyColumn. verticalArrangement=0: строки одной секции примыкают (сплошной фон-блок без
@@ -724,9 +819,6 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                     subtitle = activeServer?.let { protoNetSec(it) },
                     speedMbps = activeServer?.let { effSpeed(it) },
                     hidden = activeHidden, blocked = activeBlocked,
-                    vpnRelation = vpnStatus.relation, vpnBypassed = vpnStatus.bypassed,
-                    vpnBypassFailed = vpnStatus.bypassFailed, vpnNoExit = vpnStatus.noExit,
-                    onRetryBypass = { XrayProxyService.retryVpnBypass(context) },
                     message = proxy.message,
                 )
                 ActionsBar(
@@ -799,29 +891,8 @@ private fun BootScreen(modifier: Modifier = Modifier) {
             }
             item { SectionBottomCap(allBg) }
         }
-        item { Spacer(Modifier.height(12.dp)) }
-
-        // Подписки — рабочее действие, остаётся на главной. Сиреневый.
-        stickyHeader(key = "h-subs") {
-            SectionHeader("Подписки (${sources.size})", subsBg, roundedBottom = !subscriptionsExpanded,
-                arrow = if (subscriptionsExpanded) "▾" else "▸", onClick = { subscriptionsExpanded = !subscriptionsExpanded })
-        }
-        if (subscriptionsExpanded) {
-            item {
-                Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(bottomStart = 14.dp, bottomEnd = 14.dp)).background(subsBg).padding(horizontal = 10.dp, vertical = 8.dp)) {
-                    SubscriptionsSection(
-                        sources = sources,
-                        onAddUrl = { url, name -> onAddUrl(url, name) },
-                        onAddPaste = { onAddPaste(it) },
-                        onImportFile = { filePickerLauncher.launch("*/*") },
-                        onToggle = { id, en -> onToggleSource(id, en) },
-                        onDeleteRequest = { pendingDelete = it },
-                        onRenameRequest = { renameSource = it },
-                    )
-                }
-            }
-        }
-        // Настройки / Стоп-лист / Автомониторинг / Трафик переехали во вкладку «Настройки».
+        // Подписки — отдельная вкладка ([SubscriptionsScreen]). Настройки/Стоп-лист/Автомониторинг/Трафик —
+        // во вкладке «Настройки».
 
         // ═══ ФУТЕР ═══
         item {
@@ -878,26 +949,6 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         )
     }
 
-    // Переименование источника: имя + URL целиком.
-    renameSource?.let { src ->
-        RenameSourceDialog(
-            source = src,
-            onSave = { onRenameSource(src.id, it) },
-            onDismiss = { renameSource = null },
-        )
-    }
-
-    // Подтверждение удаления источника — с числом серверов, которые ИСЧЕЗНУТ (нет в других источниках).
-    pendingDelete?.let { src ->
-        val lost = remember(src) { SubscriptionManager.serversLostOnRemove(context, src.id) }
-        AlertDialog(
-            onDismissRequest = { pendingDelete = null },
-            title = { Text("Удалить источник?") },
-            text = { Text("«${src.name}»\nИсчезнет серверов: $lost (только те, которых нет в других подписках).") },
-            confirmButton = { TextButton(onClick = { onDeleteSource(src) }) { Text("Удалить") } },
-            dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("Отмена") } },
-        )
-    }
 }
 
 /** Шапка: имя приложения + место под будущий подзаголовок. */
@@ -980,11 +1031,6 @@ private fun StatusBox(
     speedMbps: Double?,
     hidden: Boolean,
     blocked: Boolean,
-    vpnRelation: VpnRelation,
-    vpnBypassed: Boolean,
-    vpnBypassFailed: Boolean,
-    vpnNoExit: Boolean,
-    onRetryBypass: () -> Unit,
     message: String,
 ) {
     val bg = when {
@@ -1025,29 +1071,7 @@ private fun StatusBox(
             if (hidden) {
                 Text("⚠ протокол скрыт настройками", style = MaterialTheme.typography.bodySmall, color = fg, fontWeight = FontWeight.Bold)
             }
-            // Чужой системный VPN — состояния (Промпт 60/62). Предупреждение о «канале VPN» ТОЛЬКО когда мы
-            // ВНУТРИ и не идём мимо; в EXCLUDED замеры честные. noExit (E3) — отличаем от «нет интернета».
-            val vpnLine = when (vpnRelation) {
-                VpnRelation.INSIDE -> when {
-                    vpnBypassed -> "🛡 системный VPN активен — идём мимо него"
-                    vpnNoExit -> "⛔ системный VPN не пропускает трафик, а обход запрещён его настройками (lockdown) — наружу не выходит никто"
-                    vpnBypassFailed -> "⚠ обход не удался (lockdown) — идём ЧЕРЕЗ системный VPN, замер = его канал"
-                    else -> "⚠ системный VPN активен — трафик и замеры идут ЧЕРЕЗ него (двойной туннель, замер = канал VPN)"
-                }
-                VpnRelation.EXCLUDED -> "🛡 системный VPN активен, но нас не касается (мы вне его)"
-                VpnRelation.NONE -> null
-            }
-            if (vpnLine != null) {
-                Text(vpnLine, style = MaterialTheme.typography.bodySmall, color = fg, fontWeight = FontWeight.Bold)
-            }
-            // Повторить обход сразу (не ждать троттлинга 5 мин), напр. после выключения lockdown.
-            if (vpnBypassFailed || vpnNoExit) {
-                Text(
-                    "↻ Повторить обход",
-                    style = MaterialTheme.typography.bodySmall, color = fg, fontWeight = FontWeight.Bold,
-                    modifier = Modifier.clip(RoundedCornerShape(4.dp)).clickable { onRetryBypass() }.padding(vertical = 2.dp),
-                )
-            }
+            // Сообщение о системном VPN переехало на вкладку «Настройки» ([VpnStatusCard]).
             // Мелко: протокол · network · security активного сервера (вместо портов).
             if (subtitle != null) {
                 Text(subtitle, style = MaterialTheme.typography.bodySmall, color = fg)
@@ -1067,6 +1091,48 @@ private fun StatusBox(
         }
         if (message.isNotEmpty() && message != "idle") {
             Text(message, style = MaterialTheme.typography.bodySmall, color = fg)
+        }
+    }
+}
+
+/**
+ * Сообщение о ЧУЖОМ системном VPN — на ЦВЕТНОМ поле (только эта надпись), вкладка «Настройки».
+ * Цвет по серьёзности: зелёный (мы мимо / нас не касается), янтарный (идём через VPN), красный (наружу
+ * никто). Кнопка «Повторить обход» — при неудавшемся обходе/lockdown. Показывается вызывающим только при
+ * relation != NONE.
+ */
+@Composable
+private fun VpnStatusCard(vpn: VpnStatus, onRetry: () -> Unit) {
+    val text: String; val bg: Color; val fg: Color
+    when {
+        vpn.relation == VpnRelation.EXCLUDED -> {
+            text = "🛡 системный VPN активен, но нас не касается (мы вне его)"; bg = Color(0xFF1B5E20); fg = Color(0xFFA5D6A7)
+        }
+        vpn.relation == VpnRelation.INSIDE && vpn.bypassed -> {
+            text = "🛡 системный VPN активен — идём мимо него"; bg = Color(0xFF1B5E20); fg = Color(0xFFA5D6A7)
+        }
+        vpn.relation == VpnRelation.INSIDE && vpn.noExit -> {
+            text = "⛔ системный VPN не пропускает трафик, а обход запрещён его настройками (lockdown) — наружу не выходит никто"; bg = Color(0xFF7F1D1D); fg = Color(0xFFFFCDD2)
+        }
+        vpn.relation == VpnRelation.INSIDE && vpn.bypassFailed -> {
+            text = "⚠ обход не удался (lockdown) — идём ЧЕРЕЗ системный VPN, замер = его канал"; bg = Color(0xFF6D4C00); fg = Color(0xFFFFE082)
+        }
+        vpn.relation == VpnRelation.INSIDE -> {
+            text = "⚠ системный VPN активен — трафик и замеры идут ЧЕРЕЗ него (двойной туннель, замер = канал VPN)"; bg = Color(0xFF6D4C00); fg = Color(0xFFFFE082)
+        }
+        else -> return   // NONE — не показываем (гейт в вызывающем)
+    }
+    Column(
+        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(bg).padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Text(text, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold, color = fg)
+        if (vpn.bypassFailed || vpn.noExit) {
+            Text(
+                "↻ Повторить обход",
+                style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold, color = fg,
+                modifier = Modifier.clip(RoundedCornerShape(4.dp)).clickable { onRetry() }.padding(vertical = 2.dp),
+            )
         }
     }
 }
