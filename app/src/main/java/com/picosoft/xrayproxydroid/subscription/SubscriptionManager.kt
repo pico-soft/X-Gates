@@ -42,9 +42,6 @@ object SubscriptionManager {
 
     private const val TAG = "SubscriptionManager"
 
-    /** URL старой единственной подписки — ТОЛЬКО как значение при первой миграции (из кода убран). */
-    private const val LEGACY_DEFAULT_URL = "https://maxim-zodchy.ru/sub-black.php"
-
     /**
      * Ключ ПОЛНОЙ идентичности соединения — дедуп внутри источника, склейка МЕЖДУ источниками,
      * привязка pingMs/speed, определение активного сервера. НЕ только addr+port+cred (иначе
@@ -86,10 +83,14 @@ object SubscriptionManager {
         return SourcesFile(migratedLegacy = true, sources = sources, servers = registry)
     }
 
-    /** Свежая установка: один источник — старый URL, ещё не обновлён (серверов нет). */
+    /**
+     * Свежая установка: БЕЗ зашитых подписок (Промпт 67) — пользователь добавляет свои сам. Раньше здесь
+     * сидел зашитый дефолтный URL; его убрали, чтобы чужой дефолт не попадал в релиз и не «воскресал»
+     * при очистке данных. Помечаем migratedLegacy=true, чтобы init больше не срабатывал.
+     */
     private fun freshDefault(): SourcesFile = SourcesFile(
         migratedLegacy = true,
-        sources = listOf(SubSource(id = newId(), name = nameFromUrl(LEGACY_DEFAULT_URL), url = LEGACY_DEFAULT_URL)),
+        sources = emptyList(),
         servers = emptyList(),
     )
 
