@@ -70,6 +70,24 @@ object XrayController {
     }
 
     /**
+     * Дельта трафика активного туннеля через core queryStats по тегу outbound "proxy".
+     * queryStats (AndroidLibXrayLite) читает счётчик С СБРОСОМ → возвращает байты с ПРОШЛОГО опроса.
+     * @return (принято downlink, отдано uplink) или null, если ядро не запущено/ошибка.
+     */
+    @Synchronized
+    fun queryTunnelDelta(): Pair<Long, Long>? {
+        val core = controller ?: return null
+        return try {
+            val up = core.queryStats("proxy", "uplink")
+            val down = core.queryStats("proxy", "downlink")
+            down to up
+        } catch (e: Exception) {
+            Log.d(TAG, "queryStats failed: ${e.message}")
+            null
+        }
+    }
+
+    /**
      * Real ping: задержка через outbound переданного конфига БЕЗ запуска loop.
      * `Libv2ray.measureOutboundDelay` обнуляет inbounds и поднимает временный инстанс —
      * не трогает активный прокси и не занимает порты, потому безопасно и параллельно.

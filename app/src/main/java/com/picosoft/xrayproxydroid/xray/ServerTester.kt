@@ -1,9 +1,12 @@
 package com.picosoft.xrayproxydroid.xray
 
 import android.content.Context
+import com.picosoft.xrayproxydroid.settings.SettingsStore
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
+import java.util.concurrent.Callable
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -15,14 +18,29 @@ object ServerTester {
 
     const val GSTATIC_204 = "https://www.gstatic.com/generate_204"
 
-    /** Один замер: profile → config → real ping. Возвращает мс (≥0) или -1 (мёртвый/ошибка сборки). */
-    fun ping(context: Context, profile: ServerProfile): Long {
+    /** Пул для МЯГКОГО таймаута: libv2ray.measureOutboundDelay сам таймаут не принимает, поэтому
+     *  ждём результат с Future.get(timeout); при просрочке — сервер считаем мёртвым. */
+    private val jniPool = Executors.newCachedThreadPool()
+
+    /**
+     * Один замер: profile → config → real ping. Возвращает мс (≥0) или -1 (мёртвый/таймаут/ошибка).
+     * [timeoutMs] — мягкий верхний предел (из настроек); брошенный JNI-замер сам погасит temp-инстанс.
+     */
+    fun ping(context: Context, profile: ServerProfile, timeoutMs: Int = SettingsStore.current().pingTimeoutMs): Long {
         val cfg = try {
             XrayConfigBuilder.build(profile)
         } catch (e: Exception) {
             return -1L   // неподдерживаемый транспорт и т.п.
         }
-        return XrayController.measureOutboundDelay(context, cfg, GSTATIC_204)
+        val future = jniPool.submit(Callable { XrayController.measureOutboundDelay(context, cfg, GSTATIC_204) })
+        return try {
+            future.get(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+        } catch (e: TimeoutException) {
+            future.cancel(true)
+            -1L
+        } catch (e: Exception) {
+            -1L
+        }
     }
 
     /** Управление запущенным батчем. */
@@ -41,7 +59,7 @@ object ServerTester {
     fun testAll(
         context: Context,
         servers: List<ServerProfile>,
-        concurrency: Int = 8,
+        concurrency: Int = SettingsStore.current().pingPool,
         onResult: (ServerProfile, Long) -> Unit,
         onProgress: (done: Int, total: Int) -> Unit,
         onFinish: () -> Unit = {},
@@ -54,11 +72,15 @@ object ServerTester {
 
         for (p in servers) {
             pool.execute {
-                if (cancelled.get()) return@execute
-                val ms = ping(appCtx, p)
-                if (cancelled.get()) return@execute
-                onResult(p, ms)
-                onProgress(done.incrementAndGet(), total)
+                try {
+                    if (cancelled.get()) return@execute
+                    val ms = ping(appCtx, p)
+                    if (cancelled.get()) return@execute
+                    onResult(p, ms)
+                    onProgress(done.incrementAndGet(), total)
+                } catch (e: Exception) {
+                    android.util.Log.w("ServerTester", "задача пинга упала (проглочено): ${e.message}")
+                }
             }
         }
         pool.shutdown() // новых не принимаем; уже поданные выполняются
