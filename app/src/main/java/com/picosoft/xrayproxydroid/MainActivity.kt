@@ -19,17 +19,23 @@ import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -38,8 +44,6 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -103,28 +107,69 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-/** Корень с нижней навигацией: «Главная» (весь существующий экран) + «Трафик». */
+/** Высота собственной нижней панели (стандартный NavigationBar фиксирован 80dp — не годится).
+ *  Подбирать здесь; системный отступ навигации сюда НЕ входит (он добавляется отдельно инсетом). */
+private val BOTTOM_BAR_HEIGHT = 28.dp
+
+/** Корень с компактной нижней навигацией: «Главная» (весь существующий экран) + «Трафик». */
 @Composable
 private fun AppRoot() {
     var tab by remember { mutableStateOf(0) }
     Scaffold(
         modifier = Modifier.fillMaxSize(),
-        bottomBar = {
-            NavigationBar {
-                NavigationBarItem(
-                    selected = tab == 0, onClick = { tab = 0 },
-                    icon = { Text("🏠") }, label = { Text("Главная") },
-                )
-                NavigationBarItem(
-                    selected = tab == 1, onClick = { tab = 1 },
-                    icon = { Text("📊") }, label = { Text("Трафик") },
-                )
-            }
-        },
+        bottomBar = { CompactBottomBar(selected = tab, onSelect = { tab = it }) },
     ) { innerPadding ->
         when (tab) {
             0 -> BootScreen(modifier = Modifier.padding(innerPadding))
             else -> TrafficScreen(modifier = Modifier.padding(innerPadding))
+        }
+    }
+}
+
+/**
+ * Компактная нижняя панель: Row из двух равных элементов, высота ~[BOTTOM_BAR_HEIGHT].
+ * Мелкие подписи, без иконок; активная вкладка — цвет текста + тонкая полоса сверху (без заливки).
+ * Системный отступ навигации (WindowInsets.navigationBars) добавляется ОТДЕЛЬНО, не входит в 28dp.
+ * cappedDensity НЕ применяем; при крупных шрифтах высота растёт (heightIn min), подпись не обрезается.
+ */
+@Composable
+private fun CompactBottomBar(selected: Int, onSelect: (Int) -> Unit) {
+    val labels = listOf("Главная", "Трафик")
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surface)
+            .windowInsetsPadding(WindowInsets.navigationBars),   // системный жест-бар — отдельным отступом
+    ) {
+        Row(modifier = Modifier.fillMaxWidth().heightIn(min = BOTTOM_BAR_HEIGHT)) {
+            labels.forEachIndexed { i, label ->
+                val active = i == selected
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .clickable { onSelect(i) },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    // тонкая полоса-индикатор активной вкладки (сверху, без заливки во всю высоту)
+                    if (active) {
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.TopCenter)
+                                .width(28.dp)
+                                .height(2.dp)
+                                .background(MaterialTheme.colorScheme.primary),
+                        )
+                    }
+                    Text(
+                        label,
+                        fontSize = 12.sp,
+                        maxLines = 1,
+                        color = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
+                    )
+                }
+            }
         }
     }
 }
@@ -1319,9 +1364,6 @@ private fun fmtUptime(ms: Long): String {
     return String.format(Locale.US, "%d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60)
 }
 
-private fun DayBucket.isEmpty() = tunnelRx == 0L && tunnelTx == 0L && test == 0L
-private fun DayBucket.total() = tunnelRx + tunnelTx + test
-
 /**
  * Вкладка «Трафик»: два потока раздельно (туннель ↓/↑ и тест), сумма «итого» отдельной строкой.
  * Три блока: сессия «с последнего запуска», за сутки, за 30 дней (+ список по дням).
@@ -1343,13 +1385,16 @@ private fun TrafficScreen(modifier: Modifier = Modifier) {
         t.sessionActive -> nowElapsed - t.sessionStartElapsed
         else -> t.sessionEndElapsed - t.sessionStartElapsed
     }
+    var confirmToday by remember { mutableStateOf(false) }
+    var confirmAll by remember { mutableStateOf(false) }
+    val daysWithData = t.days.count { !it.second.isEmpty() }
 
     LazyColumn(
         modifier = modifier.fillMaxSize().padding(horizontal = 14.dp),
         contentPadding = PaddingValues(vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        // 1. С последнего запуска
+        // 1. С последнего запуска — сброс без подтверждения (сессия + таймер).
         item {
             TrafficBlock("С последнего запуска") {
                 if (t.sessionStartElapsed == 0L) {
@@ -1365,9 +1410,17 @@ private fun TrafficScreen(modifier: Modifier = Modifier) {
                 }
             }
         }
-        // 2. За сутки
-        item { TrafficBlock("За сутки") { BucketRows(t.today) } }
-        // 3. За 30 дней + список по дням
+        // 2. За сутки — сброс корзины сегодняшнего дня, с подтверждением.
+        item {
+            TrafficBlock("За сутки") {
+                BucketRows(t.today)
+                if (!t.today.isEmpty()) {
+                    Spacer(Modifier.height(6.dp))
+                    OutlinedButton(onClick = { confirmToday = true }) { Text("Сбросить") }
+                }
+            }
+        }
+        // 3. За 30 дней + список по дням — стереть всю историю, с подтверждением.
         item {
             TrafficBlock("За 30 дней") {
                 BucketRows(t.total30)
@@ -1378,9 +1431,30 @@ private fun TrafficScreen(modifier: Modifier = Modifier) {
                     nonEmpty.forEach { (date, b) ->
                         MetricRow(date, fmtBytes(b.total()))
                     }
+                    Spacer(Modifier.height(6.dp))
+                    OutlinedButton(onClick = { confirmAll = true }) { Text("Сбросить") }
                 }
             }
         }
+    }
+
+    if (confirmToday) {
+        AlertDialog(
+            onDismissRequest = { confirmToday = false },
+            title = { Text("Сбросить за сутки?") },
+            text = { Text("Трафик за сегодня (${fmtBytes(t.today.total())}) будет удалён безвозвратно.") },
+            confirmButton = { TextButton(onClick = { TrafficTracker.resetToday(); confirmToday = false }) { Text("Удалить") } },
+            dismissButton = { TextButton(onClick = { confirmToday = false }) { Text("Отмена") } },
+        )
+    }
+    if (confirmAll) {
+        AlertDialog(
+            onDismissRequest = { confirmAll = false },
+            title = { Text("Стереть всю историю?") },
+            text = { Text("Будет удалена вся история трафика за $daysWithData дн. (${fmtBytes(t.total30.total())}), включая список по дням. Безвозвратно.") },
+            confirmButton = { TextButton(onClick = { TrafficTracker.resetAll(); confirmAll = false }) { Text("Стереть") } },
+            dismissButton = { TextButton(onClick = { confirmAll = false }) { Text("Отмена") } },
+        )
     }
 }
 

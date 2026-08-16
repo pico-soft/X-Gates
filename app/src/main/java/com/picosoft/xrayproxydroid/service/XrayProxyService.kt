@@ -4,7 +4,9 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.os.IBinder
+import android.util.Log
 import androidx.core.content.ContextCompat
+import com.picosoft.xrayproxydroid.settings.SettingsStore
 import com.picosoft.xrayproxydroid.traffic.TrafficTracker
 import com.picosoft.xrayproxydroid.xray.XrayConfig
 import com.picosoft.xrayproxydroid.xray.XrayController
@@ -95,7 +97,12 @@ class XrayProxyService : Service() {
             while (polling && XrayController.isRunning) {
                 try { Thread.sleep(POLL_MS) } catch (e: InterruptedException) { break }
                 if (!polling) break
-                XrayController.queryTunnelDelta()?.let { (rx, tx) -> TrafficTracker.addTunnel(rx, tx) }
+                XrayController.queryTunnelDelta()?.let { (rx, tx) ->
+                    // ДИАГНОСТИКА reset-семантики queryStats: два опроса подряд без трафика между ними
+                    // должны дать нулевую вторую дельту. Если повторяет первую — счётчик НЕ сбрасывается.
+                    if (SettingsStore.current().verboseLogs) Log.i("TrafficPoll", "delta ↓$rx ↑$tx (байт с прошлого опроса)")
+                    TrafficTracker.addTunnel(rx, tx)
+                }
             }
         }.start()
     }

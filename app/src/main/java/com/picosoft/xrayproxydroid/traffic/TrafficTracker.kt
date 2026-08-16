@@ -22,7 +22,10 @@ data class DayBucket(
     val tunnelRx: Long = 0,   // принято через активный прокси
     val tunnelTx: Long = 0,   // отдано через активный прокси
     val test: Long = 0,       // скачано пробниками замера скорости
-)
+) {
+    fun total(): Long = tunnelRx + tunnelTx + test
+    fun isEmpty(): Boolean = tunnelRx == 0L && tunnelTx == 0L && test == 0L
+}
 
 @Serializable
 data class TrafficFile(val days: Map<String, DayBucket> = emptyMap())
@@ -152,11 +155,25 @@ object TrafficTracker {
         }
     }
 
-    /** Кнопка «Сбросить» на вкладке: обнулить счётчики сессии (дневные корзины НЕ трогаем). */
+    /** «С последнего запуска»: обнулить счётчики СЕССИИ и таймер (дневные корзины НЕ трогаем). Без диска. */
     fun resetSession() = synchronized(lock) {
         sessionRx = 0; sessionTx = 0; sessionTest = 0
         sessionStartElapsed = SystemClock.elapsedRealtime()
         sessionEndElapsed = if (sessionActive) 0 else sessionStartElapsed
+        publish()
+    }
+
+    /** «За сутки»: удалить корзину ТЕКУЩЕГО дня. Сессию НЕ трогаем. Пишем на диск НЕМЕДЛЕННО. */
+    fun resetToday() = synchronized(lock) {
+        days.remove(today())
+        persist()   // сразу на диск, иначе очередной флаш вернёт стёртое
+        publish()
+    }
+
+    /** «За 30 дней»: стереть ВСЮ историю (все корзины + список по дням). Сессию НЕ трогаем. Диск НЕМЕДЛЕННО. */
+    fun resetAll() = synchronized(lock) {
+        days.clear()
+        persist()
         publish()
     }
 
@@ -170,6 +187,13 @@ object TrafficTracker {
         val ctx = appContext ?: return
         lastPersistElapsed = SystemClock.elapsedRealtime()
         prune()
+        // ИНВАРИАНТ: сессия ≤ сутки ≤ 30 дней. Нарушение = баг учёта (TZ/двойной счёт/разные источники).
+        val today = days[today()] ?: DayBucket()
+        var s30 = 0L; for (b in days.values) s30 += b.total()
+        val sess = sessionRx + sessionTx + sessionTest
+        if (sess > today.total() || today.total() > s30) {
+            Log.w("TrafficStore", "ИНВАРИАНТ НАРУШЕН: сессия=$sess сутки=${today.total()} 30д=$s30 (ключ_сегодня=${today()})")
+        }
         TrafficStore.save(ctx, TrafficFile(days = HashMap(days)))
     }
 
