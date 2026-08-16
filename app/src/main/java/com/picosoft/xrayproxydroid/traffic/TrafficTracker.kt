@@ -27,8 +27,18 @@ data class DayBucket(
     fun isEmpty(): Boolean = tunnelRx == 0L && tunnelTx == 0L && test == 0L
 }
 
+/**
+ * @param days      история по дням: сумма = «за 30 дней» + список по дням. Сбрасывается ТОЛЬКО «За 30 дней».
+ * @param todayDate дата НЕЗАВИСИМОГО суточного счётчика
+ * @param today     «За сутки» — ОТДЕЛЬНЫЙ счётчик (не производный от days), сбрасывается ТОЛЬКО «За сутки».
+ * Три счётчика независимы: сброс одного не трогает другие (требование Elyor).
+ */
 @Serializable
-data class TrafficFile(val days: Map<String, DayBucket> = emptyMap())
+data class TrafficFile(
+    val days: Map<String, DayBucket> = emptyMap(),
+    val todayDate: String = "",
+    val today: DayBucket = DayBucket(),
+)
 
 /** Снимок для UI: сессия «с последнего запуска» + сегодня + сумма 30 дней + список по дням. */
 data class TrafficSnapshot(
@@ -81,7 +91,9 @@ object TrafficTracker {
     private const val PERSIST_INTERVAL_MS = 20_000L
 
     private val lock = Any()
-    private var days = LinkedHashMap<String, DayBucket>()
+    private var days = LinkedHashMap<String, DayBucket>()   // история (30д + список), НЕЗАВИСИМА от суточного
+    private var todayDate = ""                              // дата независимого суточного счётчика
+    private var todayRx = 0L; private var todayTx = 0L; private var todayTest = 0L
     private var sessionActive = false
     private var sessionStartElapsed = 0L
     private var sessionEndElapsed = 0L
@@ -94,10 +106,16 @@ object TrafficTracker {
     private val _state = MutableStateFlow(TrafficSnapshot())
     val state: StateFlow<TrafficSnapshot> = _state.asStateFlow()
 
-    /** Загрузить корзины, отсечь старше 30 дней. Вызвать при старте приложения. */
+    private fun loadFrom(file: TrafficFile) {
+        days = LinkedHashMap(file.days)
+        todayDate = file.todayDate
+        todayRx = file.today.tunnelRx; todayTx = file.today.tunnelTx; todayTest = file.today.test
+    }
+
+    /** Загрузить историю + суточный счётчик, отсечь старше 30 дней. Вызвать при старте приложения. */
     fun init(context: Context) = synchronized(lock) {
         appContext = context.applicationContext
-        days = LinkedHashMap(TrafficStore.load(appContext!!).days)
+        loadFrom(TrafficStore.load(appContext!!))
         prune()
         publish()
     }
@@ -106,7 +124,7 @@ object TrafficTracker {
     fun attachContext(context: Context) = synchronized(lock) {
         if (appContext == null) {
             appContext = context.applicationContext
-            days = LinkedHashMap(TrafficStore.load(appContext!!).days)
+            loadFrom(TrafficStore.load(appContext!!))
             prune()
             publish()
         }
@@ -130,14 +148,21 @@ object TrafficTracker {
         publish()
     }
 
-    /** Дельты туннеля из core queryStats (приём/отдача). Только положительные. */
+    /** Сброс суточного счётчика при смене локальной даты (иначе за сутки покажет вчерашнее). */
+    private fun rollToday() {
+        val k = today()
+        if (todayDate != k) { todayDate = k; todayRx = 0; todayTx = 0; todayTest = 0 }
+    }
+
+    /** Дельты туннеля из core queryStats (приём/отдача). Обновляют ТРИ независимых счётчика. */
     fun addTunnel(rx: Long, tx: Long) = synchronized(lock) {
         val r = rx.coerceAtLeast(0); val t = tx.coerceAtLeast(0)
         if (r > 0 || t > 0) {
             val k = today()
             val b = days[k] ?: DayBucket()
-            days[k] = b.copy(tunnelRx = b.tunnelRx + r, tunnelTx = b.tunnelTx + t)
-            if (sessionActive) { sessionRx += r; sessionTx += t }
+            days[k] = b.copy(tunnelRx = b.tunnelRx + r, tunnelTx = b.tunnelTx + t)  // история/30д
+            rollToday(); todayRx += r; todayTx += t                                 // «за сутки» (независимо)
+            if (sessionActive) { sessionRx += r; sessionTx += t }                    // сессия (независимо)
             maybePersist()
             publish()
         }
@@ -148,14 +173,17 @@ object TrafficTracker {
         if (bytes > 0) {
             val k = today()
             val b = days[k] ?: DayBucket()
-            days[k] = b.copy(test = b.test + bytes)
-            if (sessionActive) sessionTest += bytes
+            days[k] = b.copy(test = b.test + bytes)      // история/30д
+            rollToday(); todayTest += bytes              // «за сутки»
+            if (sessionActive) sessionTest += bytes       // сессия
             maybePersist()
             publish()
         }
     }
 
-    /** «С последнего запуска»: обнулить счётчики СЕССИИ и таймер (дневные корзины НЕ трогаем). Без диска. */
+    // Три кнопки — три НЕЗАВИСИМЫХ счётчика: сброс одного не трогает другие.
+
+    /** «С последнего запуска»: обнулить ТОЛЬКО счётчики сессии и таймер. Без подтверждения, без диска. */
     fun resetSession() = synchronized(lock) {
         sessionRx = 0; sessionTx = 0; sessionTest = 0
         sessionStartElapsed = SystemClock.elapsedRealtime()
@@ -163,14 +191,14 @@ object TrafficTracker {
         publish()
     }
 
-    /** «За сутки»: удалить корзину ТЕКУЩЕГО дня. Сессию НЕ трогаем. Пишем на диск НЕМЕДЛЕННО. */
+    /** «За сутки»: обнулить ТОЛЬКО суточный счётчик. Историю (30д/список) и сессию НЕ трогаем. Диск немедленно. */
     fun resetToday() = synchronized(lock) {
-        days.remove(today())
-        persist()   // сразу на диск, иначе очередной флаш вернёт стёртое
+        todayDate = today(); todayRx = 0; todayTx = 0; todayTest = 0
+        persist()
         publish()
     }
 
-    /** «За 30 дней»: стереть ВСЮ историю (все корзины + список по дням). Сессию НЕ трогаем. Диск НЕМЕДЛЕННО. */
+    /** «За 30 дней»: стереть ТОЛЬКО историю (все корзины + список). Суточный счётчик и сессию НЕ трогаем. Диск немедленно. */
     fun resetAll() = synchronized(lock) {
         days.clear()
         persist()
@@ -187,14 +215,11 @@ object TrafficTracker {
         val ctx = appContext ?: return
         lastPersistElapsed = SystemClock.elapsedRealtime()
         prune()
-        // ИНВАРИАНТ: сессия ≤ сутки ≤ 30 дней. Нарушение = баг учёта (TZ/двойной счёт/разные источники).
-        val today = days[today()] ?: DayBucket()
-        var s30 = 0L; for (b in days.values) s30 += b.total()
-        val sess = sessionRx + sessionTx + sessionTest
-        if (sess > today.total() || today.total() > s30) {
-            Log.w("TrafficStore", "ИНВАРИАНТ НАРУШЕН: сессия=$sess сутки=${today.total()} 30д=$s30 (ключ_сегодня=${today()})")
-        }
-        TrafficStore.save(ctx, TrafficFile(days = HashMap(days)))
+        TrafficStore.save(ctx, TrafficFile(
+            days = HashMap(days),
+            todayDate = todayDate,
+            today = DayBucket(todayRx, todayTx, todayTest),
+        ))
     }
 
     private fun prune() {
@@ -203,7 +228,9 @@ object TrafficTracker {
     }
 
     private fun publish() {
-        val today = days[today()] ?: DayBucket()
+        // «За сутки» = независимый суточный счётчик (0, если его дата — не сегодня, т.е. новый день без трафика).
+        val today = if (todayDate == today()) DayBucket(todayRx, todayTx, todayTest) else DayBucket()
+        // «За 30 дней» = сумма истории days.
         var rx = 0L; var tx = 0L; var test = 0L
         for (b in days.values) { rx += b.tunnelRx; tx += b.tunnelTx; test += b.test }
         val list = days.entries.sortedByDescending { it.key }.map { it.key to it.value }
