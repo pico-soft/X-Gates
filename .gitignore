@@ -8,3 +8,8 @@
 .externalNativeBuild
 .cxx
 local.properties
+# Release-подпись НИКОГДА в репо (репозиторий публичный): ключ лежит ВНЕ дерева репо,
+# пароли — в local.properties (уже игнорируется). Паттерны ниже — страховка от случайного add.
+*.jks
+*.keystore
+keystore.properties
