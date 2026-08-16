@@ -961,10 +961,10 @@ private fun SettingsSection(
     val d = SettingsStore.DEFAULTS
     Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SettingsGroupLabel("Замер скорости")
-        IntSettingRow("Прогрев перед замером", "с", settings.speedWarmupSec, d.speedWarmupSec, 0, 60) {
+        DoubleSettingRow("Прогрев перед замером", "с", settings.speedWarmupSec, d.speedWarmupSec, 0.0, 60.0) {
             onChange(settings.copy(speedWarmupSec = it))
         }
-        IntSettingRow("Окно замера", "с", settings.speedWindowSec, d.speedWindowSec, 1, 120) {
+        DoubleSettingRow("Окно замера", "с", settings.speedWindowSec, d.speedWindowSec, 0.5, 120.0) {
             onChange(settings.copy(speedWindowSec = it))
         }
         IntSettingRow("Одновременных замеров (пул)", "", settings.speedPool, d.speedPool, 1, 32) {

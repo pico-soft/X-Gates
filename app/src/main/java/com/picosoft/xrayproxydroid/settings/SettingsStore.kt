@@ -10,6 +10,7 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.File
+import kotlin.math.roundToInt
 
 /**
  * ЕДИНЫЙ ИСТОЧНИК ПРАВДЫ для всех порогов/таймаутов. Раньше они были константами в разных файлах
@@ -22,8 +23,9 @@ import java.io.File
 @Serializable
 data class AppSettings(
     // --- Замер скорости (прямо влияет на открытый вопрос 0.1 vs 4.0) ---
-    val speedWarmupSec: Int = 1,        // прогрев (TCP slow-start) отбрасываем
-    val speedWindowSec: Int = 2,        // окно измерения (2с: 5с×170Мбит=>100МБ/сервер, гигабайты трафика на прогон)
+    // Секунды ДРОБНЫЕ (Double): нужен суб-секундный прогрев (напр. 0.5). Старые целые из JSON читаются как X.0.
+    val speedWarmupSec: Double = 1.0,   // прогрев (TCP slow-start) отбрасываем
+    val speedWindowSec: Double = 2.0,   // окно измерения (2с: 5с×170Мбит=>100МБ/сервер, гигабайты трафика на прогон)
     val speedPool: Int = 1,             // одновременных замеров скорости; ОТ 1 (1 = строго последовательно)
     val speedProbeUrl: String = "http://speedtest.tele2.net/1GB.zip", // 1 ГБ: заведомо больше окна (нет eof); редактируемый (Cloudflare 403 / Hetzner TLS)
 
@@ -43,8 +45,8 @@ data class AppSettings(
     val verboseLogs: Boolean = true,    // детальный лог ServerSpeedTester (промпт 18)
 ) {
     // Производные (в единицах, которые нужны коду).
-    val speedWarmupMs: Int get() = speedWarmupSec * 1_000
-    val speedWindowMs: Int get() = speedWindowSec * 1_000
+    val speedWarmupMs: Int get() = (speedWarmupSec * 1_000).roundToInt()
+    val speedWindowMs: Int get() = (speedWindowSec * 1_000).roundToInt()
     val marginRatio: Double get() = upgradeMarginPercent / 100.0
 }
 
