@@ -999,6 +999,12 @@ private fun SettingsSection(
         DoubleSettingRow("Окно замера", "с", settings.speedWindowSec, d.speedWindowSec, 0.5, 120.0) {
             onChange(settings.copy(speedWindowSec = it))
         }
+        IntSettingRow("Объём прогрева", "МБ", settings.speedWarmupMb, d.speedWarmupMb, 1, 500) {
+            onChange(settings.copy(speedWarmupMb = it))
+        }
+        IntSettingRow("Объём замера", "МБ", settings.speedMeasureMb, d.speedMeasureMb, 1, 1000) {
+            onChange(settings.copy(speedMeasureMb = it))
+        }
         IntSettingRow("Одновременных замеров (пул)", "", settings.speedPool, d.speedPool, 1, 32) {
             onChange(settings.copy(speedPool = it))
         }

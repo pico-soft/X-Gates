@@ -71,8 +71,9 @@ object ServerSpeedTester {
 
     /**
      * Скорость одного сервера, Mbps. >0 — ВАЛИДНЫЙ замер; -1.0 — ПРОВАЛ/«не измерено»
-     * (ошибка сборки/connect/порт/чтения, схлопнувшееся окно, ноль измеренных байт) — это НЕ 0.0
-     * и НЕ маленькая скорость. Не трогает активный прокси (свой CoreController + эфемерный порт).
+     * (ошибка сборки/connect/порт/чтения, ноль измеренных байт, обрыв до минимума) — это НЕ 0.0
+     * и НЕ маленькая скорость. Остановка по бюджету (время/объём) — ВАЛИДНА, не провал.
+     * Не трогает активный прокси (свой CoreController + эфемерный порт).
      */
     fun measureSpeed(
         context: Context,
@@ -94,8 +95,10 @@ object ServerSpeedTester {
         val probes = (listOf(SettingsStore.current().speedProbeUrl) + fallbackProbes).distinct()
 
         val name = profile.remarks.ifBlank { profile.address }
+        val warmupBudget = SettingsStore.current().speedWarmupBudgetBytes
+        val measureBudget = SettingsStore.current().speedMeasureBudgetBytes
         val concurrent = concurrentMeasures.incrementAndGet()
-        log("── measure START «$name» ${profile.address}:${profile.port} net=${profile.network} sec=${profile.security} · параллельно=$concurrent · warmup=${warmupMs}мс окно=${measureMs}мс")
+        log("── measure START «$name» ${profile.address}:${profile.port} net=${profile.network} sec=${profile.security} · параллельно=$concurrent · warmup=${warmupMs}мс/${warmupBudget}Б окно=${measureMs}мс/${measureBudget}Б")
         val t0 = System.nanoTime()
         try {
             val port = freePort() ?: run { log("«$name» freePort FAIL"); return Measurement(-1.0, false, "нет свободного порта") }
@@ -120,7 +123,7 @@ object ServerSpeedTester {
                 var lastFail = Measurement(-1.0, false, "нет пробников")
                 var testBytes = 0L
                 for (probe in probes) {
-                    val m = downloadMbps(probe, port, warmupMs, measureMs, name, verbose)
+                    val m = downloadMbps(probe, port, warmupMs, measureMs, warmupBudget, measureBudget, name, verbose)
                     testBytes += m.bytes                    // тестовый трафик: скачанное каждым пробником
                     if (m.ok) {
                         TrafficTracker.addTest(testBytes)
@@ -216,16 +219,20 @@ object ServerSpeedTester {
     }
 
     /**
-     * TIME-BASED замер. ОДНА формула: mbps = измерено_байт × 8 / фактическое_окно / 1e6.
-     * Прогрев отмеряется от ПЕРВОГО БАЙТА ТЕЛА (не от старта запроса — иначе граница уезжает),
-     * окно измерения — сразу после прогрева. Никаких переключений формулы по eof/ошибке.
+     * Замер с ДВУМЯ бюджетами на КАЖДУЮ фазу — время И объём, кончается наступивший РАНЬШЕ.
+     * ОДНА формула: mbps = измерено_байт × 8 / фактическое_окно / 1e6. Прогрев — от ПЕРВОГО БАЙТА
+     * ТЕЛА (фикс C), измерение — сразу после прогрева (его фактического конца, не по фикс. времени).
+     * Соединение рвём сразу по достижении бюджета — не дочитываем впустую.
      *
-     * Возвращает [Measurement]: ok=false (провал, mbps=-1) если — измерено_байт==0 / окно <50%
-     * заданного / была ошибка чтения / всего_байт < минимума. Это НЕ маленькая скорость: провалившийся
-     * замер (напр. таймаут чтения после заголовков) НЕ выдаётся за 0.1 Мбит/с. eof в пределах окна —
-     * валидный результат по фактически прошедшему времени (помечается в логе).
+     * ВАЖНО (Промпт 32): остановка ПО ОБЪЁМУ — ВАЛИДНЫЙ результат при любой длительности окна.
+     * Правило «короткое окно = провал» БОЛЬШЕ НЕ применяется: провал только при ошибке чтения /
+     * ноль измеренных байт / всего_байт < минимума. Быстрый сервер упрётся в объём за доли секунды —
+     * это НЕ «не измерено».
      */
-    private fun downloadMbps(probe: String, socksPort: Int, warmupMs: Int, measureMs: Int, name: String, verbose: Boolean): Measurement {
+    private fun downloadMbps(
+        probe: String, socksPort: Int, warmupMs: Int, measureMs: Int,
+        warmupBudget: Long, measureBudget: Long, name: String, verbose: Boolean,
+    ): Measurement {
         fun log(msg: String) { if (verbose) Log.i(TAG, msg) }
         val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", socksPort))
         val conn = (URL(probe).openConnection(proxy) as HttpURLConnection).apply {
@@ -252,31 +259,56 @@ object ServerSpeedTester {
         var warmupBytes = 0L
         var measuredBytes = 0L
         var firstNanos = 0L
-        var warmupEnd = 0L      // фиксируется от ПЕРВОГО байта тела
-        var measureEnd = 0L
+        var warmupTimeEnd = 0L        // предел прогрева по времени (от первого байта)
+        var warmupDoneNanos = 0L      // фактический конец прогрева (время ИЛИ объём)
+        var measureTimeEnd = 0L       // предел измерения по времени (от конца прогрева)
         var lastMeasuredNanos = 0L
+        var inWarmup = true
         var eof = false
         var readErr: String? = null
+        var warmupEndReason = "—"     // ПО_ВРЕМЕНИ / ПО_ОБЪЁМУ / EOF / ОШИБКА
+        var measureEndReason = "—"
         try {
             conn.inputStream.use { input ->
                 val buf = ByteArray(64 * 1024)
-                while (true) {
-                    val n = try { input.read(buf) } catch (e: Exception) { readErr = "${e.javaClass.simpleName}: ${e.message}"; break }
-                    if (n < 0) { eof = true; break }
+                loop@ while (true) {
+                    val n = try { input.read(buf) } catch (e: Exception) {
+                        readErr = "${e.javaClass.simpleName}: ${e.message}"
+                        if (inWarmup) warmupEndReason = "ОШИБКА" else measureEndReason = "ОШИБКА"
+                        break@loop
+                    }
+                    if (n < 0) {
+                        eof = true
+                        if (inWarmup) warmupEndReason = "EOF" else measureEndReason = "EOF"
+                        break@loop
+                    }
                     val now = System.nanoTime()
-                    if (firstNanos == 0L) {                          // прогрев/окно стартуют от ПЕРВОГО байта
+                    if (firstNanos == 0L) {                          // прогрев стартует от ПЕРВОГО байта
                         firstNanos = now
-                        warmupEnd = now + warmupMs * 1_000_000L
-                        measureEnd = warmupEnd + measureMs * 1_000_000L
+                        warmupTimeEnd = now + warmupMs * 1_000_000L
                     }
                     totalBytes += n
-                    if (now < warmupEnd) {
+                    if (inWarmup) {
                         warmupBytes += n
+                        // прогрев кончается по ВРЕМЕНИ или по ОБЪЁМУ — что раньше
+                        val byTime = now >= warmupTimeEnd
+                        val byVol = warmupBytes >= warmupBudget
+                        if (byTime || byVol) {
+                            warmupEndReason = if (byVol) "ПО_ОБЪЁМУ" else "ПО_ВРЕМЕНИ"
+                            inWarmup = false
+                            warmupDoneNanos = now
+                            measureTimeEnd = now + measureMs * 1_000_000L
+                        }
                     } else {
                         measuredBytes += n
                         lastMeasuredNanos = now
+                        val byTime = now >= measureTimeEnd
+                        val byVol = measuredBytes >= measureBudget
+                        if (byTime || byVol) {
+                            measureEndReason = if (byVol && !byTime) "ПО_ОБЪЁМУ" else "ПО_ВРЕМЕНИ"
+                            break@loop                                // рвём сразу — не дочитываем впустую
+                        }
                     }
-                    if (now >= measureEnd) break                     // окно выработано
                 }
             }
         } catch (e: Exception) {
@@ -286,28 +318,30 @@ object ServerSpeedTester {
         }
 
         val ttfbMs = if (firstNanos != 0L) (firstNanos - reqStart) / 1_000_000 else -1
-        // Фактическое окно = от конца прогрева до последнего измеренного байта.
-        val actualWindowMs = if (warmupEnd != 0L && lastMeasuredNanos > warmupEnd)
-            (lastMeasuredNanos - warmupEnd) / 1_000_000 else 0L
+        val warmupMsActual = if (firstNanos != 0L && warmupDoneNanos > firstNanos) (warmupDoneNanos - firstNanos) / 1_000_000 else -1
+        // Фактическое окно измерения = от конца прогрева до последнего измеренного байта.
+        val actualWindowMs = if (warmupDoneNanos != 0L && lastMeasuredNanos > warmupDoneNanos)
+            (lastMeasuredNanos - warmupDoneNanos) / 1_000_000 else 0L
 
-        // ПРОВАЛ: не выдаём провалившийся замер за скорость.
+        // ПРОВАЛ — ТОЛЬКО ошибка/обрыв/ноль. Остановка по объёму (короткое окно) — валидна.
         val failReason = when {
             readErr != null -> "ошибка чтения: $readErr"
             measuredBytes == 0L -> "0 измеренных байт (соединение встало после заголовков)"
-            actualWindowMs < measureMs / 2 -> "окно ${actualWindowMs}мс < 50% от ${measureMs}мс"
             totalBytes < MIN_TOTAL_BYTES -> "всего $totalBytes байт < минимума"
+            actualWindowMs <= 0L -> "нулевое окно измерения"
             else -> null
         }
-        val eofNote = if (eof) " (eof — окно не выработано полностью)" else ""
+        val diag = "ttfb=${ttfbMs}мс прогрев[$warmupEndReason ${warmupMsActual}мс ${warmupBytes}Б/бюджет${warmupBudget}Б] " +
+            "измер[$measureEndReason ${actualWindowMs}мс ${measuredBytes}Б/бюджет${measureBudget}Б] всего=$totalBytes eof=$eof"
         if (failReason != null) {
-            log("«$name» probe=$probe ПРОВАЛ [$failReason]$eofNote | ttfb=${ttfbMs}мс окно=${actualWindowMs}мс всего=$totalBytes прогрев=$warmupBytes измерено=$measuredBytes eof=$eof")
+            log("«$name» probe=$probe ПРОВАЛ [$failReason] | $diag")
             return Measurement(-1.0, false, failReason, bytes = totalBytes)
         }
 
         val mbps = measuredBytes * 8.0 / (actualWindowMs / 1000.0) / 1_000_000.0   // ЕДИНАЯ формула
         val rounded = (mbps * 100).roundToInt() / 100.0
-        log("«$name» probe=$probe → $rounded Mbps$eofNote | ttfb=${ttfbMs}мс окно=${actualWindowMs}мс всего=$totalBytes прогрев=$warmupBytes измерено=$measuredBytes eof=$eof")
-        return Measurement(rounded, true, "ok$eofNote", bytes = totalBytes)
+        log("«$name» probe=$probe → $rounded Mbps | $diag")
+        return Measurement(rounded, true, "ok/$measureEndReason", bytes = totalBytes)
     }
 
     private class NoopCallback : CoreCallbackHandler {

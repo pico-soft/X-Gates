@@ -24,8 +24,11 @@ import kotlin.math.roundToInt
 data class AppSettings(
     // --- Замер скорости (прямо влияет на открытый вопрос 0.1 vs 4.0) ---
     // Секунды ДРОБНЫЕ (Double): нужен суб-секундный прогрев (напр. 0.5). Старые целые из JSON читаются как X.0.
-    val speedWarmupSec: Double = 1.0,   // прогрев (TCP slow-start) отбрасываем
-    val speedWindowSec: Double = 2.0,   // окно измерения (2с: 5с×170Мбит=>100МБ/сервер, гигабайты трафика на прогон)
+    val speedWarmupSec: Double = 1.0,   // предел прогрева ПО ВРЕМЕНИ (что раньше — время ИЛИ объём)
+    val speedWindowSec: Double = 2.0,   // предел измерения ПО ВРЕМЕНИ (что раньше — время ИЛИ объём)
+    // Бюджеты ПО ОБЪЁМУ (что раньше — время ИЛИ объём): на быстром сервере фаза кончается по МБ, не по времени.
+    val speedWarmupMb: Int = 3,         // объём прогрева, МБ (без него прогрев-по-времени тянул бы больше всего лимита)
+    val speedMeasureMb: Int = 10,       // объём замера, МБ
     val speedPool: Int = 1,             // одновременных замеров скорости; ОТ 1 (1 = строго последовательно)
     val speedProbeUrl: String = "http://speedtest.tele2.net/1GB.zip", // 1 ГБ: заведомо больше окна (нет eof); редактируемый (Cloudflare 403 / Hetzner TLS)
 
@@ -47,6 +50,8 @@ data class AppSettings(
     // Производные (в единицах, которые нужны коду).
     val speedWarmupMs: Int get() = (speedWarmupSec * 1_000).roundToInt()
     val speedWindowMs: Int get() = (speedWindowSec * 1_000).roundToInt()
+    val speedWarmupBudgetBytes: Long get() = speedWarmupMb * 1_048_576L
+    val speedMeasureBudgetBytes: Long get() = speedMeasureMb * 1_048_576L
     val marginRatio: Double get() = upgradeMarginPercent / 100.0
 }
 
