@@ -61,6 +61,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -70,6 +71,7 @@ import com.picosoft.xrayproxydroid.service.ProxyState
 import com.picosoft.xrayproxydroid.service.XrayProxyService
 import com.picosoft.xrayproxydroid.settings.AppSettings
 import com.picosoft.xrayproxydroid.settings.SettingsStore
+import com.picosoft.xrayproxydroid.subscription.SubSource
 import com.picosoft.xrayproxydroid.subscription.SubscriptionManager
 import com.picosoft.xrayproxydroid.ui.TestProgress
 import com.picosoft.xrayproxydroid.ui.theme.XrayProxyDroidTheme
@@ -83,6 +85,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         SettingsStore.init(applicationContext)   // загрузить настройки до первого замера
+        SubscriptionManager.init(applicationContext)   // миграция старой подписки в мультиподписки (однократно)
         enableEdgeToEdge()
         setContent {
             XrayProxyDroidTheme {
@@ -147,9 +150,12 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     val proxy by ProxyState.state.collectAsState()
     val settings by SettingsStore.state.collectAsState()   // живое применение порогов в UI
 
-    var subUrl by remember { mutableStateOf("https://maxim-zodchy.ru/sub-black.php") }
     var subStatus by remember { mutableStateOf("") }
     var servers by remember { mutableStateOf(SubscriptionManager.allServers(context)) }
+    var sources by remember { mutableStateOf(SubscriptionManager.sources(context)) }
+    var refreshingSubs by remember { mutableStateOf(false) }
+    var subRefreshCancel by remember { mutableStateOf(false) }
+    var pendingDelete by remember { mutableStateOf<SubSource?>(null) }
 
     var pingResults by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
 
@@ -180,6 +186,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     }
 
     fun reloadServers() { servers = SubscriptionManager.allServers(context) }
+    fun reloadSources() { sources = SubscriptionManager.sources(context) }
 
     fun effPing(p: ServerProfile): Int? = pingResults[SubscriptionManager.serverKey(p)] ?: p.pingMs
     fun effSpeed(p: ServerProfile): Double? = speedResults[SubscriptionManager.serverKey(p)] ?: p.speedMbps
@@ -223,22 +230,88 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         }.start()
     }
 
-    fun onAddRefresh() {
-        val url = subUrl.trim()
-        if (url.isEmpty()) { subStatus = "введите адрес подписки"; return }
-        subStatus = "загрузка…"
-        TestProgress.startIndeterminate("обновление подписки…")   // total неизвестен → indeterminate
+    // Обновить ВСЕ включённые источники. Одна упавшая не роняет прочие. Отменяемо, не блокирует UI.
+    fun onRefreshAll() {
+        if (refreshingSubs) return
+        val hasUrl = sources.any { it.enabled && it.url.isNotBlank() }
+        if (!hasUrl) { subStatus = "нет включённых подписок с URL"; return }
+        refreshingSubs = true; subRefreshCancel = false
+        TestProgress.startIndeterminate("обновление подписок…")
         Thread {
-            SubscriptionManager.add(context, url)
-            val s = SubscriptionManager.refresh(context, url)
+            val res = SubscriptionManager.refreshAllEnabled(
+                context,
+                cancelled = { subRefreshCancel },
+                onEach = { src, sum ->
+                    activity.runOnUiThread {
+                        TestProgress.phase("${src.name}: " + if (sum.ok) "+${sum.added}" else "ошибка")
+                        reloadSources()
+                    }
+                },
+            )
+            val okN = res.values.count { it.ok }; val failN = res.values.count { !it.ok }
             activity.runOnUiThread {
-                subStatus = if (s.ok) "добавлено=${s.added}  дубли=${s.duplicates}  неподдерж=${s.unsupported}  ошибок=${s.invalid}"
-                            else "ошибка: ${s.error}"
-                TestProgress.clear()
-                reloadServers()
+                refreshingSubs = false
+                subStatus = "обновлено: $okN ок, $failN с ошибкой"
+                TestProgress.finish(if (subRefreshCancel) "обновление прервано" else "подписки обновлены: $okN ок, $failN ошибок")
+                reloadSources(); reloadServers()
             }
         }.start()
     }
+
+    fun onAddUrl(url: String, name: String) {
+        if (url.isBlank()) { subStatus = "введите URL"; return }
+        Thread {
+            val id = SubscriptionManager.addUrl(context, url, name)
+            if (id == null) { activity.runOnUiThread { subStatus = "дубликат URL или пусто"; reloadSources() }; return@Thread }
+            val s = SubscriptionManager.refreshOne(context, id)
+            activity.runOnUiThread {
+                subStatus = if (s.ok) "добавлено: +${s.added}" else "источник добавлен, обновление: ${s.error}"
+                reloadSources(); reloadServers()
+            }
+        }.start()
+    }
+
+    fun onAddPaste(text: String) {
+        if (text.isBlank()) { subStatus = "вставьте ссылки"; return }
+        Thread {
+            val (_, s) = SubscriptionManager.addLocalFromBody(context, text)
+            activity.runOnUiThread {
+                subStatus = "вставка: +${s.added}  дубли=${s.duplicates}  неподдерж=${s.unsupported}  ошибок=${s.invalid}"
+                reloadSources(); reloadServers()
+            }
+        }.start()
+    }
+
+    fun onImportFile(uri: android.net.Uri) {
+        Thread {
+            val body = runCatching {
+                context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+            }.getOrNull().orEmpty()
+            if (body.isBlank()) { activity.runOnUiThread { subStatus = "файл пуст/не прочитан" }; return@Thread }
+            val name = uri.lastPathSegment?.substringAfterLast('/') ?: "файл"
+            val (_, s) = SubscriptionManager.addLocalFromBody(context, body, name)
+            activity.runOnUiThread {
+                subStatus = "из файла: +${s.added}  дубли=${s.duplicates}  неподдерж=${s.unsupported}  ошибок=${s.invalid}"
+                reloadSources(); reloadServers()
+            }
+        }.start()
+    }
+
+    fun onToggleSource(id: String, enabled: Boolean) {
+        SubscriptionManager.setEnabled(context, id, enabled)
+        reloadSources(); reloadServers()
+    }
+
+    fun onDeleteSource(src: SubSource) {
+        SubscriptionManager.remove(context, src.id)
+        pendingDelete = null
+        reloadSources(); reloadServers()
+    }
+
+    // Пикер файла (объявлен после onImportFile — локальные функции без forward-reference).
+    val filePickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri -> if (uri != null) onImportFile(uri) }
 
     // Полный адаптивный тест: ping → speed по живым → early-connect первого рабочего → апгрейд.
     fun onFullTest() {
@@ -371,10 +444,12 @@ private fun BootScreen(modifier: Modifier = Modifier) {
             ActionsBar(
                 fullTesting = fullTesting,
                 running = proxy.running,
+                refreshingSubs = refreshingSubs,
                 onFullTest = { onFullTest() },
                 onCancelFull = { onCancelFull() },
                 onStop = { onStop() },
-                onRefreshSubs = { onAddRefresh() },
+                onRefreshSubs = { onRefreshAll() },
+                onCancelRefreshSubs = { subRefreshCancel = true },
             )
         }
         // Прогресс-бар Полного теста — сразу под кнопками, над «Живые серверы». Свой item со
@@ -436,18 +511,15 @@ private fun BootScreen(modifier: Modifier = Modifier) {
             }
         }
         item {
-            CollapsibleSection(title = "Подписки", initiallyExpanded = false) {
-                OutlinedTextField(
-                    value = subUrl,
-                    onValueChange = { subUrl = it },
-                    label = { Text("Адрес подписки") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
+            CollapsibleSection(title = "Подписки (${sources.size})", initiallyExpanded = false) {
+                SubscriptionsSection(
+                    sources = sources,
+                    onAddUrl = { url, name -> onAddUrl(url, name) },
+                    onAddPaste = { onAddPaste(it) },
+                    onImportFile = { filePickerLauncher.launch("*/*") },
+                    onToggle = { id, en -> onToggleSource(id, en) },
+                    onDeleteRequest = { pendingDelete = it },
                 )
-                Spacer(Modifier.height(8.dp))
-                Button(onClick = { onAddRefresh() }, modifier = Modifier.fillMaxWidth()) {
-                    Text("↻ Подписки")
-                }
             }
         }
         // Заглушки под будущие фичи — порядок эталона: Автомониторинг → Настройки → Стоп-лист.
@@ -483,6 +555,18 @@ private fun BootScreen(modifier: Modifier = Modifier) {
             remeasuring = remeasuring,
             onRemeasure = { onRemeasure(p) },
             onDismiss = { detailProfile = null; remeasureStatus = "" },
+        )
+    }
+
+    // Подтверждение удаления источника — с числом серверов, которые ИСЧЕЗНУТ (нет в других источниках).
+    pendingDelete?.let { src ->
+        val lost = remember(src) { SubscriptionManager.serversLostOnRemove(context, src.id) }
+        AlertDialog(
+            onDismissRequest = { pendingDelete = null },
+            title = { Text("Удалить источник?") },
+            text = { Text("«${src.name}»\nИсчезнет серверов: $lost (только те, которых нет в других подписках).") },
+            confirmButton = { TextButton(onClick = { onDeleteSource(src) }) { Text("Удалить") } },
+            dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("Отмена") } },
         )
     }
 }
@@ -623,10 +707,12 @@ private fun StatusBox(
 private fun ActionsBar(
     fullTesting: Boolean,
     running: Boolean,
+    refreshingSubs: Boolean,
     onFullTest: () -> Unit,
     onCancelFull: () -> Unit,
     onStop: () -> Unit,
     onRefreshSubs: () -> Unit,
+    onCancelRefreshSubs: () -> Unit,
 ) {
     FlowRow(
         modifier = Modifier.fillMaxWidth(),
@@ -639,7 +725,11 @@ private fun ActionsBar(
             Button(onClick = onFullTest) { Text("🔍 Полный тест") }
         }
         OutlinedButton(onClick = onStop, enabled = running) { Text("■ Стоп") }
-        OutlinedButton(onClick = onRefreshSubs) { Text("↻ Подписки") }
+        if (refreshingSubs) {
+            OutlinedButton(onClick = onCancelRefreshSubs) { Text("⏹ Обновление") }
+        } else {
+            OutlinedButton(onClick = onRefreshSubs) { Text("↻ Подписки") }
+        }
     }
 }
 
@@ -1004,5 +1094,99 @@ private fun UrlSettingRow(label: String, value: String, default: String, onCommi
 private fun BoolSettingRow(label: String, value: Boolean, default: Boolean, onCommit: (Boolean) -> Unit) {
     SettingRowScaffold(label, "", changed = value != default, defaultText = if (default) "вкл" else "выкл") {
         Switch(checked = value, onCheckedChange = onCommit)
+    }
+}
+
+// ═══════════════════════ ПОДПИСКИ ═══════════════════════
+
+/**
+ * Содержимое секции «Подписки»: список источников (точка · имя · N · время · вкл/выкл · удалить),
+ * добавление по URL+имя, вставка ссылок текстом, импорт из файла. Плотно, под крупные шрифты.
+ */
+@Composable
+private fun SubscriptionsSection(
+    sources: List<SubSource>,
+    onAddUrl: (String, String) -> Unit,
+    onAddPaste: (String) -> Unit,
+    onImportFile: () -> Unit,
+    onToggle: (String, Boolean) -> Unit,
+    onDeleteRequest: (SubSource) -> Unit,
+) {
+    var newUrl by remember { mutableStateOf("") }
+    var newName by remember { mutableStateOf("") }
+    var paste by remember { mutableStateOf("") }
+    var shownErrorId by remember { mutableStateOf<String?>(null) }
+
+    Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (sources.isEmpty()) {
+            Text("Нет источников.", style = MaterialTheme.typography.bodyMedium, color = TABLE_GRAY)
+        }
+        sources.forEach { s ->
+            val dotColor = when {
+                !s.enabled -> TABLE_GRAY                 // выключена — серая
+                s.lastOk == true -> Color(0xFF2E7D32)    // ок — зелёная
+                s.lastOk == false -> Color(0xFFD32F2F)   // ошибка — красная
+                else -> TABLE_GRAY                       // ни разу — серая
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    "●",
+                    color = dotColor,
+                    fontSize = TABLE_FONT,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(4.dp))
+                        .clickable { shownErrorId = if (shownErrorId == s.id) null else s.id }
+                        .padding(4.dp),
+                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(s.name, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(
+                        "${s.serverCount} серв · ${s.lastRefreshTs ?: "не обновлялась"}" +
+                            (if (s.url.isBlank()) " · локальная" else ""),
+                        style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+                    )
+                    if (shownErrorId == s.id && s.lastError != null) {
+                        Text(s.lastError, style = MaterialTheme.typography.bodySmall, color = Color(0xFFD32F2F))
+                    }
+                }
+                Switch(checked = s.enabled, onCheckedChange = { onToggle(s.id, it) })
+                TextButton(onClick = { onDeleteRequest(s) }) { Text("✗") }
+            }
+        }
+
+        SettingsGroupLabel("Добавить подписку (URL)")
+        OutlinedTextField(
+            value = newUrl, onValueChange = { newUrl = it },
+            label = { Text("URL подписки") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = newName, onValueChange = { newName = it },
+            label = { Text("Имя (необязательно)") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+        )
+        Button(
+            onClick = { onAddUrl(newUrl.trim(), newName.trim()); newUrl = ""; newName = "" },
+            enabled = newUrl.isNotBlank(),
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("Добавить и обновить") }
+
+        SettingsGroupLabel("Вставить ссылки текстом")
+        OutlinedTextField(
+            value = paste, onValueChange = { paste = it },
+            label = { Text("vless:// vmess:// trojan:// ss:// или base64-подписка") },
+            minLines = 3, modifier = Modifier.fillMaxWidth(),
+        )
+        Button(
+            onClick = { onAddPaste(paste); paste = "" },
+            enabled = paste.isNotBlank(),
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("Добавить из текста") }
+
+        OutlinedButton(onClick = onImportFile, modifier = Modifier.fillMaxWidth()) {
+            Text("📄 Импорт из файла")
+        }
     }
 }

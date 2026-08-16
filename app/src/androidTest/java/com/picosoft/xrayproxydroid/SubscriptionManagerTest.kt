@@ -4,16 +4,14 @@ import android.util.Base64
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.picosoft.xrayproxydroid.subscription.SubscriptionManager
-import com.picosoft.xrayproxydroid.subscription.SubscriptionStore
-import com.picosoft.xrayproxydroid.xray.link.Protocol
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
- * Оффлайн-ядро Manager: base64(vless+vmess+ss+hysteria2+мусор) → importFromBody →
- * added=3, unsupported=1 (hysteria2), invalid>=1, Store хранит подписку с 3 серверами.
+ * Оффлайн-ядро Manager: base64(vless+vmess+ss+hysteria2+мусор) → addLocalFromBody →
+ * added=3, unsupported=1 (hysteria2), invalid>=1, локальный источник с serverCount=3.
  * Без сети (refresh проверим на шаге UI с реальной подпиской).
  */
 @RunWith(AndroidJUnit4::class)
@@ -40,19 +38,14 @@ class SubscriptionManagerTest {
         val plain = listOf(vless, vmess, ss, hysteria2, garbage).joinToString("\n")
         val body = Base64.encodeToString(plain.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
 
-        val url = "https://test.local/import-sub"
-        val summary = SubscriptionManager.importFromBody(ctx, url, body)
+        val (id, summary) = SubscriptionManager.addLocalFromBody(ctx, body, name = "test-import")
 
         assertTrue("ok", summary.ok)
         assertEquals("added (vless+vmess+ss)", 3, summary.added)
         assertEquals("unsupported (hysteria2)", 1, summary.unsupported)
         assertTrue("invalid >= 1 (garbage)", summary.invalid >= 1)
 
-        val sub = SubscriptionStore.load(ctx).first { it.url == url }
-        assertEquals("stored servers", 3, sub.servers.size)
-        assertEquals(
-            listOf(Protocol.VLESS, Protocol.VMESS, Protocol.SHADOWSOCKS),
-            sub.servers.map { it.protocol }
-        )
+        val src = SubscriptionManager.sources(ctx).first { it.id == id }
+        assertEquals("serverCount источника", 3, src.serverCount)
     }
 }

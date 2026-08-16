@@ -8,39 +8,40 @@ import java.net.URI
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 
-/** Итог обновления подписки: сколько серверов добавлено и сколько строк пропущено. */
+/** Итог обновления одного источника. */
 data class RefreshSummary(
     val ok: Boolean,
     val added: Int = 0,
     val unsupported: Int = 0,   // hysteria2/tuic… — распознаны, но не наше ядро
     val invalid: Int = 0,       // битые/неизвестные строки
-    val duplicates: Int = 0,    // повторы того же сервера в самой подписке — отброшены
+    val duplicates: Int = 0,    // повторы в самом источнике — отброшены
     val error: String? = null,
 )
 
+/** Итог склейки при импорте (факт-проверка дедупа между источниками). */
+data class MergeStats(
+    val incoming: Int,          // распознано в этом импорте
+    val newInRegistry: Int,     // новых записей добавлено в общий реестр
+    val mergedExisting: Int,    // совпало с уже существующими serverKey (склейка, не дубль)
+    val registryTotal: Int,     // всего записей в реестре после
+)
+
 /**
- * Оркестратор подписок: fetch → decode → parse → save, поверх [SubscriptionStore].
- * Сетевые методы БЛОКИРУЮЩИЕ — вызывать в фоновом потоке (обеспечит UI на шаге 4).
+ * Оркестратор МУЛЬТИподписок поверх [SubscriptionStore] ([SourcesFile]).
+ * Серверы склеиваются по [serverKey] в общий реестр; членство — список источников.
+ * Сетевые методы БЛОКИРУЮЩИЕ — вызывать в фоне.
  */
 object SubscriptionManager {
 
-    /** Все подписки. */
-    fun list(context: Context): List<Subscription> = SubscriptionStore.load(context)
-
-    /** Плоский список всех серверов из всех подписок (для выбора в UI). */
-    fun allServers(context: Context): List<ServerProfile> =
-        SubscriptionStore.load(context).flatMap { it.servers }
+    /** URL старой единственной подписки — ТОЛЬКО как значение при первой миграции (из кода убран). */
+    private const val LEGACY_DEFAULT_URL = "https://maxim-zodchy.ru/sub-black.php"
 
     /**
-     * Ключ ПОЛНОЙ идентичности соединения — для дедупа импорта И привязки pingMs.
-     *
-     * ВАЖНО: НЕ только protocol+address+port+credential — иначе склеиваются серверы,
-     * различающиеся транспортом (network/security/sni/path/host/flow/reality/grpc/alpn)
-     * или fp: это РАЗНЫЕ конфиги на одном endpoint (проверено на реальной подписке —
-     * 12 транспортно-разных + 17 fp-разных групп, 0 полных дублей). fp включён (вариант A):
-     * под DPI разные отпечатки проходят по-разному, автовыбор должен тестировать каждый.
-     * Исключены только динамика/метки: remarks, raw, pingMs, lastTestedTs.
+     * Ключ ПОЛНОЙ идентичности соединения — дедуп внутри источника, склейка МЕЖДУ источниками,
+     * привязка pingMs/speed, определение активного сервера. НЕ только addr+port+cred (иначе
+     * склеятся транспортно/fp-разные варианты — это разные конфиги). Исключены динамика/метки.
      */
     fun serverKey(p: ServerProfile): String = listOf(
         p.protocol.name, p.address, p.port.toString(), p.credential,
@@ -50,79 +51,169 @@ object SubscriptionManager {
         p.publicKey.orEmpty(), p.shortId.orEmpty(), p.spiderX.orEmpty(),
     ).joinToString("|")
 
-    /**
-     * Пакетно применить задержки (ключ [serverKey] → мс) к сохранённым серверам и сохранить
-     * ОДИН раз. Батчируем, чтобы не писать subscriptions.json на каждый из ~101 результатов.
-     * Непереданные серверы не трогаем (частичный результат при отмене сохраняется).
-     */
+    // ─────────────────────────── миграция (однократно) ───────────────────────────
+
+    /** Однократная инициализация: миграция старого `subscriptions.json` или создание дефолтного источника. */
+    fun init(context: Context) {
+        val cur = SubscriptionStore.load(context)
+        if (cur.migratedLegacy) return
+        val legacy = SubscriptionStore.readLegacy(context)
+        val migrated = if (legacy.isNotEmpty()) convertLegacy(legacy) else freshDefault()
+        SubscriptionStore.save(context, recount(migrated))
+    }
+
+    /** Старые вложенные подписки → источники + реестр (измерения серверов сохраняются). */
+    private fun convertLegacy(legacy: List<Subscription>): SourcesFile {
+        val sources = ArrayList<SubSource>()
+        var registry = emptyList<ServerRecord>()
+        for (s in legacy) {
+            val id = newId()
+            sources.add(
+                SubSource(
+                    id = id, name = s.name, url = s.url, enabled = true,
+                    lastRefreshTs = s.lastUpdateTs, lastOk = s.lastUpdateOk,
+                )
+            )
+            registry = mergeIntoRegistry(registry, id, s.servers).first  // s.servers несут измерения
+        }
+        return SourcesFile(migratedLegacy = true, sources = sources, servers = registry)
+    }
+
+    /** Свежая установка: один источник — старый URL, ещё не обновлён (серверов нет). */
+    private fun freshDefault(): SourcesFile = SourcesFile(
+        migratedLegacy = true,
+        sources = listOf(SubSource(id = newId(), name = nameFromUrl(LEGACY_DEFAULT_URL), url = LEGACY_DEFAULT_URL)),
+        servers = emptyList(),
+    )
+
+    // ─────────────────────────── чтение ───────────────────────────
+
+    /** Метаданные источников. */
+    fun sources(context: Context): List<SubSource> = SubscriptionStore.load(context).sources
+
+    /** Плоский ДЕДУПЛИЦИРОВАННЫЙ список серверов из ВКЛЮЧЁННЫХ источников (для списка/Авто). */
+    fun allServers(context: Context): List<ServerProfile> {
+        val file = SubscriptionStore.load(context)
+        val enabled = file.sources.filter { it.enabled }.map { it.id }.toSet()
+        return file.servers.filter { rec -> rec.sourceIds.any { it in enabled } }.map { it.profile }
+    }
+
+    // ─────────────────────────── применение замеров ───────────────────────────
+
+    /** Обновить pingMs (ключ→мс) в реестре и сохранить ОДИН раз. */
     fun applyPingResults(context: Context, pingByKey: Map<String, Int>) {
         if (pingByKey.isEmpty()) return
         val ts = now()
-        val subs = SubscriptionStore.load(context)
-        val updated = subs.map { sub ->
-            sub.copy(servers = sub.servers.map { s ->
-                val ms = pingByKey[serverKey(s)]
-                if (ms != null) s.copy(pingMs = ms, lastTestedTs = ts) else s
-            })
+        val file = SubscriptionStore.load(context)
+        val servers = file.servers.map { rec ->
+            val ms = pingByKey[serverKey(rec.profile)]
+            if (ms != null) rec.copy(profile = rec.profile.copy(pingMs = ms, lastTestedTs = ts)) else rec
         }
-        SubscriptionStore.save(context, updated)
+        SubscriptionStore.save(context, file.copy(servers = servers))
     }
 
-    /** Пакетно применить скорости (ключ→Mbps) и сохранить один раз. Аналог [applyPingResults]. */
+    /** Обновить speedMbps (ключ→Mbps) в реестре и сохранить ОДИН раз. */
     fun applySpeedResults(context: Context, speedByKey: Map<String, Double>) {
         if (speedByKey.isEmpty()) return
         val ts = now()
-        val subs = SubscriptionStore.load(context)
-        val updated = subs.map { sub ->
-            sub.copy(servers = sub.servers.map { s ->
-                val mbps = speedByKey[serverKey(s)]
-                if (mbps != null) s.copy(speedMbps = mbps, speedTestedTs = ts) else s
-            })
+        val file = SubscriptionStore.load(context)
+        val servers = file.servers.map { rec ->
+            val mbps = speedByKey[serverKey(rec.profile)]
+            if (mbps != null) rec.copy(profile = rec.profile.copy(speedMbps = mbps, speedTestedTs = ts)) else rec
         }
-        SubscriptionStore.save(context, updated)
+        SubscriptionStore.save(context, file.copy(servers = servers))
     }
 
-    /** Добавить подписку (dedup по url). Имя по умолчанию — из URL. true если добавили. */
-    fun add(context: Context, url: String, name: String? = null): Boolean {
+    // ─────────────────────────── управление источниками ───────────────────────────
+
+    /** Добавить источник по URL (дедуп по url). Имя пустое → из хоста. Возвращает id или null (дубль/пусто). */
+    fun addUrl(context: Context, url: String, name: String? = null): String? {
         val u = url.trim()
-        if (u.isEmpty()) return false
-        val subs = SubscriptionStore.load(context).toMutableList()
-        if (subs.any { it.url == u }) return false
-        subs.add(Subscription(url = u, name = name?.takeIf { it.isNotBlank() } ?: nameFromUrl(u)))
-        SubscriptionStore.save(context, subs)
-        return true
+        if (u.isEmpty()) return null
+        val file = SubscriptionStore.load(context)
+        if (file.sources.any { it.url == u }) return null
+        val id = newId()
+        val src = SubSource(id = id, url = u, name = name?.takeIf { it.isNotBlank() } ?: nameFromUrl(u))
+        SubscriptionStore.save(context, file.copy(sources = file.sources + src))
+        return id
     }
 
-    /** Удалить подписку вместе с её серверами. true если что-то удалили. */
-    fun remove(context: Context, url: String): Boolean {
-        val subs = SubscriptionStore.load(context)
-        val kept = subs.filterNot { it.url == url }
-        if (kept.size == subs.size) return false
-        SubscriptionStore.save(context, kept)
-        return true
+    /** Локальный источник из вставленного текста/файла (без URL). Тот же путь, что refresh, но оффлайн. */
+    fun addLocalFromBody(context: Context, body: String, name: String? = null): Pair<String, RefreshSummary> {
+        val id = newId()
+        val file = SubscriptionStore.load(context)
+        val src = SubSource(id = id, url = "", name = name?.takeIf { it.isNotBlank() } ?: "Вставка ${now()}")
+        SubscriptionStore.save(context, file.copy(sources = file.sources + src))
+        return id to importInto(context, id, body)
     }
 
-    /** Скачать + импортировать подписку. БЛОКИРУЮЩИЙ (сеть). */
-    fun refresh(context: Context, url: String): RefreshSummary {
-        val body = SubscriptionFetcher.fetch(url).getOrElse { e ->
-            markFailed(context, url)
+    /** Удалить источник; серверы убираем ТОЛЬКО там, где не осталось ни одного источника. */
+    fun remove(context: Context, id: String) {
+        val file = SubscriptionStore.load(context)
+        val sources = file.sources.filterNot { it.id == id }
+        val servers = file.servers.mapNotNull { rec ->
+            val ids = rec.sourceIds - id
+            if (ids.isEmpty()) null else rec.copy(sourceIds = ids)
+        }
+        SubscriptionStore.save(context, recount(file.copy(sources = sources, servers = servers)))
+    }
+
+    /** Сколько серверов ИСЧЕЗНЕТ при удалении источника (принадлежат только ему). */
+    fun serversLostOnRemove(context: Context, id: String): Int =
+        SubscriptionStore.load(context).servers.count { it.sourceIds.singleOrNull() == id }
+
+    /** Вкл/выкл источник (серверы не удаляем — фильтруются при чтении по enabled). */
+    fun setEnabled(context: Context, id: String, enabled: Boolean) {
+        val file = SubscriptionStore.load(context)
+        SubscriptionStore.save(context, file.copy(sources = file.sources.map {
+            if (it.id == id) it.copy(enabled = enabled) else it
+        }))
+    }
+
+    // ─────────────────────────── обновление ───────────────────────────
+
+    /** Скачать + импортировать ОДИН источник по его url. БЛОКИРУЮЩИЙ. Локальные (url пустой) пропускаем. */
+    fun refreshOne(context: Context, id: String): RefreshSummary {
+        val src = SubscriptionStore.load(context).sources.firstOrNull { it.id == id }
+            ?: return RefreshSummary(ok = false, error = "источник не найден")
+        if (src.url.isBlank()) return RefreshSummary(ok = false, error = "локальный источник — нечего скачивать")
+        val body = SubscriptionFetcher.fetch(src.url).getOrElse { e ->
+            markStatus(context, id, ok = false, error = e.message ?: "fetch failed")
             return RefreshSummary(ok = false, error = e.message ?: "fetch failed")
         }
-        return importFromBody(context, url, body)
+        return importInto(context, id, body)
     }
 
     /**
-     * Оффлайн-ядро: тело → decode → parse каждую строку → заменить servers подписки → save.
-     * Без сети — тестируемо отдельно. Если подписки с таким url ещё нет, создаётся.
+     * Обновить ВСЕ включённые URL-источники. Одна упавшая не роняет прочие. [cancelled] — флаг между
+     * источниками. [onEach] — колбэк прогресса (имя, summary). Возвращает карту id→summary.
      */
-    fun importFromBody(context: Context, url: String, body: String): RefreshSummary {
-        val lines = SubscriptionDecoder.decode(body)
+    fun refreshAllEnabled(
+        context: Context,
+        cancelled: () -> Boolean = { false },
+        onEach: (SubSource, RefreshSummary) -> Unit = { _, _ -> },
+    ): Map<String, RefreshSummary> {
+        val result = LinkedHashMap<String, RefreshSummary>()
+        val targets = SubscriptionStore.load(context).sources.filter { it.enabled && it.url.isNotBlank() }
+        for (src in targets) {
+            if (cancelled()) break
+            val summary = runCatching { refreshOne(context, src.id) }
+                .getOrElse { RefreshSummary(ok = false, error = it.message ?: "ошибка") }
+            result[src.id] = summary
+            onEach(src, summary)
+        }
+        return result
+    }
 
+    /**
+     * Оффлайн-ядро: тело → decode → parse → склейка в реестр под источник [id] → пересчёт → save.
+     * Обновляет статус источника. Тестируемо без сети.
+     */
+    fun importInto(context: Context, id: String, body: String): RefreshSummary {
+        val lines = SubscriptionDecoder.decode(body)
         val profiles = ArrayList<ServerProfile>()
-        val seen = HashSet<String>()          // дедуп внутри подписки по serverKey
-        var unsupported = 0
-        var invalid = 0
-        var duplicates = 0
+        val seen = HashSet<String>()   // дедуп ВНУТРИ источника
+        var unsupported = 0; var invalid = 0; var duplicates = 0
         for (line in lines) {
             when (val r = ServerLinkParser.parse(line)) {
                 is ParseResult.Supported ->
@@ -132,37 +223,88 @@ object SubscriptionManager {
             }
         }
 
-        val subs = SubscriptionStore.load(context).toMutableList()
-        val idx = subs.indexOfFirst { it.url == url }
-        val name = if (idx >= 0) subs[idx].name else nameFromUrl(url)
-        val updated = Subscription(
-            url = url,
-            name = name,
-            lastUpdateOk = true,
-            lastUpdateTs = now(),
-            servers = profiles,          // ре-импорт заменяет серверы целиком
-        )
-        if (idx >= 0) subs[idx] = updated else subs.add(updated)
-        SubscriptionStore.save(context, subs)
+        val file = SubscriptionStore.load(context)
+        val (registry, _) = mergeIntoRegistry(file.servers, id, profiles)
+        val sources = file.sources.map {
+            if (it.id == id) it.copy(lastOk = true, lastError = null, lastRefreshTs = now()) else it
+        }
+        SubscriptionStore.save(context, recount(file.copy(sources = sources, servers = registry)))
+        return RefreshSummary(ok = true, added = profiles.size, unsupported = unsupported, invalid = invalid, duplicates = duplicates)
+    }
 
-        return RefreshSummary(
-            ok = true, added = profiles.size,
-            unsupported = unsupported, invalid = invalid, duplicates = duplicates,
+    /** Факт-проверка дедупа: склеить набор профилей в реестр и вернуть статистику пересечений. */
+    fun mergeStats(existing: List<ServerRecord>, sourceId: String, profiles: List<ServerProfile>): MergeStats {
+        val existingKeys = existing.map { serverKey(it.profile) }.toHashSet()
+        val incomingKeys = profiles.map { serverKey(it) }.toHashSet()
+        val merged = incomingKeys.count { it in existingKeys }
+        val (reg, _) = mergeIntoRegistry(existing, sourceId, profiles)
+        return MergeStats(
+            incoming = profiles.size,
+            newInRegistry = incomingKeys.size - merged,
+            mergedExisting = merged,
+            registryTotal = reg.size,
         )
     }
 
-    // --- helpers ---
+    // ─────────────────────────── склейка реестра ───────────────────────────
 
-    /** Пометить существующую подписку как неуспешно обновлённую (для индикатора в UI). */
-    private fun markFailed(context: Context, url: String) {
-        val subs = SubscriptionStore.load(context)
-        if (subs.none { it.url == url }) return
-        SubscriptionStore.save(context, subs.map {
-            if (it.url == url) it.copy(lastUpdateOk = false, lastUpdateTs = now()) else it
-        })
+    /**
+     * Влить [profiles] под [sourceId] в реестр: совпавшие по serverKey — склеить (СОХРАНИВ измерения
+     * существующей записи, добавив sourceId), отсутствующие в импорте — убрать sourceId (и запись,
+     * если источников не осталось), новые — добавить. Возвращает (новый реестр, число склеек).
+     */
+    private fun mergeIntoRegistry(
+        registry: List<ServerRecord>,
+        sourceId: String,
+        profiles: List<ServerProfile>,
+    ): Pair<List<ServerRecord>, Int> {
+        val incoming = LinkedHashMap<String, ServerProfile>()
+        for (p in profiles) incoming.putIfAbsent(serverKey(p), p)
+
+        val result = ArrayList<ServerRecord>()
+        val handled = HashSet<String>()
+        var merged = 0
+        for (rec in registry) {
+            val k = serverKey(rec.profile)
+            val fresh = incoming[k]
+            if (fresh != null) {
+                // Совпадение: сохраняем измерения существующей записи, статические поля берём из fresh.
+                val mergedProfile = fresh.copy(
+                    pingMs = rec.profile.pingMs, lastTestedTs = rec.profile.lastTestedTs,
+                    speedMbps = rec.profile.speedMbps, speedTestedTs = rec.profile.speedTestedTs,
+                )
+                result.add(ServerRecord(mergedProfile, (rec.sourceIds + sourceId).distinct()))
+                if (sourceId !in rec.sourceIds) merged++
+                handled.add(k)
+            } else {
+                // Не в этом импорте — убираем данный источник; запись остаётся, если есть другие.
+                val ids = rec.sourceIds - sourceId
+                if (ids.isNotEmpty()) result.add(rec.copy(sourceIds = ids))
+            }
+        }
+        for ((k, fresh) in incoming) if (k !in handled) result.add(ServerRecord(fresh, listOf(sourceId)))
+        return result to merged
     }
 
-    /** Имя из URL — как Python _name_from_url: host + последний сегмент пути (12 симв.). */
+    /** Пересчитать serverCount каждого источника из реестра (денормализация без дрейфа). */
+    private fun recount(file: SourcesFile): SourcesFile {
+        val counts = HashMap<String, Int>()
+        for (rec in file.servers) for (id in rec.sourceIds) counts[id] = (counts[id] ?: 0) + 1
+        return file.copy(sources = file.sources.map { it.copy(serverCount = counts[it.id] ?: 0) })
+    }
+
+    // ─────────────────────────── helpers ───────────────────────────
+
+    private fun markStatus(context: Context, id: String, ok: Boolean, error: String?) {
+        val file = SubscriptionStore.load(context)
+        SubscriptionStore.save(context, file.copy(sources = file.sources.map {
+            if (it.id == id) it.copy(lastOk = ok, lastError = error, lastRefreshTs = now()) else it
+        }))
+    }
+
+    private fun newId(): String = UUID.randomUUID().toString()
+
+    /** Имя из URL: host + последний сегмент пути (12 симв.). */
     private fun nameFromUrl(url: String): String = try {
         val u = URI(url)
         val host = u.host ?: return url.take(30)
@@ -172,6 +314,5 @@ object SubscriptionManager {
         url.take(30)
     }
 
-    private fun now(): String =
-        SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date())
+    private fun now(): String = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date())
 }
