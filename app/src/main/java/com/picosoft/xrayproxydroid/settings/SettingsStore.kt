@@ -25,7 +25,7 @@ data class AppSettings(
     val speedWarmupSec: Int = 1,        // прогрев (TCP slow-start) отбрасываем
     val speedWindowSec: Int = 5,        // окно измерения
     val speedPool: Int = 1,             // одновременных замеров скорости; ОТ 1 (1 = строго последовательно)
-    val speedProbeUrl: String = "http://speedtest.tele2.net/100MB.zip", // редактируемый (Cloudflare 403 / Hetzner TLS)
+    val speedProbeUrl: String = "http://speedtest.tele2.net/1GB.zip", // 1 ГБ: заведомо больше окна (нет eof); редактируемый (Cloudflare 403 / Hetzner TLS)
 
     // --- Пинг ---
     val pingTimeoutMs: Int = 5_000,     // мягкий таймаут одного пинга

@@ -220,11 +220,12 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         remeasureStatus = "меряю… (лог: тег ServerSpeedTester)"
         val key = SubscriptionManager.serverKey(p)
         Thread {
-            val mbps = ServerSpeedTester.measureSpeed(context, p)
-            SubscriptionManager.applySpeedResults(context, mapOf(key to mbps))
+            val m = ServerSpeedTester.measureSpeedDetailed(context, p)
+            SubscriptionManager.applySpeedResults(context, mapOf(key to m.mbps))   // -1 при провале
             activity.runOnUiThread {
-                speedResults = speedResults + (key to mbps)
-                remeasureStatus = "результат: $mbps Мбит/с"
+                speedResults = speedResults + (key to m.mbps)
+                remeasureStatus = if (m.ok) "результат: ${m.mbps} Мбит/с"
+                                  else "НЕ ИЗМЕРЕНО — ${m.reason}"
                 remeasuring = false
                 reloadServers()
             }
