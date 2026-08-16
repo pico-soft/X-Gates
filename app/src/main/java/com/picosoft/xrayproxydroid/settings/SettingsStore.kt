@@ -31,6 +31,10 @@ data class AppSettings(
     val pingTimeoutMs: Int = 5_000,     // мягкий таймаут одного пинга
     val pingPool: Int = 8,              // одновременных пингов
 
+    // --- Подписки ---
+    val subUserAgent: String = "v2rayNG/1.8.0",  // многие панели по неизвестному UA отдают Clash YAML вместо base64
+    val subTimeoutSec: Int = 15,                 // таймаут загрузки подписки
+
     // --- Выбор сервера ---
     val minUsableMbps: Double = 0.05,   // порог видимости в списке / «живой»
     val upgradeMarginPercent: Int = 10, // запас для апгрейда на более быстрый

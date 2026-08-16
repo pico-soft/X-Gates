@@ -156,6 +156,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     var refreshingSubs by remember { mutableStateOf(false) }
     var subRefreshCancel by remember { mutableStateOf(false) }
     var pendingDelete by remember { mutableStateOf<SubSource?>(null) }
+    var renameSource by remember { mutableStateOf<SubSource?>(null) }
 
     var pingResults by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
 
@@ -251,7 +252,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
             val okN = res.values.count { it.ok }; val failN = res.values.count { !it.ok }
             activity.runOnUiThread {
                 refreshingSubs = false
-                subStatus = "обновлено: $okN ок, $failN с ошибкой"
+                // Одна статус-строка (в баре) — вторую (subStatus) НЕ дублируем. Детали ошибок — в секции подписок.
                 TestProgress.finish(if (subRefreshCancel) "обновление прервано" else "подписки обновлены: $okN ок, $failN ошибок")
                 reloadSources(); reloadServers()
             }
@@ -306,6 +307,12 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         SubscriptionManager.remove(context, src.id)
         pendingDelete = null
         reloadSources(); reloadServers()
+    }
+
+    fun onRenameSource(id: String, name: String) {
+        SubscriptionManager.rename(context, id, name)
+        renameSource = null
+        reloadSources()
     }
 
     // Пикер файла (объявлен после onImportFile — локальные функции без forward-reference).
@@ -519,6 +526,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                     onImportFile = { filePickerLauncher.launch("*/*") },
                     onToggle = { id, en -> onToggleSource(id, en) },
                     onDeleteRequest = { pendingDelete = it },
+                    onRenameRequest = { renameSource = it },
                 )
             }
         }
@@ -555,6 +563,15 @@ private fun BootScreen(modifier: Modifier = Modifier) {
             remeasuring = remeasuring,
             onRemeasure = { onRemeasure(p) },
             onDismiss = { detailProfile = null; remeasureStatus = "" },
+        )
+    }
+
+    // Переименование источника: имя + URL целиком.
+    renameSource?.let { src ->
+        RenameSourceDialog(
+            source = src,
+            onSave = { onRenameSource(src.id, it) },
+            onDismiss = { renameSource = null },
         )
     }
 
@@ -964,6 +981,14 @@ private fun SettingsSection(
             onChange(settings.copy(pingPool = it))
         }
 
+        SettingsGroupLabel("Подписки")
+        UrlSettingRow("User-Agent загрузки", settings.subUserAgent, d.subUserAgent, requireHttp = false) {
+            onChange(settings.copy(subUserAgent = it))
+        }
+        IntSettingRow("Таймаут загрузки", "с", settings.subTimeoutSec, d.subTimeoutSec, 3, 120) {
+            onChange(settings.copy(subTimeoutSec = it))
+        }
+
         SettingsGroupLabel("Выбор сервера")
         DoubleSettingRow("Минимальная полезная скорость", "Мбит/с", settings.minUsableMbps, d.minUsableMbps, 0.0, 100.0) {
             onChange(settings.copy(minUsableMbps = it))
@@ -1065,12 +1090,14 @@ private fun DoubleSettingRow(
     }
 }
 
-/** URL — во всю ширину (длинный), валиден если начинается с http(s):// и не пуст. */
+/** Текст во всю ширину (длинный: URL/UA). [requireHttp] — для URL требуем схему http(s), иначе просто не пусто. */
 @Composable
-private fun UrlSettingRow(label: String, value: String, default: String, onCommit: (String) -> Unit) {
+private fun UrlSettingRow(label: String, value: String, default: String, requireHttp: Boolean = true, onCommit: (String) -> Unit) {
     var text by remember(value) { mutableStateOf(value) }
-    val v = text.trim()
-    val valid = v.isNotBlank() && (v.startsWith("http://") || v.startsWith("https://"))
+    fun ok(s: String): Boolean {
+        val v = s.trim()
+        return v.isNotBlank() && (!requireHttp || v.startsWith("http://") || v.startsWith("https://"))
+    }
     Column(modifier = Modifier.fillMaxWidth()) {
         Text(label, style = MaterialTheme.typography.bodyMedium)
         if (value != default) {
@@ -1080,10 +1107,9 @@ private fun UrlSettingRow(label: String, value: String, default: String, onCommi
             value = text,
             onValueChange = { t ->
                 text = t
-                val tv = t.trim()
-                if (tv.isNotBlank() && (tv.startsWith("http://") || tv.startsWith("https://"))) onCommit(tv)
+                if (ok(t)) onCommit(t.trim())
             },
-            isError = !valid,
+            isError = !ok(text),
             singleLine = true,
             modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
         )
@@ -1111,11 +1137,13 @@ private fun SubscriptionsSection(
     onImportFile: () -> Unit,
     onToggle: (String, Boolean) -> Unit,
     onDeleteRequest: (SubSource) -> Unit,
+    onRenameRequest: (SubSource) -> Unit,
 ) {
     var newUrl by remember { mutableStateOf("") }
     var newName by remember { mutableStateOf("") }
     var paste by remember { mutableStateOf("") }
-    var shownErrorId by remember { mutableStateOf<String?>(null) }
+    var shownDetailId by remember { mutableStateOf<String?>(null) }   // тап по точке разворачивает подробности
+    val red = Color(0xFFD32F2F)
 
     Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (sources.isEmpty()) {
@@ -1125,7 +1153,7 @@ private fun SubscriptionsSection(
             val dotColor = when {
                 !s.enabled -> TABLE_GRAY                 // выключена — серая
                 s.lastOk == true -> Color(0xFF2E7D32)    // ок — зелёная
-                s.lastOk == false -> Color(0xFFD32F2F)   // ошибка — красная
+                s.lastOk == false -> red                 // ошибка — красная
                 else -> TABLE_GRAY                       // ни разу — серая
             }
             Row(
@@ -1133,24 +1161,42 @@ private fun SubscriptionsSection(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
+                // Тап по точке = свернуть/развернуть ПОДРОБНОСТИ (суть ошибки видна и без тапа).
                 Text(
                     "●",
                     color = dotColor,
                     fontSize = TABLE_FONT,
                     modifier = Modifier
                         .clip(RoundedCornerShape(4.dp))
-                        .clickable { shownErrorId = if (shownErrorId == s.id) null else s.id }
+                        .clickable { shownDetailId = if (shownDetailId == s.id) null else s.id }
                         .padding(4.dp),
                 )
-                Column(modifier = Modifier.weight(1f)) {
+                // Тап по имени = переименовать.
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(4.dp))
+                        .clickable { onRenameRequest(s) }
+                        .padding(vertical = 2.dp),
+                ) {
                     Text(s.name, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Text(
                         "${s.serverCount} серв · ${s.lastRefreshTs ?: "не обновлялась"}" +
                             (if (s.url.isBlank()) " · локальная" else ""),
                         style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
                     )
-                    if (shownErrorId == s.id && s.lastError != null) {
-                        Text(s.lastError, style = MaterialTheme.typography.bodySmall, color = Color(0xFFD32F2F))
+                    // Суть ошибки — ВСЕГДА видна, красным, с переносом (без тапа).
+                    if (s.lastError != null) {
+                        Text(s.lastError, style = MaterialTheme.typography.bodySmall, color = red)
+                    }
+                    // Подробности — по тапу на точку.
+                    if (shownDetailId == s.id && s.lastDetail != null) {
+                        Text(
+                            s.lastDetail,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TABLE_GRAY,
+                            modifier = Modifier.padding(top = 2.dp),
+                        )
                     }
                 }
                 Switch(checked = s.enabled, onCheckedChange = { onToggle(s.id, it) })
@@ -1189,4 +1235,32 @@ private fun SubscriptionsSection(
             Text("📄 Импорт из файла")
         }
     }
+}
+
+/** Диалог переименования источника: поле имени + URL целиком (в списке он обрезан). */
+@Composable
+private fun RenameSourceDialog(
+    source: SubSource,
+    onSave: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var name by remember(source) { mutableStateOf(source.name) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Переименовать источник") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = name, onValueChange = { name = it },
+                    label = { Text("Имя") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    if (source.url.isBlank()) "URL: — (локальный источник)" else "URL: ${source.url}",
+                    style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+                )
+            }
+        },
+        confirmButton = { TextButton(onClick = { onSave(name.trim()) }) { Text("Сохранить") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
+    )
 }

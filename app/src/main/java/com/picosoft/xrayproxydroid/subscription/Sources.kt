@@ -23,7 +23,8 @@ data class SubSource(
     val enabled: Boolean = true,
     val lastRefreshTs: String? = null,
     val lastOk: Boolean? = null,
-    val lastError: String? = null,
+    val lastError: String? = null,     // суть ошибки (видна всегда, красным)
+    val lastDetail: String? = null,    // диагностика под тапом (URL/код/байты/тело-200/исключение)
     val serverCount: Int = 0,
 )
 

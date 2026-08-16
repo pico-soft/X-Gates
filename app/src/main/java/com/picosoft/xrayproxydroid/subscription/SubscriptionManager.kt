@@ -1,6 +1,8 @@
 package com.picosoft.xrayproxydroid.subscription
 
 import android.content.Context
+import android.util.Log
+import com.picosoft.xrayproxydroid.settings.SettingsStore
 import com.picosoft.xrayproxydroid.xray.link.ParseResult
 import com.picosoft.xrayproxydroid.xray.link.ServerLinkParser
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
@@ -34,6 +36,8 @@ data class MergeStats(
  * Сетевые методы БЛОКИРУЮЩИЕ — вызывать в фоне.
  */
 object SubscriptionManager {
+
+    private const val TAG = "SubscriptionManager"
 
     /** URL старой единственной подписки — ТОЛЬКО как значение при первой миграции (из кода убран). */
     private const val LEGACY_DEFAULT_URL = "https://maxim-zodchy.ru/sub-black.php"
@@ -126,9 +130,9 @@ object SubscriptionManager {
 
     // ─────────────────────────── управление источниками ───────────────────────────
 
-    /** Добавить источник по URL (дедуп по url). Имя пустое → из хоста. Возвращает id или null (дубль/пусто). */
+    /** Добавить источник по URL (нормализуем, дедуп по нормализованному url). Возвращает id или null. */
     fun addUrl(context: Context, url: String, name: String? = null): String? {
-        val u = url.trim()
+        val u = normalizeUrl(url)
         if (u.isEmpty()) return null
         val file = SubscriptionStore.load(context)
         if (file.sources.any { it.url == u }) return null
@@ -138,13 +142,23 @@ object SubscriptionManager {
         return id
     }
 
-    /** Локальный источник из вставленного текста/файла (без URL). Тот же путь, что refresh, но оффлайн. */
+    /** Локальный источник из вставленного текста/файла (без URL). Тот же разбор, что refresh, но оффлайн. */
     fun addLocalFromBody(context: Context, body: String, name: String? = null): Pair<String, RefreshSummary> {
         val id = newId()
         val file = SubscriptionStore.load(context)
         val src = SubSource(id = id, url = "", name = name?.takeIf { it.isNotBlank() } ?: "Вставка ${now()}")
         SubscriptionStore.save(context, file.copy(sources = file.sources + src))
-        return id to importInto(context, id, body)
+        val detail = "Локальная вставка: ${body.length} симв, похоже на ${sniff(body)}"
+        return id to importInto(context, id, body, detail)
+    }
+
+    /** Переименовать источник. Имя persist и НЕ затирается обновлением (refresh не трогает name). */
+    fun rename(context: Context, id: String, name: String) {
+        val n = name.trim().ifBlank { "Без имени" }
+        val file = SubscriptionStore.load(context)
+        SubscriptionStore.save(context, file.copy(sources = file.sources.map {
+            if (it.id == id) it.copy(name = n) else it
+        }))
     }
 
     /** Удалить источник; серверы убираем ТОЛЬКО там, где не осталось ни одного источника. */
@@ -174,14 +188,49 @@ object SubscriptionManager {
 
     /** Скачать + импортировать ОДИН источник по его url. БЛОКИРУЮЩИЙ. Локальные (url пустой) пропускаем. */
     fun refreshOne(context: Context, id: String): RefreshSummary {
+        val settings = SettingsStore.current()
+        val verbose = settings.verboseLogs
+        fun log(m: String) { if (verbose) Log.i(TAG, m) }
+
         val src = SubscriptionStore.load(context).sources.firstOrNull { it.id == id }
             ?: return RefreshSummary(ok = false, error = "источник не найден")
         if (src.url.isBlank()) return RefreshSummary(ok = false, error = "локальный источник — нечего скачивать")
-        val body = SubscriptionFetcher.fetch(src.url).getOrElse { e ->
-            markStatus(context, id, ok = false, error = e.message ?: "fetch failed")
-            return RefreshSummary(ok = false, error = e.message ?: "fetch failed")
+
+        val url = normalizeUrl(src.url)
+        log("── refresh «${src.name}» url=${src.url} → norm=$url UA=${settings.subUserAgent} timeout=${settings.subTimeoutSec}s")
+        val res = SubscriptionFetcher.fetch(url, settings.subUserAgent, settings.subTimeoutSec * 1000)
+        log("  http=${res.httpCode} finalUrl=${res.finalUrl} type=${res.contentType} len=${res.contentLength} bytes=${res.bodyBytes} exc=${res.exceptionClass}")
+        log("  body[0..200]=${res.body.take(200).replace("\n", "⏎")}")
+
+        val fetchDetail = buildString {
+            append("URL: ${res.finalUrl}\n")
+            append("HTTP: ${if (res.httpCode >= 0) res.httpCode else "—"}")
+            res.contentType?.let { append(" · $it") }
+            append("\nБайт: ${res.bodyBytes}")
+            res.exceptionClass?.let { append("\nИсключение: $it: ${res.errorMessage}") }
+            append("\nТело: ${res.body.take(200).replace("\n", " ")}")
         }
-        return importInto(context, id, body)
+
+        // Классификация СЕТЕВОГО/HTTP отказа (до разбора тела).
+        if (!res.ok) {
+            val err = classifyFetchFailure(res)
+            setStatus(context, id, ok = false, error = err, detail = fetchDetail)
+            log("  → ОТКАЗ: $err")
+            return RefreshSummary(ok = false, error = err)
+        }
+        return importInto(context, id, res.body, fetchDetail)
+    }
+
+    /** Классификация не-успешной загрузки в русский текст (сеть/таймаут/cleartext/HTTP-код/пусто). */
+    private fun classifyFetchFailure(res: FetchResult): String = when {
+        res.exceptionClass != null && (res.errorMessage?.contains("CLEARTEXT", true) == true ||
+            res.errorMessage?.contains("Cleartext", true) == true) ->
+            "cleartext http:// заблокирован политикой Android — используйте https://"
+        res.exceptionClass == "UnknownHostException" -> "Хост не найден (нет сети/DNS): ${res.errorMessage}"
+        res.exceptionClass == "SocketTimeoutException" -> "Таймаут загрузки (${res.errorMessage})"
+        res.exceptionClass != null -> "Сеть недоступна: ${res.exceptionClass}: ${res.errorMessage}"
+        res.httpCode !in 200..299 -> "HTTP ${res.httpCode} — сервер отклонил запрос"
+        else -> "Неизвестная ошибка загрузки"
     }
 
     /**
@@ -207,29 +256,74 @@ object SubscriptionManager {
 
     /**
      * Оффлайн-ядро: тело → decode → parse → склейка в реестр под источник [id] → пересчёт → save.
-     * Обновляет статус источника. Тестируемо без сети.
+     * Классифицирует отказ разбора (пусто / 0 ссылок / всё unsupported) отдельным русским текстом —
+     * это НЕ сетевая ошибка. [detail] — диагностика (URL/код/тело) для подробностей. Тестируемо без сети.
      */
-    fun importInto(context: Context, id: String, body: String): RefreshSummary {
+    fun importInto(context: Context, id: String, body: String, detail: String? = null): RefreshSummary {
+        val verbose = SettingsStore.current().verboseLogs
+        fun log(m: String) { if (verbose) Log.i(TAG, m) }
+
+        val bytes = body.toByteArray(Charsets.UTF_8).size
+        if (body.isBlank()) {
+            val err = "Тело пустое (0 байт)"
+            persistMerge(context, id, emptyList(), ok = false, error = err, detail = detail)
+            log("  → $err")
+            return RefreshSummary(ok = false, error = err)
+        }
+
         val lines = SubscriptionDecoder.decode(body)
         val profiles = ArrayList<ServerProfile>()
+        val unsupportedKinds = LinkedHashSet<String>()
         val seen = HashSet<String>()   // дедуп ВНУТРИ источника
         var unsupported = 0; var invalid = 0; var duplicates = 0
         for (line in lines) {
             when (val r = ServerLinkParser.parse(line)) {
                 is ParseResult.Supported ->
                     if (seen.add(serverKey(r.profile))) profiles.add(r.profile) else duplicates++
-                is ParseResult.Unsupported -> unsupported++
+                is ParseResult.Unsupported -> { unsupported++; unsupportedKinds.add(r.scheme) }
                 is ParseResult.Invalid -> invalid++
             }
         }
+        log("  строк=${lines.size} распарсено=${profiles.size} unsupported=$unsupported ($unsupportedKinds) invalid=$invalid дубли=$duplicates")
 
+        if (profiles.isEmpty()) {
+            val err = when {
+                lines.isNotEmpty() && unsupported > 0 && invalid == 0 ->
+                    "Ссылки есть, но все протоколы не поддержаны: ${unsupportedKinds.joinToString(", ")}"
+                else ->
+                    "Скачано $bytes байт, ссылок не найдено (похоже на ${sniff(body)})"
+            }
+            persistMerge(context, id, emptyList(), ok = false, error = err, detail = detail)
+            log("  → $err")
+            return RefreshSummary(ok = false, added = 0, unsupported = unsupported, invalid = invalid, error = err)
+        }
+
+        persistMerge(context, id, profiles, ok = true, error = null, detail = detail)
+        return RefreshSummary(ok = true, added = profiles.size, unsupported = unsupported, invalid = invalid, duplicates = duplicates)
+    }
+
+    /** Влить профили под источник [id] в реестр + выставить статус/детали источника + пересчёт + save. */
+    private fun persistMerge(
+        context: Context, id: String, profiles: List<ServerProfile>,
+        ok: Boolean, error: String?, detail: String?,
+    ) {
         val file = SubscriptionStore.load(context)
         val (registry, _) = mergeIntoRegistry(file.servers, id, profiles)
         val sources = file.sources.map {
-            if (it.id == id) it.copy(lastOk = true, lastError = null, lastRefreshTs = now()) else it
+            if (it.id == id) it.copy(lastOk = ok, lastError = error, lastDetail = detail, lastRefreshTs = now()) else it
         }
         SubscriptionStore.save(context, recount(file.copy(sources = sources, servers = registry)))
-        return RefreshSummary(ok = true, added = profiles.size, unsupported = unsupported, invalid = invalid, duplicates = duplicates)
+    }
+
+    /** На что похоже тело (для сообщения «ссылок не найдено»). */
+    private fun sniff(body: String): String {
+        val t = body.trimStart()
+        return when {
+            t.startsWith("<") || t.contains("<!doctype", true) || t.contains("<html", true) -> "HTML (страница, не подписка)"
+            t.startsWith("{") || t.startsWith("[") -> "JSON"
+            t.contains("proxies:") || t.contains("proxy-groups:") || Regex("(?m)^[\\w-]+:\\s").containsMatchIn(t) -> "YAML/Clash (нужен base64-список, не Clash)"
+            else -> "обычный текст без ссылок"
+        }
     }
 
     /** Факт-проверка дедупа: склеить набор профилей в реестр и вернуть статистику пересечений. */
@@ -295,23 +389,28 @@ object SubscriptionManager {
 
     // ─────────────────────────── helpers ───────────────────────────
 
-    private fun markStatus(context: Context, id: String, ok: Boolean, error: String?) {
+    /** Выставить статус источника (сетевой/HTTP отказ — без изменения серверов). */
+    private fun setStatus(context: Context, id: String, ok: Boolean, error: String?, detail: String?) {
         val file = SubscriptionStore.load(context)
         SubscriptionStore.save(context, file.copy(sources = file.sources.map {
-            if (it.id == id) it.copy(lastOk = ok, lastError = error, lastRefreshTs = now()) else it
+            if (it.id == id) it.copy(lastOk = ok, lastError = error, lastDetail = detail, lastRefreshTs = now()) else it
         }))
     }
 
     private fun newId(): String = UUID.randomUUID().toString()
 
-    /** Имя из URL: host + последний сегмент пути (12 симв.). */
+    /** Нормализация URL: обрезать пробелы/переводы строк с концов; без схемы — подставить https://. */
+    fun normalizeUrl(raw: String): String {
+        val u = raw.trim().trim('\n', '\r', ' ', '\t')
+        if (u.isEmpty()) return ""
+        return if (u.startsWith("http://", true) || u.startsWith("https://", true)) u else "https://$u"
+    }
+
+    /** Имя из URL — ТОЛЬКО host. Если хост извлечь не удалось — честно «Без имени» (не огрызок URL). */
     private fun nameFromUrl(url: String): String = try {
-        val u = URI(url)
-        val host = u.host ?: return url.take(30)
-        val seg = u.path.orEmpty().trim('/').substringAfterLast('/', "")
-        if (seg.isNotEmpty()) "$host/${seg.take(12)}" else host
+        URI(normalizeUrl(url)).host?.takeIf { it.isNotBlank() } ?: "Без имени"
     } catch (e: Exception) {
-        url.take(30)
+        "Без имени"
     }
 
     private fun now(): String = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date())
