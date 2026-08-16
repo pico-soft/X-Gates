@@ -23,7 +23,7 @@ import java.io.File
 data class AppSettings(
     // --- Замер скорости (прямо влияет на открытый вопрос 0.1 vs 4.0) ---
     val speedWarmupSec: Int = 1,        // прогрев (TCP slow-start) отбрасываем
-    val speedWindowSec: Int = 5,        // окно измерения
+    val speedWindowSec: Int = 2,        // окно измерения (2с: 5с×170Мбит=>100МБ/сервер, гигабайты трафика на прогон)
     val speedPool: Int = 1,             // одновременных замеров скорости; ОТ 1 (1 = строго последовательно)
     val speedProbeUrl: String = "http://speedtest.tele2.net/1GB.zip", // 1 ГБ: заведомо больше окна (нет eof); редактируемый (Cloudflare 403 / Hetzner TLS)
 
