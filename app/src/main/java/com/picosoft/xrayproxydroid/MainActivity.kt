@@ -27,11 +27,9 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
@@ -141,33 +139,38 @@ private fun CompactBottomBar(selected: Int, onSelect: (Int) -> Unit) {
             .background(MaterialTheme.colorScheme.surface)
             .windowInsetsPadding(WindowInsets.navigationBars),   // системный жест-бар — отдельным отступом
     ) {
-        Row(modifier = Modifier.fillMaxWidth().heightIn(min = BOTTOM_BAR_HEIGHT)) {
-            labels.forEachIndexed { i, label ->
-                val active = i == selected
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxHeight()
-                        .clickable { onSelect(i) },
-                    contentAlignment = Alignment.Center,
-                ) {
-                    // тонкая полоса-индикатор активной вкладки (сверху, без заливки во всю высоту)
-                    if (active) {
-                        Box(
-                            modifier = Modifier
-                                .align(Alignment.TopCenter)
-                                .width(28.dp)
-                                .height(2.dp)
-                                .background(MaterialTheme.colorScheme.primary),
-                        )
+        // Подпись при крупных системных шрифтах не режем высотой — ограничиваем масштаб (cappedDensity).
+        CompositionLocalProvider(LocalDensity provides cappedDensity()) {
+            Row(
+                modifier = Modifier.fillMaxWidth().height(BOTTOM_BAR_HEIGHT),   // ФИКС. высота — панель тонкая
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                labels.forEachIndexed { i, label ->
+                    val active = i == selected
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)                 // weight — ТОЛЬКО ширина; высоту НЕ трогаем
+                            .clickable { onSelect(i) },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            // тонкая полоса-индикатор ВНУТРИ вкладки (прозрачна у неактивной — layout не прыгает)
+                            Box(
+                                modifier = Modifier
+                                    .width(24.dp)
+                                    .height(2.dp)
+                                    .background(if (active) MaterialTheme.colorScheme.primary else Color.Transparent),
+                            )
+                            Spacer(Modifier.height(2.dp))
+                            Text(
+                                label,
+                                fontSize = 11.sp,
+                                maxLines = 1,
+                                color = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
+                            )
+                        }
                     }
-                    Text(
-                        label,
-                        fontSize = 12.sp,
-                        maxLines = 1,
-                        color = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
-                        fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
-                    )
                 }
             }
         }
