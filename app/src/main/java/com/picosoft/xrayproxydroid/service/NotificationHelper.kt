@@ -16,8 +16,30 @@ import com.picosoft.xrayproxydroid.R
 object NotificationHelper {
 
     const val NOTIFICATION_ID = 1
+    const val PROMPT_ID = 2
     private const val CHANNEL_ID = "xray_proxy"
     private const val CHANNEL_NAME = "Xray proxy"
+
+    /** Уведомление (пункт E): нет живых серверов, предложить включить выключенные источники. Тап → приложение. */
+    fun notifyEnableSources(context: Context, sources: Int, servers: Int) {
+        ensureChannel(context)
+        val pi = PendingIntent.getActivity(
+            context, 2, Intent(context, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val n = NotificationCompat.Builder(context, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_stat_proxy)
+            .setContentTitle("Нет живых серверов")
+            .setContentText("Включить $sources выключенных источников (~$servers серверов)? Откройте приложение.")
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setContentIntent(pi)
+            .build()
+        androidx.core.app.NotificationManagerCompat.from(context).notify(PROMPT_ID, n)
+    }
+
+    fun cancelEnableSources(context: Context) =
+        androidx.core.app.NotificationManagerCompat.from(context).cancel(PROMPT_ID)
 
     fun buildNotification(service: Service, label: String?): Notification {
         ensureChannel(service)

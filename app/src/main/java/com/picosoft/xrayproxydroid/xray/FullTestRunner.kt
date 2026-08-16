@@ -1,12 +1,16 @@
 package com.picosoft.xrayproxydroid.xray
 
 import android.content.Context
+import com.picosoft.xrayproxydroid.monitor.MonitorLog
+import com.picosoft.xrayproxydroid.monitor.ServerLabels
+import com.picosoft.xrayproxydroid.service.ProxyState
 import com.picosoft.xrayproxydroid.settings.BlocklistStore
 import com.picosoft.xrayproxydroid.settings.SettingsStore
 import com.picosoft.xrayproxydroid.subscription.SubscriptionManager
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.roundToInt
 
 /**
  * Полный адаптивный тест (перенос Termux run_full_test_with_early_connect):
@@ -62,6 +66,7 @@ object FullTestRunner {
 
         fun key(p: ServerProfile) = SubscriptionManager.serverKey(p)
         fun label(p: ServerProfile) = p.remarks.ifBlank { p.address }
+        fun fmt(v: Double) = "${(v * 10).roundToInt() / 10.0}"
 
         // --- Этап 2: speed + early-connect ---
         fun startSpeedPhase(alive: List<ServerProfile>) {
@@ -92,10 +97,15 @@ object FullTestRunner {
                             // Сначала — к ПЕРВОМУ живому: связь сразу, любая полезная скорость.
                             connected = p; connectedSpeed = mbps
                             onPhase("Подключён ${label(p)} ($mbps Мбит/с), продолжаю…")
+                            val from = ServerLabels.displayForKey(appCtx, ProxyState.state.value.serverKey)
+                            MonitorLog.switch(appCtx, from, ServerLabels.display(p), "полный тест: первый рабочий", "${fmt(mbps)} Мбит/с")
                             connect(p)
                         } else if (p !== connected && mbps > connectedSpeed * (1 + marginRatio)) {
                             // Прогрессивный апгрейд ПО ХОДУ: переключаемся на заметно (>10%) более быстрый.
+                            val prev = connectedSpeed
                             onPhase("Быстрее на >10%: ${label(p)} ($mbps > $connectedSpeed) — переключаюсь")
+                            val from = ServerLabels.displayForKey(appCtx, ProxyState.state.value.serverKey)
+                            MonitorLog.switch(appCtx, from, ServerLabels.display(p), "полный тест: апгрейд", "было ${fmt(prev)} → стало ${fmt(mbps)} Мбит/с")
                             connected = p; connectedSpeed = mbps
                             connect(p)
                         }

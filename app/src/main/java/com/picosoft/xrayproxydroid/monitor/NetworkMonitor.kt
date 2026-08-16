@@ -2,14 +2,19 @@ package com.picosoft.xrayproxydroid.monitor
 
 import android.content.Context
 import android.util.Log
+import com.picosoft.xrayproxydroid.settings.AppSettings
 import com.picosoft.xrayproxydroid.settings.BlocklistStore
 import com.picosoft.xrayproxydroid.settings.SettingsStore
+import com.picosoft.xrayproxydroid.service.NotificationHelper
 import com.picosoft.xrayproxydroid.service.ProxyState
+import com.picosoft.xrayproxydroid.service.XrayProxyService
 import com.picosoft.xrayproxydroid.subscription.SubscriptionManager
 import com.picosoft.xrayproxydroid.traffic.TrafficTracker
 import com.picosoft.xrayproxydroid.xray.ExternalIpChecker
 import com.picosoft.xrayproxydroid.xray.ServerFilter
+import com.picosoft.xrayproxydroid.xray.ServerSpeedTester
 import com.picosoft.xrayproxydroid.xray.XrayConfig
+import com.picosoft.xrayproxydroid.xray.XrayConfigBuilder
 import com.picosoft.xrayproxydroid.xray.XrayController
 import kotlinx.coroutines.delay
 import java.net.HttpURLConnection
@@ -20,147 +25,264 @@ import java.net.URL
 import kotlin.math.roundToInt
 
 /**
- * Цикл АВТОМОНИТОРИНГА, этап 1: только НАБЛЮДЕНИЕ и запись журнала — НИКАКИХ переключений.
- * Живёт корутиной внутри foreground-сервиса (Doze его не усыпляет), работает только пока прокси активен.
+ * Цикл АВТОМОНИТОРИНГА. Корутина в foreground-сервисе; запускается ТОЛЬКО когда монитор включён И прокси
+ * активен (иначе не работает вообще — сервис не создаёт эту корутину, ради батареи). Включён — следит И
+ * ПЕРЕКЛЮЧАЕТ (режима «только наблюдать» больше нет).
  *
- * Порядок каждого активного цикла (перенос эталонного _monitor_loop, облегчённый под батарею):
- *   0. Гейты: монитор включён? прокси жив? не идёт ручной тест? (иначе молчим)
- *   1. ЭКОНОМИЯ: с прошлого цикла через туннель не прошло ни байта → простой → проверку пропускаем.
- *   2. Сигнал A (прямой канал МИМО туннеля, дешёвый TCP к DNS) — ГЛАВНЫЙ ГЕЙТ: мёртв → «нет интернета»,
- *      туннель НЕ винить, падением НЕ считать.
- *   3. Сигнал B (туннель): лёгкая достижимость внешнего мира через активный SOCKS (внешний IP).
- *      Отвечает → «всё в порядке» (пишем разрежённо). Не отвечает → это лёгкая проверка УЖЕ указала
- *      на проблему →
- *   4. Только тогда HEAVY-замер: прямой канал (Мбит/с, русские CDN) + туннель (зарубежный пробник).
- *      Решение по эталону (адаптивный порог 50% при слабом интернете, иначе tunnel_threshold).
- *      Падение копится; после N подряд формируем ГИПОТЕТИЧЕСКОЕ действие «переключился бы на X…».
+ * Порядок цикла:
+ *   0. Сигнал A (нет интернета) — В САМОМ НАЧАЛЕ, ДО перебора. Нет сети → пауза с удвоением (10м→4ч),
+ *      сброс по событию ConnectivityManager / действию пользователя ([MonitorCoordinator.awaitWake]).
+ *   1. Сигнал B (внешний IP через активный SOCKS) — туннель жив? да → рутина, ничего не пишем.
+ *   2. Тяжёлый замер (прямой русскими CDN + туннель зарубежным) только при провале B.
+ *   3. Падение (N неудач подряд) → перебор кандидатов и переключение.
  *
- * Общие ресурсы: счётчики туннеля берём из [TrafficTracker] (накопленные), НЕ через queryTunnelDelta
- * (её потребляет поллер трафика сервиса — был бы конфликт). Активный сервер/SOCKS при ручном тесте
- * не трогаем (см. [MonitorCoordinator]).
+ * Перебор: ВЕСЬ список сверху вниз (от быстрых к медленным по известной скорости); дешёвая проверка
+ * (temp-инстанс, реальный запрос через ServerTester.ping) → подключаемся к ПЕРВОМУ живому (связь важнее
+ * точного числа), скорость меряем ПОСЛЕ подключения. Не подошёл никто → обновить подписки → ещё проход.
+ * Опять никто → предложить включить выключенные источники (не включаем сами) → пауза с удвоением.
  */
 object NetworkMonitor {
     private const val TAG = "NetworkMonitor"
 
-    // Сигнал A (лёгкий): «есть ли интернет вообще» — TCP-connect к DNS мимо туннеля (полезной нагрузки ~0).
     private val directDnsProbes = listOf("77.88.8.8" to 53, "8.8.8.8" to 53, "1.1.1.1" to 53)
-    // Heavy-замер прямого канала (Мбит/с) — русские CDN (эталон сигнала A), НЕ Cloudflare (блок в РФ напрямую).
     private val directSpeedProbes = listOf("https://ya.ru/", "https://mc.yandex.ru/", "https://vk.ru/")
-    // Heavy-замер туннеля — зарубежный пробник ЧЕРЕЗ активный SOCKS (смысл туннеля = доступ к миру).
     private const val TUNNEL_SPEED_PROBE = "https://speed.cloudflare.com/__down?bytes=2000000"
 
-    private const val IDLE_WAIT_MS = 30_000L
-    private const val OK_HEARTBEAT_MS = 30 * 60 * 1000L   // «всё в порядке» — не чаще раза в 30 мин
+    private const val SWITCH_THROTTLE_MS = 60_000L        // в фоне переключаться не чаще раза в 60с
+    private const val BACKOFF_START_MS = 10 * 60_000L     // первая пауза при отсутствии сети — 10 минут
+    // Верхний предел паузы — 4 часа: дальше удваивать бессмысленно (это уже «редкая фоновая проверка»),
+    // а ConnectivityManager всё равно разбудит мгновенно при появлении сети; экономим батарею при долгом офлайне.
+    private const val BACKOFF_MAX_MS = 4 * 3600_000L
+
+    private enum class SwitchResult { SWITCHED, ABORTED, NO_CANDIDATES }
 
     suspend fun loop(context: Context) {
         val app = context.applicationContext
-        var baseline = tunnelBytes()
         var failures = 0
-        var lastTag = ""
-        var lastOkMs = 0L
+        var phase = "ok"            // ok | nonet | problem
+        var problemSince = 0L
+        var verdictActed = false
+        var lastSwitchMs = 0L
+        var backoffMs = 0L          // текущая пауза «нет интернета/нет замены» (0 = нет)
+        var cycles = 0
         Log.i(TAG, "monitor loop started")
 
         while (true) {
             val s = SettingsStore.current()
-            if (!s.monitorEnabled) { delay(IDLE_WAIT_MS); continue }
-            if (!XrayController.isRunning || !ProxyState.state.value.running) { delay(IDLE_WAIT_MS); continue }
+            if (!s.monitorEnabled) return                 // выключили — корутина завершается (сервис пересоздаст при включении)
+            if (!XrayController.isRunning || !ProxyState.state.value.running) return
 
-            delay(s.monitorIntervalSec.coerceAtLeast(60) * 1000L)
+            // Обычный интервал (прерываемый — чтобы wake() поднял досрочно).
+            MonitorCoordinator.drainWakeups()
+            MonitorCoordinator.awaitWake(s.monitorIntervalSec.coerceAtLeast(60) * 1000L)
 
-            // Пере-проверка после сна.
             val cur = SettingsStore.current()
-            if (!cur.monitorEnabled) continue
-            if (!XrayController.isRunning || !ProxyState.state.value.running) continue
+            if (!cur.monitorEnabled) return
+            if (!XrayController.isRunning || !ProxyState.state.value.running) return
+            if (MonitorCoordinator.fullTestRunning) continue   // ручной тест сам переключает — молчим
 
-            // Взаимное исключение с ручным полным тестом — он сам переключает сервер, монитор молчит.
-            if (MonitorCoordinator.fullTestRunning) {
-                if (lastTag != "manual") { record(app, "—", "—", "пропуск: идёт ручной тест"); lastTag = "manual" }
-                baseline = tunnelBytes()
-                continue
-            }
+            cycles++
 
-            // Простой = нет байт через туннель с прошлого цикла. ВАЖНО (Промпт 43): сам по себе он НЕ
-            // повод пропускать проверки — мёртвый туннель тоже не даёт байт, именно потому что мёртв, и
-            // пропуск цикла по нулю байт маскировал бы поломку. Лёгкие сигналы A/B идут ВСЕГДА (дёшевы);
-            // простой отменяет ТОЛЬКО тяжёлый замер (шаг ниже).
-            val idle = tunnelBytes() - baseline <= 0
-
-            // --- Сигнал A (гейт «есть интернет») — ВСЕГДА ---
+            // ── Сигнал A: нет интернета → пауза с удвоением, ДО любого перебора ──
             if (!directAlive()) {
-                failures = 0
-                if (lastTag != "nonet") { record(app, "нет", "—", "нет интернета — туннель не виню"); lastTag = "nonet" }
-                baseline = tunnelBytes()
-                continue
-            }
-
-            // --- Сигнал B (лёгкая достижимость через туннель) — ВСЕГДА ---
-            if (ExternalIpChecker.fetch() != null) {
-                failures = 0
-                if (idle) {
-                    // Простой И проверки в порядке → тяжёлый замер не гоним (экономия трафика/батареи).
-                    if (lastTag != "idle") { record(app, "жив", "OK", "простой — трафика нет, проверки в порядке"); lastTag = "idle" }
+                backoffMs = if (backoffMs == 0L) BACKOFF_START_MS else minOf(backoffMs * 2, BACKOFF_MAX_MS)
+                if (phase != "nonet") {
+                    MonitorLog.event(app, "net", "Пропал интернет", "пауза ${humanDur(backoffMs)}")
+                    phase = "nonet"; failures = 0; verdictActed = false
                 } else {
-                    val nowMs = System.currentTimeMillis()
-                    if (lastTag != "ok" || nowMs - lastOkMs > OK_HEARTBEAT_MS) {
-                        record(app, "жив", "OK", "всё в порядке"); lastTag = "ok"; lastOkMs = nowMs
-                    }
+                    MonitorLog.event(app, "net", "Интернета всё нет — пауза увеличена", humanDur(backoffMs))
                 }
-                baseline = tunnelBytes()
+                MonitorStatus.update(true, "нет интернета, пауза ${humanDur(backoffMs)}", now(), cycles)
+                MonitorCoordinator.drainWakeups()
+                val woke = MonitorCoordinator.awaitWake(backoffMs)
+                if (woke) MonitorLog.event(app, "net", "Пробуждение (сеть/действие) — проверяю", "пауза длилась < ${humanDur(backoffMs)}")
+                continue
+            }
+            if (phase == "nonet") {
+                MonitorLog.event(app, "net", "Интернет появился", if (backoffMs > 0) "пауза сброшена" else "")
+                phase = "ok"; backoffMs = 0
+            }
+
+            // ── Сигнал B: туннель отвечает? (лёгкая проверка) ──
+            if (ExternalIpChecker.fetch() != null) {
+                onHealthy(app, phase, problemSince, "OK")
+                phase = "ok"; failures = 0; verdictActed = false; backoffMs = 0
+                MonitorStatus.update(true, "ок", now(), cycles)
                 continue
             }
 
-            // --- Лёгкая B НЕ прошла → это ПОЛОМКА (даже при нуле байт), не простой → HEAVY-замер ---
+            // ── Тяжёлый замер (лёгкая указала на проблему) ──
             val directMbps = measureDirectMbps(app)
-            if (directMbps == null) {
-                failures = 0
-                record(app, "нет", "—", "нет интернета (канал не тянет) — туннель не виню"); lastTag = "nonet"
-                baseline = tunnelBytes()
+            if (directMbps == null) {   // канал не тянет — считаем как нет интернета
+                backoffMs = if (backoffMs == 0L) BACKOFF_START_MS else minOf(backoffMs * 2, BACKOFF_MAX_MS)
+                if (phase != "nonet") { MonitorLog.event(app, "net", "Пропал интернет", "канал не тянет, пауза ${humanDur(backoffMs)}"); phase = "nonet" }
+                failures = 0; verdictActed = false
+                MonitorStatus.update(true, "нет интернета, пауза ${humanDur(backoffMs)}", now(), cycles)
+                MonitorCoordinator.drainWakeups(); MonitorCoordinator.awaitWake(backoffMs)
                 continue
             }
             val tunnelMbps = measureTunnelMbps()
             val weak = directMbps < cur.monitorDirectThreshold
             val effThr = if (weak) maxOf(directMbps / 2, 0.05) else cur.monitorTunnelThreshold
-
             if (tunnelMbps >= effThr) {
-                // Внешний IP не получен, но по скорости туннель тянет — проба IP дала ложную тревогу.
-                failures = 0
-                record(app, fmt(directMbps), fmt(tunnelMbps),
-                    "внешний IP не получен, но туннель тянет — не считаю падением")
-                lastTag = "ok"; lastOkMs = System.currentTimeMillis()
-                baseline = tunnelBytes()
+                onHealthy(app, phase, problemSince, fmt(tunnelMbps))
+                phase = "ok"; failures = 0; verdictActed = false; backoffMs = 0
+                MonitorStatus.update(true, "ок", now(), cycles)
                 continue
             }
 
-            // Падение — копим подряд; вывод (гипотетическое действие) только после N. Ноль байт при
-            // неотвечающем туннеле — это ПОЛОМКА, отличаем в вердикте от «простой, проверки в порядке».
+            // ── ПАДЕНИЕ ──
             failures++
-            val verdict = if (idle) "нет трафика, туннель не отвечает" else "падение туннеля"
+            if (phase != "problem") { problemSince = now(); phase = "problem" }
             val reason = "туннель ${fmt(tunnelMbps)} < порог ${fmt(effThr)}" +
                 if (weak) " (слабый интернет, 50% от ${fmt(directMbps)})" else " (прямой ${fmt(directMbps)})"
-            val wouldDo = if (failures >= cur.monitorFailuresToVerdict) {
-                hypotheticalSwitch(app, reason, failures)
-            } else {
-                "наблюдаю ($failures/${cur.monitorFailuresToVerdict}) — пока не вмешался бы"
+            MonitorStatus.update(true, "падение ($failures)", now(), cycles)
+            if (failures == 1) MonitorLog.event(app, "monitor", "Туннель: первая неудача", reason)
+
+            if (failures >= cur.monitorFailuresToVerdict && !verdictActed) {
+                verdictActed = true
+                if (now() - lastSwitchMs < SWITCH_THROTTLE_MS) {
+                    MonitorLog.event(app, "monitor", "Падение — переключение отложено", "$reason · троттлинг 60с")
+                } else {
+                    MonitorLog.event(app, "monitor", "Падение туннеля — ищу замену", reason)
+                    when (runSwitchSearch(app, cur)) {
+                        SwitchResult.SWITCHED -> {
+                            lastSwitchMs = now(); phase = "ok"; failures = 0; verdictActed = false; backoffMs = 0
+                            MonitorPrompt.resetDeclined()
+                        }
+                        SwitchResult.ABORTED -> { /* пользователь вмешался — оставляем как есть до следующего цикла */ }
+                        SwitchResult.NO_CANDIDATES -> {
+                            backoffMs = if (backoffMs == 0L) BACKOFF_START_MS else minOf(backoffMs * 2, BACKOFF_MAX_MS)
+                            MonitorLog.event(app, "monitor", "Замену не нашёл — пауза ${humanDur(backoffMs)}", "")
+                            MonitorStatus.update(true, "нет замены, пауза ${humanDur(backoffMs)}", now(), cycles)
+                            MonitorCoordinator.drainWakeups(); MonitorCoordinator.awaitWake(backoffMs)
+                        }
+                    }
+                }
             }
-            record(app, fmt(directMbps), fmt(tunnelMbps), verdict, wouldDo)
-            lastTag = "fall"
-            baseline = tunnelBytes()
         }
     }
 
-    // Накопленные байты туннеля из TrafficTracker (НЕ queryTunnelDelta — её читает поллер сервиса).
-    private fun tunnelBytes(): Long {
-        val s = TrafficTracker.state.value
-        return s.sessionRx + s.sessionTx
+    /** Переход в здоровое состояние: восстановление (со временем простоя) — событие; рутину не пишем. */
+    private fun onHealthy(context: Context, prevPhase: String, problemSince: Long, tunnelStr: String) {
+        if (prevPhase == "problem") {
+            MonitorLog.event(context, "monitor", "Восстановление туннеля", "скорость $tunnelStr, длилось ${humanDur(now() - problemSince)}")
+        }
+        // Здоровы → снимаем предложение включить источники (если висело) и разрешаем спрашивать снова.
+        if (MonitorPrompt.pending) { MonitorPrompt.clear(); NotificationHelper.cancelEnableSources(context) }
+        MonitorPrompt.resetDeclined()
     }
 
-    private fun record(context: Context, direct: String, tunnel: String, verdict: String, wouldDo: String = "") {
-        MonitorLog.add(context, MonitorEvent(System.currentTimeMillis(), direct, tunnel, verdict, wouldDo))
+    // ---- Перебор кандидатов / переключение ----
+
+    private suspend fun runSwitchSearch(app: Context, s: AppSettings): SwitchResult {
+        MonitorCoordinator.monitorSearchRunning = true
+        try {
+            return runSwitchSearchInner(app, s)
+        } finally {
+            MonitorCoordinator.monitorSearchRunning = false
+        }
     }
+
+    private suspend fun runSwitchSearchInner(app: Context, s: AppSettings): SwitchResult {
+        val startKey = ProxyState.state.value.serverKey   // если сменится не нами — значит вмешался пользователь
+
+        val r1 = probeAndConnect(app, s, startKey, "1")
+        if (r1 != SwitchResult.NO_CANDIDATES) return r1
+
+        // Никто не подошёл → обновить ВСЕ включённые подписки → пройти список заново.
+        if (aborted(startKey)) return SwitchResult.ABORTED
+        MonitorLog.event(app, "monitor", "Никто не подошёл — обновляю подписки", "")
+        MonitorStatus.update(true, "обновляю подписки", now(), 0)
+        runCatching { SubscriptionManager.refreshAllEnabled(app, cancelled = { aborted(startKey) }, onEach = { _, _ -> }) }
+            .onFailure { MonitorLog.event(app, "error", "Ошибка обновления подписок", it.message ?: "") }
+        if (aborted(startKey)) return SwitchResult.ABORTED
+
+        val r2 = probeAndConnect(app, s, startKey, "2")
+        if (r2 != SwitchResult.NO_CANDIDATES) return r2
+
+        handleNoAlive(app)   // пункт E: предложить включить выключенные источники (или записать «все включены»)
+        return SwitchResult.NO_CANDIDATES
+    }
+
+    /** true, если перебор надо прервать: идёт ручной тест ИЛИ активный сервер сменил кто-то другой (пользователь). */
+    private fun aborted(startKey: String?): Boolean =
+        MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey != startKey
+
+    /**
+     * Один проход по ВСЕМУ списку (от быстрых к медленным). Кандидаты — единый предикат (протокол +
+     * стоп-лист), МИНУЯ пинг-фильтр (мёртвый пинг ≠ мёртвый сервер, v2rayN). Дешёвая проверка на temp-
+     * инстансе; подключаемся к ПЕРВОМУ живому; скорость меряем ПОСЛЕ.
+     */
+    private suspend fun probeAndConnect(app: Context, s: AppSettings, startKey: String?, round: String): SwitchResult {
+        val bl = BlocklistStore.current()
+        val candidates = SubscriptionManager.allServers(app)
+            .filter { SubscriptionManager.serverKey(it) != startKey }
+            .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl) }
+            .sortedByDescending { it.speedMbps ?: 0.0 }
+        val total = candidates.size
+
+        for ((i, c) in candidates.withIndex()) {
+            if (aborted(startKey)) return SwitchResult.ABORTED
+            MonitorStatus.update(true, "перебор $round: ${i + 1}/$total · ${ServerLabels.display(c)}", now(), 0)
+            // Дешёвая проверка (Промпт 52): temp-инстанс + РЕАЛЬНАЯ передача нескольких КБ (байты пришли),
+            // НЕ пинг/задержка — иначе «не пингуется, но работает» серверы отбрасывались бы молча. НЕ полный замер.
+            if (!ServerSpeedTester.probeAlive(app, c)) continue
+            val cfg = runCatching { XrayConfigBuilder.build(c) }.getOrNull()
+            if (cfg == null) { MonitorLog.event(app, "error", "Кандидат ${ServerLabels.display(c)}: ошибка конфига", ""); continue }
+            val from = ServerLabels.displayForKey(app, startKey)
+            XrayProxyService.start(app, cfg, ServerLabels.full(c), SubscriptionManager.serverKey(c))
+            MonitorLog.switch(app, from, ServerLabels.display(c), "монитор", "первый живой (проход $round)")
+            measureAfterConnect(app, c)
+            return SwitchResult.SWITCHED
+        }
+        return SwitchResult.NO_CANDIDATES
+    }
+
+    /** Скорость измеряем ПОСЛЕ подключения (пользователю нужна связь, не число) и записываем серверу. */
+    private suspend fun measureAfterConnect(app: Context, c: com.picosoft.xrayproxydroid.xray.link.ServerProfile) {
+        val key = SubscriptionManager.serverKey(c)
+        var waited = 0
+        while (waited < 8000 && (!ProxyState.state.value.running || ProxyState.state.value.serverKey != key)) {
+            delay(500); waited += 500
+        }
+        delay(1000)   // дать туннелю осесть
+        val mbps = measureTunnelMbps()
+        if (mbps > 0) {
+            SubscriptionManager.applySpeedResults(app, mapOf(key to mbps))
+            MonitorLog.event(app, "monitor", "Скорость нового сервера", "${fmt(mbps)}")
+        }
+    }
+
+    /** Пункт E: живых нет после двух проходов. Есть выключенные источники → предложить (не включать сами). */
+    private fun handleNoAlive(app: Context) {
+        val disabled = SubscriptionManager.sources(app).filter { !it.enabled }
+        if (disabled.isNotEmpty() && !MonitorPrompt.declined) {
+            val srv = SubscriptionManager.serversFromDisabled(app)
+            MonitorPrompt.request(disabled.size, srv)
+            NotificationHelper.notifyEnableSources(app, disabled.size, srv)
+            MonitorLog.event(app, "monitor", "Нет живых серверов", "есть ${disabled.size} выключенных источников (~$srv серв.) — предложил включить")
+        } else {
+            MonitorLog.event(app, "monitor", "Нет живых серверов",
+                if (disabled.isEmpty()) "все источники включены" else "пользователь отказался включать")
+        }
+    }
+
+    // ---- Замеры/утилиты ----
+
+    private fun now(): Long = System.currentTimeMillis()
 
     private fun fmt(mbps: Double) = "${(mbps * 10).roundToInt() / 10.0} Мбит/с"
 
-    /** Сигнал A: жив ли прямой канал (TCP к DNS мимо туннеля). Полезной нагрузки нет — учитывать нечего. */
+    private fun humanDur(ms: Long): String {
+        val sec = (ms / 1000).coerceAtLeast(0)
+        return when {
+            sec < 60 -> "${sec}с"
+            sec < 3600 -> "${sec / 60}м"
+            else -> "${sec / 3600}ч ${(sec % 3600) / 60}м"
+        }
+    }
+
     private fun directAlive(): Boolean {
         for ((host, port) in directDnsProbes) {
             try {
@@ -170,7 +292,6 @@ object NetworkMonitor {
         return false
     }
 
-    /** Heavy-замер прямого канала (МИМО туннеля). Трафик проверки → поток «Тест». null — канал не тянет. */
     private fun measureDirectMbps(context: Context): Double? {
         for (url in directSpeedProbes) {
             try {
@@ -180,27 +301,26 @@ object NetworkMonitor {
                     setRequestProperty("User-Agent", "curl/8.0")
                 }
                 if (conn.responseCode !in 200..399) { conn.disconnect(); continue }
-                var total = 0L
+                var totalBytes = 0L
                 conn.inputStream.use { ins ->
                     val buf = ByteArray(16 * 1024)
                     while (true) {
                         val n = ins.read(buf); if (n < 0) break
-                        total += n
-                        if (total >= 1_000_000L || (System.nanoTime() - start) / 1e9 > 3.0) break
+                        totalBytes += n
+                        if (totalBytes >= 1_000_000L || (System.nanoTime() - start) / 1e9 > 3.0) break
                     }
                 }
                 conn.disconnect()
                 val secs = (System.nanoTime() - start) / 1e9
-                if (total > 0 && secs > 0) {
-                    TrafficTracker.addTest(total)   // прямой канал мимо туннеля иначе нигде не учтётся
-                    return total * 8 / 1e6 / secs
+                if (totalBytes > 0 && secs > 0) {
+                    TrafficTracker.addTest(totalBytes)
+                    return totalBytes * 8 / 1e6 / secs
                 }
             } catch (e: Exception) { /* следующий */ }
         }
         return null
     }
 
-    /** Heavy-замер туннеля через активный SOCKS. Это реальный трафик туннеля (учтёт поллер сервиса). */
     private fun measureTunnelMbps(): Double {
         return try {
             val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", XrayConfig.SOCKS_PORT))
@@ -210,34 +330,18 @@ object NetworkMonitor {
                 setRequestProperty("User-Agent", "curl/8.0")
             }
             if (conn.responseCode !in 200..299) { conn.disconnect(); return 0.0 }
-            var total = 0L
+            var totalBytes = 0L
             conn.inputStream.use { ins ->
                 val buf = ByteArray(32 * 1024)
                 while (true) {
                     val n = ins.read(buf); if (n < 0) break
-                    total += n
-                    if (total >= 2_000_000L || (System.nanoTime() - start) / 1e9 > 6.0) break
+                    totalBytes += n
+                    if (totalBytes >= 2_000_000L || (System.nanoTime() - start) / 1e9 > 6.0) break
                 }
             }
             conn.disconnect()
             val secs = (System.nanoTime() - start) / 1e9
-            if (total > 0 && secs > 0) total * 8 / 1e6 / secs else 0.0
+            if (totalBytes > 0 && secs > 0) totalBytes * 8 / 1e6 / secs else 0.0
         } catch (e: Exception) { 0.0 }
-    }
-
-    /** Что монитор СДЕЛАЛ БЫ (переключений сейчас нет): лучший ИНОЙ кандидат по известной скорости. */
-    private fun hypotheticalSwitch(context: Context, reason: String, failures: Int): String {
-        val settings = SettingsStore.current()
-        val bl = BlocklistStore.current()
-        val curKey = ProxyState.state.value.serverKey
-        val best = SubscriptionManager.allServers(context)
-            .filter { SubscriptionManager.serverKey(it) != curKey }
-            .filter { ServerFilter.isSelectable(it, it.speedMbps, settings, bl) }
-            .maxByOrNull { it.speedMbps ?: 0.0 }
-            ?: return "переключаться некуда — нет живых кандидатов (нужен полный тест). Причина: $reason"
-        // Имя через оверрайд (пользовательское, если задано) — журнал показывает то же, что видит юзер.
-        val name = bl.customName(SubscriptionManager.serverKey(best)) ?: best.remarks.ifBlank { best.address }
-        val sp = best.speedMbps?.let { fmt(it) } ?: "скорость неизв."
-        return "переключился бы на «$name» ($sp), потому что $reason ($failures циклов подряд)"
     }
 }
