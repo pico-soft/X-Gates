@@ -3,6 +3,8 @@ package com.picosoft.xrayproxydroid.xray
 import android.content.Context
 import android.util.Log
 import com.picosoft.xrayproxydroid.settings.SettingsStore
+import com.picosoft.xrayproxydroid.subscription.FetchResult
+import com.picosoft.xrayproxydroid.subscription.SubscriptionFetcher
 import com.picosoft.xrayproxydroid.traffic.TrafficTracker
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
 import libv2ray.CoreCallbackHandler
@@ -138,6 +140,119 @@ object ServerSpeedTester {
             } catch (e: Exception) {
                 log("«$name» measureSpeed error: ${e.message}")
                 return Measurement(-1.0, false, "исключение: ${e.message}")
+            } finally {
+                try { core.stopLoop() } catch (e: Exception) { /* ignore */ }
+            }
+        } finally {
+            concurrentMeasures.decrementAndGet()
+        }
+    }
+
+    // Дешёвая проверка кандидата (Промпт 52): temp-инстанс + РЕАЛЬНАЯ передача небольшого объёма.
+    // Критерий — БАЙТЫ ПРИШЛИ, а не время ответа (в отличие от ServerTester.ping = measureOutboundDelay,
+    // который меряет задержку до generate_204 и отбрасывал бы «не пингуется, но работает» серверы).
+    private const val PROBE_ALIVE_TARGET_BYTES = 32 * 1024L
+    private const val PROBE_ALIVE_MIN_BYTES = 8 * 1024L
+    private const val PROBE_ALIVE_TIMEOUT_MS = 6_000
+
+    /**
+     * Жив ли сервер по РЕАЛЬНОЙ передаче: поднять temp-инстанс на эфемерном порту, скачать несколько КБ
+     * через его socks. true — пришло ≥ [PROBE_ALIVE_MIN_BYTES]. Не трогает активный прокси. Трафик → «Тест».
+     */
+    fun probeAlive(context: Context, profile: ServerProfile): Boolean {
+        XrayController.ensureEnv(context)
+        val verbose = SettingsStore.current().verboseLogs
+        fun log(msg: String) { if (verbose) Log.i(TAG, msg) }
+        val name = profile.remarks.ifBlank { profile.address }
+        val probes = (listOf(SettingsStore.current().speedProbeUrl) + fallbackProbes).distinct()
+        concurrentMeasures.incrementAndGet()
+        try {
+            val port = freePort() ?: return false
+            val cfg = try { XrayConfigBuilder.buildForSpeedTest(profile, port) } catch (e: Exception) {
+                log("«$name» probeAlive buildForSpeedTest FAIL: ${e.message}"); return false
+            }
+            val core = Libv2ray.newCoreController(NoopCallback())
+            try {
+                core.startLoop(cfg, 0)
+                if (!core.isRunning || !awaitPort(port, deadlineMs = 2_000)) {
+                    log("«$name» probeAlive temp-инстанс не поднялся"); return false
+                }
+                val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", port))
+                var testBytes = 0L
+                for (probe in probes) {
+                    val got = downloadSome(probe, proxy, PROBE_ALIVE_TARGET_BYTES, PROBE_ALIVE_TIMEOUT_MS)
+                    testBytes += got
+                    if (got >= PROBE_ALIVE_MIN_BYTES) {
+                        TrafficTracker.addTest(testBytes)
+                        log("«$name» probeAlive OK ($got Б via $probe)")
+                        return true
+                    }
+                }
+                TrafficTracker.addTest(testBytes)
+                log("«$name» probeAlive FAIL (пришло $testBytes Б)")
+                return false
+            } finally {
+                try { core.stopLoop() } catch (e: Exception) { /* ignore */ }
+            }
+        } finally {
+            concurrentMeasures.decrementAndGet()
+        }
+    }
+
+    /** Скачать до [targetBytes] через socks-proxy с [timeoutMs]. Возвращает фактически принятые байты. */
+    private fun downloadSome(probe: String, proxy: Proxy, targetBytes: Long, timeoutMs: Int): Long {
+        return try {
+            val conn = (URL(probe).openConnection(proxy) as HttpURLConnection).apply {
+                connectTimeout = CONNECT_TIMEOUT_MS
+                readTimeout = timeoutMs
+                setRequestProperty("User-Agent", "v2rayNG/1.8.0")
+            }
+            if (conn.responseCode !in 200..299) { conn.disconnect(); return 0L }
+            var total = 0L
+            val start = System.nanoTime()
+            conn.inputStream.use { ins ->
+                val buf = ByteArray(16 * 1024)
+                while (true) {
+                    val n = ins.read(buf); if (n < 0) break
+                    total += n
+                    if (total >= targetBytes || (System.nanoTime() - start) / 1_000_000 > timeoutMs) break
+                }
+            }
+            conn.disconnect()
+            total
+        } catch (e: Exception) {
+            0L
+        }
+    }
+
+    /**
+     * Скачать ПРОИЗВОЛЬНЫЙ URL через temp-инстанс данного сервера (ступень 5 каскада [CascadeFetch]:
+     * обновить подписку, когда прямой путь заблокирован, а активный туннель упал). Переиспользует
+     * [SubscriptionFetcher] (редиректы/типизированный результат) через socks temp-инстанса. Не трогает
+     * активный прокси. Трафик → «Тест». null — temp-инстанс не поднялся.
+     */
+    fun fetchViaTempInstance(context: Context, profile: ServerProfile, url: String, userAgent: String, timeoutMs: Int): FetchResult? {
+        XrayController.ensureEnv(context)
+        val verbose = SettingsStore.current().verboseLogs
+        fun log(msg: String) { if (verbose) Log.i(TAG, msg) }
+        val name = profile.remarks.ifBlank { profile.address }
+        concurrentMeasures.incrementAndGet()
+        try {
+            val port = freePort() ?: return null
+            val cfg = try { XrayConfigBuilder.buildForSpeedTest(profile, port) } catch (e: Exception) {
+                log("«$name» fetchViaTempInstance buildForSpeedTest FAIL: ${e.message}"); return null
+            }
+            val core = Libv2ray.newCoreController(NoopCallback())
+            try {
+                core.startLoop(cfg, 0)
+                if (!core.isRunning || !awaitPort(port, deadlineMs = 2_000)) {
+                    log("«$name» fetchViaTempInstance temp-инстанс не поднялся"); return null
+                }
+                val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", port))
+                val res = SubscriptionFetcher.fetch(url, userAgent, timeoutMs) { it.openConnection(proxy) }
+                if (res.bodyBytes > 0) TrafficTracker.addTest(res.bodyBytes.toLong())
+                log("«$name» fetchViaTempInstance http=${res.httpCode} bytes=${res.bodyBytes}")
+                return res
             } finally {
                 try { core.stopLoop() } catch (e: Exception) { /* ignore */ }
             }
