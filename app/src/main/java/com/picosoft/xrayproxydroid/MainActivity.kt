@@ -107,7 +107,7 @@ class MainActivity : ComponentActivity() {
 
 /** Высота собственной нижней панели (стандартный NavigationBar фиксирован 80dp — не годится).
  *  Подбирать здесь; системный отступ навигации сюда НЕ входит (он добавляется отдельно инсетом). */
-private val BOTTOM_BAR_HEIGHT = 28.dp
+private val BOTTOM_BAR_HEIGHT = 42.dp
 
 /** Корень с компактной нижней навигацией: «Главная» (весь существующий экран) + «Трафик». */
 @Composable
@@ -136,9 +136,16 @@ private fun CompactBottomBar(selected: Int, onSelect: (Int) -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .background(MaterialTheme.colorScheme.surface)
-            .windowInsetsPadding(WindowInsets.navigationBars),   // системный жест-бар — отдельным отступом
+            .background(MaterialTheme.colorScheme.surfaceVariant)   // отдельный цвет — панель заметна на фоне контента
+            .windowInsetsPadding(WindowInsets.navigationBars),      // системный жест-бар — отдельным отступом
     ) {
+        // Тонкая линия-разделитель сверху — визуально отделяет панель от списка.
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(1.dp)
+                .background(MaterialTheme.colorScheme.outlineVariant),
+        )
         // Подпись при крупных системных шрифтах не режем высотой — ограничиваем масштаб (cappedDensity).
         CompositionLocalProvider(LocalDensity provides cappedDensity()) {
             Row(
