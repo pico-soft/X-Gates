@@ -63,6 +63,7 @@ class XrayProxyService : Service() {
                             running = true, label = label, serverKey = serverKey,
                             message = "", socksOk = socks, httpOk = http,   // порты — отдельными флагами (одна строка в UI)
                         )
+                        LastServerStore.save(applicationContext, serverKey)   // запомнить для автозапуска
                         startTrafficPolling()
                     } else {
                         ProxyState.update(running = false, label = label, serverKey = serverKey, message = "ядро не запустилось")

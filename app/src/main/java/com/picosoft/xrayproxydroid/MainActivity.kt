@@ -76,6 +76,7 @@ import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
 import java.util.Locale
 import kotlin.math.roundToInt
+import com.picosoft.xrayproxydroid.service.LastServerStore
 import com.picosoft.xrayproxydroid.service.ProxyState
 import com.picosoft.xrayproxydroid.service.XrayProxyService
 import com.picosoft.xrayproxydroid.settings.AppSettings
@@ -279,6 +280,11 @@ private fun speedColor(mbps: Double?): Color = when {
     else -> Color(0xFF2E7D32)          // зелёный
 }
 
+// Автозапуск выполняем РОВНО ОДИН РАЗ за процесс, а не на каждую рекомпозицию/пересоздание Activity
+// при переключении вкладок. Флаг уровня процесса переживает и то, и другое (сбрасывается только при
+// перезапуске приложения — тогда автозапуск повторится, что и требуется).
+private var autoStartDone = false
+
 @Composable
 private fun BootScreen(modifier: Modifier = Modifier) {
     val context = LocalContext.current
@@ -373,7 +379,9 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     }
 
     // Обновить ВСЕ включённые источники. Одна упавшая не роняет прочие. Отменяемо, не блокирует UI.
-    fun onRefreshAll() {
+    // onComplete вызывается на main-потоке ПОСЛЕ обновления и reloadServers() (нужно автозапуску, чтобы
+    // тест шёл по СВЕЖЕМУ списку серверов). НЕ вызывается при раннем выходе (нет URL / уже идёт).
+    fun onRefreshAll(onComplete: (() -> Unit)? = null) {
         if (refreshingSubs) return
         val hasUrl = sources.any { it.enabled && it.url.isNotBlank() }
         if (!hasUrl) { subStatus = "нет включённых подписок с URL"; return }
@@ -396,6 +404,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                 // Одна статус-строка (в баре) — вторую (subStatus) НЕ дублируем. Детали ошибок — в секции подписок.
                 TestProgress.finish(if (subRefreshCancel) "обновление прервано" else "подписки обновлены: $okN ок, $failN ошибок")
                 reloadSources(); reloadServers()
+                if (!subRefreshCancel) onComplete?.invoke()   // цепочка автозапуска: тест по свежему списку
             }
         }.start()
     }
@@ -555,6 +564,23 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         }
     }
     val ipVerified = externalIp.isNotEmpty() && externalIp != "…" && externalIp != "нет ответа"
+
+    // Автозапуск при старте (по умолчанию, отключаемо в Настройках). Один раз за процесс. Два шага:
+    //  1) МГНОВЕННАЯ СВЯЗЬ — сразу подключиться к последнему успешному серверу (если он ещё в списке),
+    //     чтобы интернет был, пока идёт тест.
+    //  2) ФОНОМ — обновить подписки → полный тест → подключиться к быстрейшему (ровно как нажатие
+    //     кнопки «▶ Самый быстрый»; early-connect/апгрейд теста перекроют соединение из шага 1).
+    LaunchedEffect(Unit) {
+        if (autoStartDone || !SettingsStore.current().autoStartOnLaunch) return@LaunchedEffect
+        autoStartDone = true
+        if (!proxy.running) {
+            val lastKey = LastServerStore.load(context)
+            val last = lastKey?.let { k -> servers.firstOrNull { SubscriptionManager.serverKey(it) == k } }
+            if (last != null) startServer(last)
+        }
+        val hasSubs = sources.any { it.enabled && it.url.isNotBlank() }
+        if (hasSubs) onRefreshAll(onComplete = { onFullTest() }) else onFullTest()
+    }
 
     // Основной вид = ЖИВЫЕ — через единый предикат [ServerFilter.isVisible] (протокол+пинг+мин.скорость).
     val alive = shown.filter { ServerFilter.isVisible(it, effPing(it), effSpeed(it), settings) }
@@ -898,7 +924,7 @@ private fun ActionsBar(
         if (fullTesting) {
             Button(onClick = onCancelFull) { Text("Прервать") }
         } else {
-            Button(onClick = onFullTest) { Text("Подключиться к быстрейшему серверу") }
+            Button(onClick = onFullTest) { Text("▶ Самый быстрый") }
         }
         OutlinedButton(onClick = onStop, enabled = running) { Text("■ Стоп") }
         if (refreshingSubs) {
@@ -1180,6 +1206,9 @@ private fun SettingsSection(
         }
 
         SettingsGroupLabel("Прочее")
+        BoolSettingRow("Автозапуск при старте", settings.autoStartOnLaunch, d.autoStartOnLaunch) {
+            onChange(settings.copy(autoStartOnLaunch = it))
+        }
         BoolSettingRow("Подробные логи", settings.verboseLogs, d.verboseLogs) {
             onChange(settings.copy(verboseLogs = it))
         }

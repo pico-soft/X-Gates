@@ -50,6 +50,9 @@ data class AppSettings(
 
     // --- Прочее ---
     val verboseLogs: Boolean = true,    // детальный лог ServerSpeedTester (промпт 18)
+    // При старте приложения: авто-обновить подписки и сразу запустить полный тест (подключиться к
+    // быстрейшему). ДЕФОЛТ включён — это ожидаемое поведение; отключаемо здесь для ручного контроля.
+    val autoStartOnLaunch: Boolean = true,
 ) {
     // Производные (в единицах, которые нужны коду).
     val speedWarmupMs: Int get() = (speedWarmupSec * 1_000).roundToInt()
