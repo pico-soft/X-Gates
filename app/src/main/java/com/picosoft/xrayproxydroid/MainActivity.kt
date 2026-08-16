@@ -80,6 +80,8 @@ import com.picosoft.xrayproxydroid.service.LastServerStore
 import com.picosoft.xrayproxydroid.service.ProxyState
 import com.picosoft.xrayproxydroid.service.XrayProxyService
 import com.picosoft.xrayproxydroid.settings.AppSettings
+import com.picosoft.xrayproxydroid.settings.Blocklist
+import com.picosoft.xrayproxydroid.settings.BlocklistStore
 import com.picosoft.xrayproxydroid.settings.SettingsStore
 import com.picosoft.xrayproxydroid.subscription.SubSource
 import com.picosoft.xrayproxydroid.subscription.SubscriptionManager
@@ -99,6 +101,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         SettingsStore.init(applicationContext)   // загрузить настройки до первого замера
+        BlocklistStore.init(applicationContext)  // стоп-лист (первый запуск → засев дефолтом RU/BY)
         SubscriptionManager.init(applicationContext)   // миграция старой подписки в мультиподписки (однократно)
         TrafficTracker.init(applicationContext)  // загрузить дневные корзины трафика
         enableEdgeToEdge()
@@ -144,9 +147,11 @@ private fun AppRoot() {
 private fun SettingsTab(modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val settings by SettingsStore.state.collectAsState()
-    val protocolCounts = remember(settings) {
-        SubscriptionManager.allServers(context).groupingBy { it.protocol }.eachCount()
-    }
+    val blocklist by BlocklistStore.state.collectAsState()
+    val allServers = remember(settings, blocklist) { SubscriptionManager.allServers(context) }
+    val protocolCounts = remember(allServers) { allServers.groupingBy { it.protocol }.eachCount() }
+    // Имена всех серверов — для счётчика «сколько блокирует слово» у чипов стоп-листа.
+    val serverNames = remember(allServers) { allServers.map { it.remarks.ifBlank { it.address } } }
     // Состояние раскрытия — на уровне вкладки (стабильное позиционное scoping), все свёрнуты по умолчанию.
     var settingsExpanded by rememberSaveable { mutableStateOf(false) }
     var blocklistExpanded by rememberSaveable { mutableStateOf(false) }
@@ -167,7 +172,17 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
                 )
             }
         }
-        item { CollapsibleSection("🚫 Стоп-лист", blocklistExpanded, { blocklistExpanded = !blocklistExpanded }) { StubText() } }
+        item {
+            CollapsibleSection("🚫 Стоп-лист", blocklistExpanded, { blocklistExpanded = !blocklistExpanded }) {
+                BlocklistSection(
+                    blocklist = blocklist,
+                    serverNames = serverNames,
+                    onAddWord = { BlocklistStore.addWord(context, it) },
+                    onRemoveWord = { BlocklistStore.removeWord(context, it) },
+                    onUnblockServer = { BlocklistStore.unblockServer(context, it) },
+                )
+            }
+        }
         item { CollapsibleSection("🛡️ Автомониторинг", monitorExpanded, { monitorExpanded = !monitorExpanded }) { StubText() } }
         item {
             CollapsibleSection("Трафик", trafficExpanded, { trafficExpanded = !trafficExpanded }) { TrafficSection() }
@@ -292,6 +307,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
 
     val proxy by ProxyState.state.collectAsState()
     val settings by SettingsStore.state.collectAsState()   // живое применение порогов в UI
+    val blocklist by BlocklistStore.state.collectAsState() // стоп-лист: пересчёт списков при изменении
 
     var subStatus by remember { mutableStateOf("") }
     var servers by remember { mutableStateOf(SubscriptionManager.allServers(context)) }
@@ -524,10 +540,12 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         }.start()
     }
 
-    // Отсев по протоколу (единый предикат [ServerFilter]) — скрывает из ВИДИМОЙ части (Живые и Все).
-    // Замер идёт по всем всегда; скрытые считаем отдельно, чтобы показать «скрыто настройками: N».
-    val allowedServers = servers.filter { ServerFilter.protocolAllowed(it, settings) }
-    val hiddenByProtocol = servers.size - allowedServers.size
+    // Отсевы (единый предикат [ServerFilter]) — скрывают из ВИДИМОЙ части (Живые и Все).
+    // Замер идёт по всем НЕзаблокированным; скрытые считаем, чтобы показать «скрыто настройками: N».
+    // Заблокированных убираем ПЕРВЫМИ — они не в списках, не в выборе, не мерятся.
+    val notBlocked = servers.filter { !ServerFilter.isBlocked(it, blocklist) }
+    val allowedServers = notBlocked.filter { ServerFilter.protocolAllowed(it, settings) }
+    val hiddenCount = servers.size - allowedServers.size   // скрыто протоколом + стоп-листом
 
     // Сортировка как Termux sort_servers_by_speed: скорость>0 (убыв.) → живые по пингу (возр.) → остальные.
     val shown = allowedServers.sortedWith(Comparator { a, b ->
@@ -582,11 +600,13 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         if (hasSubs) onRefreshAll(onComplete = { onFullTest() }) else onFullTest()
     }
 
-    // Основной вид = ЖИВЫЕ — через единый предикат [ServerFilter.isVisible] (протокол+пинг+мин.скорость).
-    val alive = shown.filter { ServerFilter.isVisible(it, effPing(it), effSpeed(it), settings) }
+    // Основной вид = ЖИВЫЕ — через единый предикат [ServerFilter.isVisible] (стоп-лист+протокол+пинг+мин.скорость).
+    val alive = shown.filter { ServerFilter.isVisible(it, effPing(it), effSpeed(it), settings, blocklist) }
 
     // Активный сервер скрыт настройками (протокол выключен)? Соединение НЕ рвём — только пометка в статусе.
     val activeHidden = activeServer != null && !ServerFilter.protocolAllowed(activeServer, settings)
+    // Активный сервер попал под стоп-лист — соединение НЕ рвём молча, помечаем и предлагаем переключиться.
+    val activeBlocked = activeServer != null && ServerFilter.isBlocked(activeServer, blocklist)
 
     // Весь экран — одна прокручиваемая лента (как веб-морда): шапка → статус → действия →
     // список серверов → сворачиваемые секции. Единый LazyColumn, чтобы раскрытые секции
@@ -612,6 +632,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                 subtitle = activeServer?.let { protoNetSec(it) },
                 speedMbps = activeServer?.let { effSpeed(it) },
                 hidden = activeHidden,
+                blocked = activeBlocked,
                 message = proxy.message,
             )
         }
@@ -645,11 +666,11 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                 fontWeight = FontWeight.Bold,
             )
         }
-        // Чтобы серверы не пропадали молча — сколько скрыто фильтром протоколов.
-        if (hiddenByProtocol > 0) {
+        // Чтобы серверы не пропадали молча — сколько скрыто (протокол + стоп-лист).
+        if (hiddenCount > 0) {
             item {
                 Text(
-                    "скрыто настройками: $hiddenByProtocol",
+                    "скрыто настройками: $hiddenCount",
                     style = MaterialTheme.typography.bodySmall,
                     color = TABLE_GRAY,
                 )
@@ -735,12 +756,20 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         }
     }
 
-    // Диалог деталей сервера (долгое нажатие) + отладочный «Перемерить». Отдельное окно — не в ленте.
+    // Диалог деталей сервера (долгое нажатие) + отладочный «Перемерить» + точечная блокировка.
     detailProfile?.let { p ->
+        val pKey = SubscriptionManager.serverKey(p)
         ServerDetailDialog(
             profile = p,
             remeasureStatus = remeasureStatus,
             remeasuring = remeasuring,
+            blockedByKey = blocklist.isServerBlocked(pKey),
+            blockedByWord = blocklist.matchesWord(serverName(p)),
+            onToggleBlock = {
+                if (blocklist.isServerBlocked(pKey)) BlocklistStore.unblockServer(context, pKey)
+                else BlocklistStore.blockServer(context, pKey, serverName(p), System.currentTimeMillis())
+                detailProfile = null; remeasureStatus = ""
+            },
             onRemeasure = { onRemeasure(p) },
             onDismiss = { detailProfile = null; remeasureStatus = "" },
         )
@@ -847,6 +876,7 @@ private fun StatusBox(
     subtitle: String?,
     speedMbps: Double?,
     hidden: Boolean,
+    blocked: Boolean,
     message: String,
 ) {
     val bg = when {
@@ -876,6 +906,13 @@ private fun StatusBox(
             color = fg,
         )
         if (running) {
+            // Активный сервер попал под стоп-лист — туннель не рвём молча, помечаем и предлагаем переключиться.
+            if (blocked) {
+                Text(
+                    "🚫 активный сервер в стоп-листе — нажмите «▶ Самый быстрый»",
+                    style = MaterialTheme.typography.bodySmall, color = fg, fontWeight = FontWeight.Bold,
+                )
+            }
             // Активный сервер скрыт фильтром протоколов — туннель не рвём, но помечаем.
             if (hidden) {
                 Text("⚠ протокол скрыт настройками", style = MaterialTheme.typography.bodySmall, color = fg, fontWeight = FontWeight.Bold)
@@ -1087,6 +1124,9 @@ private fun ServerDetailDialog(
     profile: ServerProfile,
     remeasureStatus: String,
     remeasuring: Boolean,
+    blockedByKey: Boolean,
+    blockedByWord: Boolean,
+    onToggleBlock: () -> Unit,
     onRemeasure: () -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -1110,6 +1150,19 @@ private fun ServerDetailDialog(
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
+                // Точечная блокировка ИМЕННО этого serverKey (не всех одноимённых).
+                OutlinedButton(onClick = onToggleBlock, modifier = Modifier.fillMaxWidth()) {
+                    Text(if (blockedByKey) "Убрать из стоп-листа" else "🚫 В стоп-лист")
+                }
+                // Если сервер УЖЕ скрыт правилом-словом — точечное снятие не поможет, объясняем куда идти.
+                if (blockedByWord && !blockedByKey) {
+                    Text(
+                        "Скрыт правилом-словом стоп-листа. Снять — Настройки → Стоп-лист.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TABLE_GRAY,
                     )
                 }
             }
@@ -1217,6 +1270,97 @@ private fun SettingsSection(
         OutlinedButton(onClick = onReset, modifier = Modifier.fillMaxWidth()) {
             Text("Сбросить всё к дефолтам")
         }
+    }
+}
+
+/**
+ * Секция «🚫 Стоп-лист» — два подраздела:
+ *  1) правила-слова: чипы «слово (N) ✗»; серый чип = никого не блокирует (N=0), вероятно опечатка;
+ *  2) персонально заблокированные серверы: имя + «Разблокировать» — без него точечную блокировку не снять.
+ * Оба типа применяются через единый предикат [ServerFilter]; здесь только управление списком.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun BlocklistSection(
+    blocklist: Blocklist,
+    serverNames: List<String>,
+    onAddWord: (String) -> Unit,
+    onRemoveWord: (String) -> Unit,
+    onUnblockServer: (String) -> Unit,
+) {
+    var input by remember { mutableStateOf("") }
+    Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        SettingsGroupLabel("Правила-слова (по имени сервера)")
+        Text(
+            "Слово (часть имени) скрывает совпавшие серверы. Регистр не важен.",
+            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+        )
+        if (blocklist.words.isEmpty()) {
+            Text("Правил нет — добавьте слово ниже.", style = MaterialTheme.typography.bodyMedium, color = TABLE_GRAY)
+        } else {
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                blocklist.words.forEach { w ->
+                    WordChip(word = w, count = blocklist.countForWord(w, serverNames), onRemove = { onRemoveWord(w) })
+                }
+            }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = input,
+                onValueChange = { input = it },
+                singleLine = true,
+                placeholder = { Text("Слово") },
+                modifier = Modifier.weight(1f),
+            )
+            Button(onClick = { onAddWord(input); input = "" }, enabled = input.isNotBlank()) { Text("+") }
+        }
+
+        Spacer(Modifier.height(4.dp))
+        SettingsGroupLabel("Персонально заблокированные")
+        if (blocklist.servers.isEmpty()) {
+            Text(
+                "Пусто. Заблокировать конкретный сервер: тап по строке → «🚫 В стоп-лист».",
+                style = MaterialTheme.typography.bodyMedium, color = TABLE_GRAY,
+            )
+        } else {
+            blocklist.servers.forEach { s ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        s.name.ifBlank { s.serverKey },
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    TextButton(onClick = { onUnblockServer(s.serverKey) }) { Text("Разблокировать") }
+                }
+            }
+        }
+    }
+}
+
+/** Чип правила-слова: «слово (N) ✗». Серый, если N==0 (никого не блокирует — вероятно опечатка). */
+@Composable
+private fun WordChip(word: String, count: Int, onRemove: () -> Unit) {
+    val useless = count == 0
+    val bg = if (useless) Color(0xFF2A2A2A) else MaterialTheme.colorScheme.surfaceVariant
+    val fg = if (useless) TABLE_GRAY else MaterialTheme.colorScheme.onSurfaceVariant
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(14.dp))
+            .background(bg)
+            .padding(start = 10.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Text("$word ($count)", style = MaterialTheme.typography.bodySmall, color = fg)
+        Text(
+            "✗",
+            color = Color(0xFFEF5350),
+            modifier = Modifier.clip(RoundedCornerShape(8.dp)).clickable { onRemove() }.padding(horizontal = 4.dp),
+        )
     }
 }
 

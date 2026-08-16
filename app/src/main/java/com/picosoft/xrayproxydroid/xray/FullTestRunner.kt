@@ -1,6 +1,7 @@
 package com.picosoft.xrayproxydroid.xray
 
 import android.content.Context
+import com.picosoft.xrayproxydroid.settings.BlocklistStore
 import com.picosoft.xrayproxydroid.settings.SettingsStore
 import com.picosoft.xrayproxydroid.subscription.SubscriptionManager
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
@@ -54,6 +55,11 @@ object FullTestRunner {
 
         val pingByKey = ConcurrentHashMap<String, Int>()
 
+        // Заблокированных НЕ мерим (в отличие от отключённых по протоколу): блокировка — «не нужен вовсе»,
+        // тратить трафик/время прогона на него незачем. Фильтр ДО ping/speed.
+        val blocklist = BlocklistStore.current()
+        val testable = allServers.filter { !ServerFilter.isBlocked(it, blocklist) }
+
         fun key(p: ServerProfile) = SubscriptionManager.serverKey(p)
         fun label(p: ServerProfile) = p.remarks.ifBlank { p.address }
 
@@ -79,8 +85,8 @@ object FullTestRunner {
                 servers = alive,
                 onResult = { p, mbps ->
                     onSpeedResult(p, mbps)   // МЕРЯЕМ ВСЕХ; результат сохраняем всегда
-                    // ВЫБОР — через единый предикат (протокол + мин.скорость). Замер не фильтруем.
-                    if (ServerFilter.isSelectable(p, mbps, settings)) {
+                    // ВЫБОР — через единый предикат (протокол + мин.скорость + стоп-лист). Замер не фильтруем.
+                    if (ServerFilter.isSelectable(p, mbps, settings, blocklist)) {
                         if (mbps > bestSpeed) { bestSpeed = mbps; best = p }
                         if (connected == null) {
                             // Сначала — к ПЕРВОМУ живому: связь сразу, любая полезная скорость.
@@ -103,12 +109,12 @@ object FullTestRunner {
             )
         }
 
-        // --- Этап 1: ping всех ---
-        onPhase("Этап 1: пинг ${allServers.size}…")
-        emitProgress(0, allServers.size)   // шкала фазы пинга
+        // --- Этап 1: ping всех (кроме заблокированных) ---
+        onPhase("Этап 1: пинг ${testable.size}…")
+        emitProgress(0, testable.size)   // шкала фазы пинга
         pingHandle = ServerTester.testAll(
             context = appCtx,
-            servers = allServers,
+            servers = testable,
             concurrency = 8,
             onResult = { p, ms ->
                 val v = ms.toInt()
@@ -123,7 +129,7 @@ object FullTestRunner {
                 if (cancelled.get()) {
                     onDone(Result(null, null, 0.0, 0, true))
                 } else {
-                    val alive = allServers
+                    val alive = testable
                         .filter { (pingByKey[key(it)] ?: it.pingMs ?: -1) >= 0 }
                         .sortedBy { pingByKey[key(it)] ?: it.pingMs ?: Int.MAX_VALUE }
                     startSpeedPhase(alive)
