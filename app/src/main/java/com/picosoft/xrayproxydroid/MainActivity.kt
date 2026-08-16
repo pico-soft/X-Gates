@@ -55,6 +55,8 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -111,17 +113,60 @@ class MainActivity : ComponentActivity() {
  *  Подбирать здесь; системный отступ навигации сюда НЕ входит (он добавляется отдельно инсетом). */
 private val BOTTOM_BAR_HEIGHT = 42.dp
 
-/** Корень с компактной нижней навигацией: «Главная» (весь существующий экран) + «Трафик». */
+/** Корень с компактной нижней навигацией: «Главная» (рабочий экран) + «Настройки» (что настраивают). */
 @Composable
 private fun AppRoot() {
-    var tab by remember { mutableStateOf(0) }
+    var tab by rememberSaveable { mutableStateOf(0) }
+    val stateHolder = rememberSaveableStateHolder()   // сохраняет состояние вкладки (раскрытые секции) при переключении
     Scaffold(
         modifier = Modifier.fillMaxSize(),
         bottomBar = { CompactBottomBar(selected = tab, onSelect = { tab = it }) },
     ) { innerPadding ->
-        when (tab) {
-            0 -> BootScreen(modifier = Modifier.padding(innerPadding))
-            else -> TrafficScreen(modifier = Modifier.padding(innerPadding))
+        stateHolder.SaveableStateProvider(tab) {
+            when (tab) {
+                0 -> BootScreen(modifier = Modifier.padding(innerPadding))
+                else -> SettingsTab(modifier = Modifier.padding(innerPadding))
+            }
+        }
+    }
+}
+
+/**
+ * Вкладка «Настройки» — всё, что настраивают и оставляют: сворачиваемые секции
+ * Настройки → Стоп-лист → Автомониторинг → Трафик. Все свёрнуты по умолчанию (экран = оглавление).
+ * Механика сворачивания общая с главной ([CollapsibleSection]).
+ */
+@Composable
+private fun SettingsTab(modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    val settings by SettingsStore.state.collectAsState()
+    val protocolCounts = remember(settings) {
+        SubscriptionManager.allServers(context).groupingBy { it.protocol }.eachCount()
+    }
+    // Состояние раскрытия — на уровне вкладки (стабильное позиционное scoping), все свёрнуты по умолчанию.
+    var settingsExpanded by rememberSaveable { mutableStateOf(false) }
+    var blocklistExpanded by rememberSaveable { mutableStateOf(false) }
+    var monitorExpanded by rememberSaveable { mutableStateOf(false) }
+    var trafficExpanded by rememberSaveable { mutableStateOf(false) }
+    LazyColumn(
+        modifier = modifier.fillMaxSize().padding(horizontal = 14.dp),
+        contentPadding = PaddingValues(vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        item {
+            CollapsibleSection("⚙️ Настройки", settingsExpanded, { settingsExpanded = !settingsExpanded }) {
+                SettingsSection(
+                    settings = settings,
+                    protocolCounts = protocolCounts,
+                    onChange = { SettingsStore.update(context, it) },
+                    onReset = { SettingsStore.resetToDefaults(context) },
+                )
+            }
+        }
+        item { CollapsibleSection("🚫 Стоп-лист", blocklistExpanded, { blocklistExpanded = !blocklistExpanded }) { StubText() } }
+        item { CollapsibleSection("🛡️ Автомониторинг", monitorExpanded, { monitorExpanded = !monitorExpanded }) { StubText() } }
+        item {
+            CollapsibleSection("Трафик", trafficExpanded, { trafficExpanded = !trafficExpanded }) { TrafficSection() }
         }
     }
 }
@@ -134,7 +179,7 @@ private fun AppRoot() {
  */
 @Composable
 private fun CompactBottomBar(selected: Int, onSelect: (Int) -> Unit) {
-    val labels = listOf("Главная", "Трафик")
+    val labels = listOf("Главная", "Настройки")
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -246,6 +291,9 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     var subRefreshCancel by remember { mutableStateOf(false) }
     var pendingDelete by remember { mutableStateOf<SubSource?>(null) }
     var renameSource by remember { mutableStateOf<SubSource?>(null) }
+    // Раскрытие сворачиваемых секций главной — на уровне экрана (стабильно, переживает переключение вкладок).
+    var allServersExpanded by rememberSaveable { mutableStateOf(false) }
+    var subscriptionsExpanded by rememberSaveable { mutableStateOf(false) }
 
     var pingResults by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
 
@@ -615,7 +663,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         // ═══ 4. СВОРАЧИВАЕМЫЕ СЕКЦИИ (порядок как эталон) ═══
         // Все серверы (вкл. мёртвые ✗ и не тестированные —) — свёрнут, не мозолит глаза.
         item {
-            CollapsibleSection(title = "Все серверы (${shown.size})", initiallyExpanded = false) {
+            CollapsibleSection("Все серверы (${shown.size})", allServersExpanded, { allServersExpanded = !allServersExpanded }) {
                 ServerTableHeader()
                 shown.forEach { p ->
                     val isActive = proxy.running && proxy.serverKey == SubscriptionManager.serverKey(p)
@@ -630,8 +678,9 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                 }
             }
         }
+        // Подписки — рабочее действие, остаётся на главной (список источников/добавление/вставка/файл).
         item {
-            CollapsibleSection(title = "Подписки (${sources.size})", initiallyExpanded = false) {
+            CollapsibleSection("Подписки (${sources.size})", subscriptionsExpanded, { subscriptionsExpanded = !subscriptionsExpanded }) {
                 SubscriptionsSection(
                     sources = sources,
                     onAddUrl = { url, name -> onAddUrl(url, name) },
@@ -643,19 +692,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                 )
             }
         }
-        // Заглушки под будущие фичи — порядок эталона: Автомониторинг → Настройки → Стоп-лист.
-        item { CollapsibleSection(title = "🛡️ Автомониторинг", initiallyExpanded = false) { StubText() } }
-        item {
-            CollapsibleSection(title = "⚙️ Настройки", initiallyExpanded = false) {
-                SettingsSection(
-                    settings = settings,
-                    protocolCounts = servers.groupingBy { it.protocol }.eachCount(),
-                    onChange = { SettingsStore.update(context, it) },
-                    onReset = { SettingsStore.resetToDefaults(context) },
-                )
-            }
-        }
-        item { CollapsibleSection(title = "🚫 Стоп-лист", initiallyExpanded = false) { StubText() } }
+        // Настройки / Стоп-лист / Автомониторинг / Трафик переехали во вкладку «Настройки».
 
         // ═══ ФУТЕР ═══
         item {
@@ -968,20 +1005,23 @@ private fun ServerRow(
     }
 }
 
-/** Сворачиваемая секция (аналог <details> веб-морды). Заголовок-строка с ▸/▾. */
+/** Сворачиваемая секция (аналог <details> веб-морды). Заголовок-строка с ▸/▾.
+ *  STATELESS: состояние раскрытия хоистится в экран (rememberSaveable на верхнем уровне
+ *  BootScreen/SettingsTab, НЕ внутри item LazyColumn — иначе позиционное scoping путается).
+ *  В паре с SaveableStateProvider(tab) переживает уход на другую вкладку и обратно. */
 @Composable
 private fun CollapsibleSection(
     title: String,
-    initiallyExpanded: Boolean,
+    expanded: Boolean,
+    onToggle: () -> Unit,
     content: @Composable () -> Unit,
 ) {
-    var expanded by remember { mutableStateOf(initiallyExpanded) }
     Column(modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(8.dp))
-                .clickable { expanded = !expanded }
+                .clickable { onToggle() }
                 .padding(vertical = 10.dp, horizontal = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -1420,11 +1460,12 @@ private fun fmtUptime(ms: Long): String {
 }
 
 /**
- * Вкладка «Трафик»: два потока раздельно (туннель ↓/↑ и тест), сумма «итого» отдельной строкой.
- * Три блока: сессия «с последнего запуска», за сутки, за 30 дней (+ список по дням).
+ * Секция «Трафик» (внутри вкладки «Настройки»): два потока раздельно (туннель ↓/↑ и тест),
+ * сумма «итого» отдельной строкой. Три блока: сессия, за сутки, за 30 дней (+ список по дням).
+ * Тот же состав/тексты/поведение, что были на отдельной вкладке — перенос без переделки.
  */
 @Composable
-private fun TrafficScreen(modifier: Modifier = Modifier) {
+private fun TrafficSection() {
     val t by TrafficTracker.state.collectAsState()
 
     // Живой таймер: тикаем раз в секунду ВСЕГДА (сессия идёт с запуска приложения).
@@ -1447,52 +1488,42 @@ private fun TrafficScreen(modifier: Modifier = Modifier) {
     var confirmAll by remember { mutableStateOf(false) }
     val daysWithData = t.days.count { !it.second.isEmpty() }
 
-    LazyColumn(
-        modifier = modifier.fillMaxSize().padding(horizontal = 14.dp),
-        contentPadding = PaddingValues(vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp),
-    ) {
+    Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         // 1. С последнего запуска — сброс без подтверждения (сессия + таймер).
-        item {
-            TrafficBlock("С последнего запуска") {
-                if (t.sessionStartElapsed == 0L) {
-                    Text("Нет данных", style = MaterialTheme.typography.bodyMedium, color = TABLE_GRAY)
-                } else {
-                    MetricRow("Время работы", fmtUptime(uptimeMs))
-                    MetricRow("Прокси активен", if (proxyUptime < 0) "—" else fmtUptime(proxyUptime))
-                    MetricRow("Туннель ↓ (приём)", fmtBytes(t.sessionRx))
-                    MetricRow("Туннель ↑ (отдача)", fmtBytes(t.sessionTx))
-                    MetricRow("Тест", fmtBytes(t.sessionTest))
-                    MetricRow("Итого", fmtBytes(t.sessionRx + t.sessionTx + t.sessionTest), bold = true)
-                    Spacer(Modifier.height(6.dp))
-                    OutlinedButton(onClick = { TrafficTracker.resetSession() }) { Text("Сбросить") }
-                }
+        TrafficBlock("С последнего запуска") {
+            if (t.sessionStartElapsed == 0L) {
+                Text("Нет данных", style = MaterialTheme.typography.bodyMedium, color = TABLE_GRAY)
+            } else {
+                MetricRow("Время работы", fmtUptime(uptimeMs))
+                MetricRow("Прокси активен", if (proxyUptime < 0) "—" else fmtUptime(proxyUptime))
+                MetricRow("Туннель ↓ (приём)", fmtBytes(t.sessionRx))
+                MetricRow("Туннель ↑ (отдача)", fmtBytes(t.sessionTx))
+                MetricRow("Тест", fmtBytes(t.sessionTest))
+                MetricRow("Итого", fmtBytes(t.sessionRx + t.sessionTx + t.sessionTest), bold = true)
+                Spacer(Modifier.height(6.dp))
+                OutlinedButton(onClick = { TrafficTracker.resetSession() }) { Text("Сбросить") }
             }
         }
         // 2. За сутки — сброс корзины сегодняшнего дня, с подтверждением.
-        item {
-            TrafficBlock("За сутки") {
-                BucketRows(t.today)
-                if (!t.today.isEmpty()) {
-                    Spacer(Modifier.height(6.dp))
-                    OutlinedButton(onClick = { confirmToday = true }) { Text("Сбросить") }
-                }
+        TrafficBlock("За сутки") {
+            BucketRows(t.today)
+            if (!t.today.isEmpty()) {
+                Spacer(Modifier.height(6.dp))
+                OutlinedButton(onClick = { confirmToday = true }) { Text("Сбросить") }
             }
         }
         // 3. За 30 дней + список по дням — стереть всю историю, с подтверждением.
-        item {
-            TrafficBlock("За 30 дней") {
-                BucketRows(t.total30)
-                val nonEmpty = t.days.filter { !it.second.isEmpty() }
-                if (nonEmpty.isNotEmpty()) {
-                    Spacer(Modifier.height(8.dp))
-                    Text("По дням:", style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
-                    nonEmpty.forEach { (date, b) ->
-                        MetricRow(date, fmtBytes(b.total()))
-                    }
-                    Spacer(Modifier.height(6.dp))
-                    OutlinedButton(onClick = { confirmAll = true }) { Text("Сбросить") }
+        TrafficBlock("За 30 дней") {
+            BucketRows(t.total30)
+            val nonEmpty = t.days.filter { !it.second.isEmpty() }
+            if (nonEmpty.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                Text("По дням:", style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
+                nonEmpty.forEach { (date, b) ->
+                    MetricRow(date, fmtBytes(b.total()))
                 }
+                Spacer(Modifier.height(6.dp))
+                OutlinedButton(onClick = { confirmAll = true }) { Text("Сбросить") }
             }
         }
     }
