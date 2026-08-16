@@ -1,0 +1,158 @@
+package com.picosoft.xrayproxydroid.xray
+
+import android.content.Context
+import com.picosoft.xrayproxydroid.monitor.MonitorLog
+import com.picosoft.xrayproxydroid.monitor.ServerLabels
+import com.picosoft.xrayproxydroid.service.ProxyState
+import com.picosoft.xrayproxydroid.settings.BlocklistStore
+import com.picosoft.xrayproxydroid.settings.SettingsStore
+import com.picosoft.xrayproxydroid.subscription.SubscriptionManager
+import com.picosoft.xrayproxydroid.xray.link.ServerProfile
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.roundToInt
+
+/**
+ * Полный адаптивный тест (перенос Termux run_full_test_with_early_connect):
+ *   Этап 1: ping всех (real-ping, пул 8) → отсев мёртвых (pingMs>=0), сорт по возр. пинга.
+ *   Этап 2: speed ПОСЛЕДОВАТЕЛЬНО по ВСЕМ живым (в порядке пинга). Первый живой (≥MIN_USABLE) →
+ *           СРАЗУ подключиться (early-connect). Дальше ПРОГРЕССИВНЫЙ апгрейд ПО ХОДУ: как только
+ *           очередной замер даёт >10% ([marginRatio]) сверх текущего подключённого — переключиться.
+ *
+ * proxy-check НЕ нужен — real-ping уже проходит весь протокол до бэкенда и тянет URL через туннель.
+ * Монитора здесь НЕТ (следующий этап).
+ *
+ * Оркестратор: переиспользует [ServerTester] (ping) + [ServerSpeedTester] (speed) + [connect].
+ * Колбэки — на фоновых потоках, UI-маршалинг на вызывающем.
+ */
+object FullTestRunner {
+
+    // Пороги (margin, min-usable) больше НЕ живут здесь константами — единый источник [SettingsStore].
+
+    data class Result(
+        val connected: ServerProfile?,   // к чему подключены в итоге
+        val fastest: ServerProfile?,     // самый быстрый по замеру
+        val fastestMbps: Double,
+        val aliveCount: Int,
+        val cancelled: Boolean,
+    )
+
+    interface Handle {
+        fun cancel()
+    }
+
+    fun run(
+        context: Context,
+        allServers: List<ServerProfile>,
+        marginRatio: Double = SettingsStore.current().marginRatio,   // живой порог из настроек
+        onPhase: (String) -> Unit,
+        onPingResult: (ServerProfile, Int) -> Unit = { _, _ -> },
+        onSpeedResult: (ServerProfile, Double) -> Unit = { _, _ -> },
+        emitProgress: (done: Int, total: Int) -> Unit = { _, _ -> },  // числовой прогресс наружу (для бара)
+        connect: (ServerProfile) -> Unit,
+        onDone: (Result) -> Unit,
+    ): Handle {
+        val appCtx = context.applicationContext
+        val cancelled = AtomicBoolean(false)
+        var pingHandle: ServerTester.TestHandle? = null
+        var speedHandle: ServerSpeedTester.Handle? = null
+
+        val pingByKey = ConcurrentHashMap<String, Int>()
+
+        // Заблокированных НЕ мерим (в отличие от отключённых по протоколу): блокировка — «не нужен вовсе»,
+        // тратить трафик/время прогона на него незачем. Фильтр ДО ping/speed.
+        val blocklist = BlocklistStore.current()
+        val testable = allServers.filter { !ServerFilter.isBlocked(it, blocklist) }
+
+        fun key(p: ServerProfile) = SubscriptionManager.serverKey(p)
+        fun label(p: ServerProfile) = p.remarks.ifBlank { p.address }
+        fun fmt(v: Double) = "${(v * 10).roundToInt() / 10.0}"
+
+        // --- Этап 2: speed + early-connect ---
+        fun startSpeedPhase(alive: List<ServerProfile>) {
+            if (cancelled.get()) { onDone(Result(null, null, 0.0, alive.size, true)); return }
+            if (alive.isEmpty()) {
+                onPhase("Нет живых серверов — проверь интернет / все мёртвые")
+                onDone(Result(null, null, 0.0, 0, cancelled.get()))
+                return
+            }
+            onPhase("Этап 2: скорость по ${alive.size} живым…")
+            emitProgress(0, alive.size)   // новая шкала фазы скорости — сброс в 0
+
+            val settings = SettingsStore.current()   // снимок порога/протоколов на прогон
+            var connected: ServerProfile? = null
+            var connectedSpeed = 0.0
+            var best: ServerProfile? = null
+            var bestSpeed = 0.0
+
+            speedHandle = ServerSpeedTester.testAll(
+                context = appCtx,
+                servers = alive,
+                onResult = { p, mbps ->
+                    onSpeedResult(p, mbps)   // МЕРЯЕМ ВСЕХ; результат сохраняем всегда
+                    // ВЫБОР — через единый предикат (протокол + мин.скорость + стоп-лист). Замер не фильтруем.
+                    if (ServerFilter.isSelectable(p, mbps, settings, blocklist)) {
+                        if (mbps > bestSpeed) { bestSpeed = mbps; best = p }
+                        if (connected == null) {
+                            // Сначала — к ПЕРВОМУ живому: связь сразу, любая полезная скорость.
+                            connected = p; connectedSpeed = mbps
+                            onPhase("Подключён ${label(p)} ($mbps Мбит/с), продолжаю…")
+                            val from = ServerLabels.displayForKey(appCtx, ProxyState.state.value.serverKey)
+                            MonitorLog.switch(appCtx, from, ServerLabels.display(p), "полный тест: первый рабочий", "${fmt(mbps)} Мбит/с")
+                            connect(p)
+                        } else if (p !== connected && mbps > connectedSpeed * (1 + marginRatio)) {
+                            // Прогрессивный апгрейд ПО ХОДУ: переключаемся на заметно (>10%) более быстрый.
+                            val prev = connectedSpeed
+                            onPhase("Быстрее на >10%: ${label(p)} ($mbps > $connectedSpeed) — переключаюсь")
+                            val from = ServerLabels.displayForKey(appCtx, ProxyState.state.value.serverKey)
+                            MonitorLog.switch(appCtx, from, ServerLabels.display(p), "полный тест: апгрейд", "было ${fmt(prev)} → стало ${fmt(mbps)} Мбит/с")
+                            connected = p; connectedSpeed = mbps
+                            connect(p)
+                        }
+                    }
+                },
+                onProgress = { done, total ->
+                    onPhase("Этап 2: скорость $done / $total · подключён: ${connected?.let(::label) ?: "—"}")
+                    emitProgress(done, total)
+                },
+                onFinish = { onDone(Result(connected ?: best, best, bestSpeed, alive.size, cancelled.get())) },
+            )
+        }
+
+        // --- Этап 1: ping всех (кроме заблокированных) ---
+        onPhase("Этап 1: пинг ${testable.size}…")
+        emitProgress(0, testable.size)   // шкала фазы пинга
+        pingHandle = ServerTester.testAll(
+            context = appCtx,
+            servers = testable,
+            concurrency = 8,
+            onResult = { p, ms ->
+                val v = ms.toInt()
+                pingByKey[key(p)] = v
+                onPingResult(p, v)
+            },
+            onProgress = { done, total ->
+                onPhase("Этап 1: пинг $done / $total")
+                emitProgress(done, total)
+            },
+            onFinish = {
+                if (cancelled.get()) {
+                    onDone(Result(null, null, 0.0, 0, true))
+                } else {
+                    val alive = testable
+                        .filter { (pingByKey[key(it)] ?: it.pingMs ?: -1) >= 0 }
+                        .sortedBy { pingByKey[key(it)] ?: it.pingMs ?: Int.MAX_VALUE }
+                    startSpeedPhase(alive)
+                }
+            },
+        )
+
+        return object : Handle {
+            override fun cancel() {
+                cancelled.set(true)
+                pingHandle?.cancel()
+                speedHandle?.cancel()
+            }
+        }
+    }
+}

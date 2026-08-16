@@ -1,15 +1,17 @@
 *.iml
 .gradle
 /local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
+.idea/
 .DS_Store
 /build
 /captures
 .externalNativeBuild
 .cxx
 local.properties
+# Release-подпись НИКОГДА в репо (репозиторий публичный). Ключ лежит в _Secrets/ (эта папка целиком
+# игнорируется), пароль — в local.properties (тоже игнорируется). Паттерны *.jks/*.keystore — двойная
+# страховка от случайного add даже вне _Secrets.
+/_Secrets/
+*.jks
+*.keystore
+keystore.properties
