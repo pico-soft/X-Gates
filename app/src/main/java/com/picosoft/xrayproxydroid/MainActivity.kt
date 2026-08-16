@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -37,6 +38,8 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -66,6 +69,8 @@ import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.delay
+import java.util.Locale
 import kotlin.math.roundToInt
 import com.picosoft.xrayproxydroid.service.ProxyState
 import com.picosoft.xrayproxydroid.service.XrayProxyService
@@ -73,6 +78,8 @@ import com.picosoft.xrayproxydroid.settings.AppSettings
 import com.picosoft.xrayproxydroid.settings.SettingsStore
 import com.picosoft.xrayproxydroid.subscription.SubSource
 import com.picosoft.xrayproxydroid.subscription.SubscriptionManager
+import com.picosoft.xrayproxydroid.traffic.DayBucket
+import com.picosoft.xrayproxydroid.traffic.TrafficTracker
 import com.picosoft.xrayproxydroid.ui.TestProgress
 import com.picosoft.xrayproxydroid.ui.theme.XrayProxyDroidTheme
 import com.picosoft.xrayproxydroid.xray.ExternalIpChecker
@@ -86,13 +93,38 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         SettingsStore.init(applicationContext)   // загрузить настройки до первого замера
         SubscriptionManager.init(applicationContext)   // миграция старой подписки в мультиподписки (однократно)
+        TrafficTracker.init(applicationContext)  // загрузить дневные корзины трафика
         enableEdgeToEdge()
         setContent {
             XrayProxyDroidTheme {
-                Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    BootScreen(modifier = Modifier.padding(innerPadding))
-                }
+                AppRoot()
             }
+        }
+    }
+}
+
+/** Корень с нижней навигацией: «Главная» (весь существующий экран) + «Трафик». */
+@Composable
+private fun AppRoot() {
+    var tab by remember { mutableStateOf(0) }
+    Scaffold(
+        modifier = Modifier.fillMaxSize(),
+        bottomBar = {
+            NavigationBar {
+                NavigationBarItem(
+                    selected = tab == 0, onClick = { tab = 0 },
+                    icon = { Text("🏠") }, label = { Text("Главная") },
+                )
+                NavigationBarItem(
+                    selected = tab == 1, onClick = { tab = 1 },
+                    icon = { Text("📊") }, label = { Text("Трафик") },
+                )
+            }
+        },
+    ) { innerPadding ->
+        when (tab) {
+            0 -> BootScreen(modifier = Modifier.padding(innerPadding))
+            else -> TrafficScreen(modifier = Modifier.padding(innerPadding))
         }
     }
 }
@@ -1264,4 +1296,135 @@ private fun RenameSourceDialog(
         confirmButton = { TextButton(onClick = { onSave(name.trim()) }) { Text("Сохранить") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
     )
+}
+
+// ═══════════════════════ ТРАФИК ═══════════════════════
+
+/** КБ/МБ/ГБ с одним знаком (точка), без сырых байтов. */
+private fun fmtBytes(b: Long): String = when {
+    b < 1024L * 1024 -> String.format(Locale.US, "%.1f КБ", b / 1024.0)
+    b < 1024L * 1024 * 1024 -> String.format(Locale.US, "%.1f МБ", b / 1_048_576.0)
+    else -> String.format(Locale.US, "%.1f ГБ", b / 1_073_741_824.0)
+}
+
+/** ч:мм:сс. */
+private fun fmtUptime(ms: Long): String {
+    val s = (ms / 1000).coerceAtLeast(0)
+    return String.format(Locale.US, "%d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60)
+}
+
+private fun DayBucket.isEmpty() = tunnelRx == 0L && tunnelTx == 0L && test == 0L
+private fun DayBucket.total() = tunnelRx + tunnelTx + test
+
+/**
+ * Вкладка «Трафик»: два потока раздельно (туннель ↓/↑ и тест), сумма «итого» отдельной строкой.
+ * Три блока: сессия «с последнего запуска», за сутки, за 30 дней (+ список по дням).
+ */
+@Composable
+private fun TrafficScreen(modifier: Modifier = Modifier) {
+    val t by TrafficTracker.state.collectAsState()
+
+    // Живой аптайм: тикаем раз в секунду, пока сессия активна.
+    var nowElapsed by remember { mutableStateOf(SystemClock.elapsedRealtime()) }
+    LaunchedEffect(t.sessionActive) {
+        while (t.sessionActive) {
+            nowElapsed = SystemClock.elapsedRealtime()
+            delay(1000)
+        }
+    }
+    val uptimeMs = when {
+        t.sessionStartElapsed == 0L -> 0L
+        t.sessionActive -> nowElapsed - t.sessionStartElapsed
+        else -> t.sessionEndElapsed - t.sessionStartElapsed
+    }
+
+    LazyColumn(
+        modifier = modifier.fillMaxSize().padding(horizontal = 14.dp),
+        contentPadding = PaddingValues(vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        // 1. С последнего запуска
+        item {
+            TrafficBlock("С последнего запуска") {
+                if (t.sessionStartElapsed == 0L) {
+                    Text("Нет данных", style = MaterialTheme.typography.bodyMedium, color = TABLE_GRAY)
+                } else {
+                    MetricRow("Время работы", fmtUptime(uptimeMs))
+                    MetricRow("Туннель ↓ (приём)", fmtBytes(t.sessionRx))
+                    MetricRow("Туннель ↑ (отдача)", fmtBytes(t.sessionTx))
+                    MetricRow("Тест", fmtBytes(t.sessionTest))
+                    MetricRow("Итого", fmtBytes(t.sessionRx + t.sessionTx + t.sessionTest), bold = true)
+                    Spacer(Modifier.height(6.dp))
+                    OutlinedButton(onClick = { TrafficTracker.resetSession() }) { Text("Сбросить") }
+                }
+            }
+        }
+        // 2. За сутки
+        item { TrafficBlock("За сутки") { BucketRows(t.today) } }
+        // 3. За 30 дней + список по дням
+        item {
+            TrafficBlock("За 30 дней") {
+                BucketRows(t.total30)
+                val nonEmpty = t.days.filter { !it.second.isEmpty() }
+                if (nonEmpty.isNotEmpty()) {
+                    Spacer(Modifier.height(8.dp))
+                    Text("По дням:", style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
+                    nonEmpty.forEach { (date, b) ->
+                        MetricRow(date, fmtBytes(b.total()))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** Строки одной корзины: туннель ↓/↑, тест, итого — или «Нет данных». */
+@Composable
+private fun BucketRows(b: DayBucket) {
+    if (b.isEmpty()) {
+        Text("Нет данных", style = MaterialTheme.typography.bodyMedium, color = TABLE_GRAY)
+    } else {
+        MetricRow("Туннель ↓ (приём)", fmtBytes(b.tunnelRx))
+        MetricRow("Туннель ↑ (отдача)", fmtBytes(b.tunnelTx))
+        MetricRow("Тест", fmtBytes(b.test))
+        MetricRow("Итого", fmtBytes(b.total()), bold = true)
+    }
+}
+
+/** Блок-карточка с заголовком. */
+@Composable
+private fun TrafficBlock(title: String, content: @Composable () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f))
+            .padding(horizontal = 14.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+        Spacer(Modifier.height(2.dp))
+        content()
+    }
+}
+
+/** Строка «метка … значение». */
+@Composable
+private fun MetricRow(label: String, value: String, bold: Boolean = false) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            label, modifier = Modifier.weight(1f),
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = if (bold) FontWeight.Bold else FontWeight.Normal,
+        )
+        Text(
+            value,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = if (bold) FontWeight.Bold else FontWeight.Normal,
+        )
+    }
 }

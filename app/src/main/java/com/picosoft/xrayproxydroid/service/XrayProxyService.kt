@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.IBinder
 import androidx.core.content.ContextCompat
+import com.picosoft.xrayproxydroid.traffic.TrafficTracker
 import com.picosoft.xrayproxydroid.xray.XrayConfig
 import com.picosoft.xrayproxydroid.xray.XrayController
 import java.net.InetSocketAddress
@@ -17,6 +18,8 @@ import java.net.Socket
  * состояние отдаём через [ProxyState].
  */
 class XrayProxyService : Service() {
+
+    @Volatile private var polling = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -43,7 +46,11 @@ class XrayProxyService : Service() {
         ProxyState.update(running = false, label = label, serverKey = serverKey, message = "запуск…")
 
         Thread {
-            if (XrayController.isRunning) XrayController.stop()   // авто-переключение сервера
+            polling = false   // остановить опрос прежнего туннеля при переключении сервера
+            if (XrayController.isRunning) {
+                XrayController.queryTunnelDelta()?.let { TrafficTracker.addTunnel(it.first, it.second) }  // финал старого туннеля
+                XrayController.stop()   // авто-переключение сервера
+            }
             val res = runCatching { XrayController.start(applicationContext, config) }
             res.fold(
                 onSuccess = { ok ->
@@ -54,6 +61,7 @@ class XrayProxyService : Service() {
                             running = true, label = label, serverKey = serverKey,
                             message = "", socksOk = socks, httpOk = http,   // порты — отдельными флагами (одна строка в UI)
                         )
+                        startTrafficPolling()
                     } else {
                         ProxyState.update(running = false, label = label, serverKey = serverKey, message = "ядро не запустилось")
                         stopSelfAndForeground()
@@ -69,9 +77,26 @@ class XrayProxyService : Service() {
 
     private fun handleStop() {
         Thread {
+            polling = false
+            XrayController.queryTunnelDelta()?.let { TrafficTracker.addTunnel(it.first, it.second) }  // финальный замер туннеля
             XrayController.stop()
+            TrafficTracker.onServiceStop()
             ProxyState.update(running = false, label = null, serverKey = null, message = "остановлено")
             stopSelfAndForeground()
+        }.start()
+    }
+
+    /** Опрос трафика туннеля раз в ~2.5с, только пока сервис активен (батарея важнее секундной точности). */
+    private fun startTrafficPolling() {
+        TrafficTracker.attachContext(applicationContext)
+        TrafficTracker.onServiceStart()
+        polling = true
+        Thread {
+            while (polling && XrayController.isRunning) {
+                try { Thread.sleep(POLL_MS) } catch (e: InterruptedException) { break }
+                if (!polling) break
+                XrayController.queryTunnelDelta()?.let { (rx, tx) -> TrafficTracker.addTunnel(rx, tx) }
+            }
         }.start()
     }
 
@@ -82,8 +107,13 @@ class XrayProxyService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        polling = false
         // Страховка: если сервис уничтожают — гасим ядро.
-        if (XrayController.isRunning) XrayController.stop()
+        if (XrayController.isRunning) {
+            XrayController.queryTunnelDelta()?.let { TrafficTracker.addTunnel(it.first, it.second) }
+            XrayController.stop()
+            TrafficTracker.onServiceStop()
+        }
         if (ProxyState.state.value.running) {
             ProxyState.update(running = false, label = null, serverKey = null, message = "остановлено")
         }
@@ -96,6 +126,7 @@ class XrayProxyService : Service() {
     }
 
     companion object {
+        private const val POLL_MS = 2_500L
         const val ACTION_START = "com.picosoft.xrayproxydroid.action.START"
         const val ACTION_STOP = "com.picosoft.xrayproxydroid.action.STOP"
         const val EXTRA_CONFIG = "config"

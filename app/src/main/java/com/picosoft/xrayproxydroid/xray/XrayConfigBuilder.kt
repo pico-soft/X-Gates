@@ -20,6 +20,8 @@ object XrayConfigBuilder {
     fun build(p: ServerProfile): String = """
         {
           "log": { "loglevel": "warning" },
+          "stats": {},
+          "policy": { "system": { "statsOutboundUplink": true, "statsOutboundDownlink": true } },
           ${XrayConfig.inbounds()},
           "outbounds": [
             ${outboundFor(p)},

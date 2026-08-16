@@ -3,6 +3,7 @@ package com.picosoft.xrayproxydroid.xray
 import android.content.Context
 import android.util.Log
 import com.picosoft.xrayproxydroid.settings.SettingsStore
+import com.picosoft.xrayproxydroid.traffic.TrafficTracker
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
 import libv2ray.CoreCallbackHandler
 import libv2ray.Libv2ray
@@ -61,8 +62,9 @@ object ServerSpeedTester {
         "https://vk.ru/js/api/openapi.js",
     )
 
-    /** Исход замера: УСПЕХ (валидная скорость) или ПРОВАЛ (замер не состоялся — НЕ маленькая скорость). */
-    data class Measurement(val mbps: Double, val ok: Boolean, val reason: String)
+    /** Исход замера: УСПЕХ (валидная скорость) или ПРОВАЛ (замер не состоялся — НЕ маленькая скорость).
+     *  [bytes] — фактически скачано (для учёта ТЕСТОВОГО трафика, [TrafficTracker]). */
+    data class Measurement(val mbps: Double, val ok: Boolean, val reason: String, val bytes: Long = 0)
 
     /** Минимум байт, ниже которого замер считаем несостоявшимся (backstop к «измерено==0»). */
     private const val MIN_TOTAL_BYTES = 16 * 1024
@@ -116,15 +118,19 @@ object ServerSpeedTester {
                 }
                 log("«$name» temp-инстанс поднят за ${upMs}мс (порт=$port)")
                 var lastFail = Measurement(-1.0, false, "нет пробников")
+                var testBytes = 0L
                 for (probe in probes) {
                     val m = downloadMbps(probe, port, warmupMs, measureMs, name, verbose)
+                    testBytes += m.bytes                    // тестовый трафик: скачанное каждым пробником
                     if (m.ok) {
-                        log("── measure DONE «$name» = ${m.mbps} Mbps [${m.reason}] (probe=$probe)")
+                        TrafficTracker.addTest(testBytes)
+                        log("── measure DONE «$name» = ${m.mbps} Mbps [${m.reason}] (probe=$probe) · тест-байт=$testBytes")
                         return m
                     }
                     lastFail = m
                 }
-                log("── measure FAIL «$name» — ${lastFail.reason}")
+                TrafficTracker.addTest(testBytes)
+                log("── measure FAIL «$name» — ${lastFail.reason} · тест-байт=$testBytes")
                 return lastFail
             } catch (e: Exception) {
                 log("«$name» measureSpeed error: ${e.message}")
@@ -295,13 +301,13 @@ object ServerSpeedTester {
         val eofNote = if (eof) " (eof — окно не выработано полностью)" else ""
         if (failReason != null) {
             log("«$name» probe=$probe ПРОВАЛ [$failReason]$eofNote | ttfb=${ttfbMs}мс окно=${actualWindowMs}мс всего=$totalBytes прогрев=$warmupBytes измерено=$measuredBytes eof=$eof")
-            return Measurement(-1.0, false, failReason)
+            return Measurement(-1.0, false, failReason, bytes = totalBytes)
         }
 
         val mbps = measuredBytes * 8.0 / (actualWindowMs / 1000.0) / 1_000_000.0   // ЕДИНАЯ формула
         val rounded = (mbps * 100).roundToInt() / 100.0
         log("«$name» probe=$probe → $rounded Mbps$eofNote | ttfb=${ttfbMs}мс окно=${actualWindowMs}мс всего=$totalBytes прогрев=$warmupBytes измерено=$measuredBytes eof=$eof")
-        return Measurement(rounded, true, "ok$eofNote")
+        return Measurement(rounded, true, "ok$eofNote", bytes = totalBytes)
     }
 
     private class NoopCallback : CoreCallbackHandler {
