@@ -1,6 +1,7 @@
 package com.picosoft.xrayproxydroid.xray
 
 import android.content.Context
+import com.picosoft.xrayproxydroid.settings.SettingsStore
 import com.picosoft.xrayproxydroid.subscription.SubscriptionManager
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
 import java.util.concurrent.ConcurrentHashMap
@@ -21,14 +22,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 object FullTestRunner {
 
-    /** Порог «заметно быстрее» для апгрейда: best.speed >= connected.speed × (1 + 0.10). */
-    const val DEFAULT_MARGIN_RATIO = 0.10
-
-    /**
-     * Минимальная ПОЛЕЗНАЯ скорость (Мбит/с) — «живой» сервер. Ниже — «0.0»: скрыт в списке
-     * (MainActivity) и не годится для авто-подключения. 0.05 = граница округления до «0.0».
-     */
-    const val MIN_USABLE_MBPS = 0.05
+    // Пороги (margin, min-usable) больше НЕ живут здесь константами — единый источник [SettingsStore].
 
     data class Result(
         val connected: ServerProfile?,   // к чему подключены в итоге
@@ -45,7 +39,7 @@ object FullTestRunner {
     fun run(
         context: Context,
         allServers: List<ServerProfile>,
-        marginRatio: Double = DEFAULT_MARGIN_RATIO,
+        marginRatio: Double = SettingsStore.current().marginRatio,   // живой порог из настроек
         onPhase: (String) -> Unit,
         onPingResult: (ServerProfile, Int) -> Unit = { _, _ -> },
         onSpeedResult: (ServerProfile, Double) -> Unit = { _, _ -> },
@@ -74,6 +68,7 @@ object FullTestRunner {
             onPhase("Этап 2: скорость по ${alive.size} живым…")
             emitProgress(0, alive.size)   // новая шкала фазы скорости — сброс в 0
 
+            val minUsable = SettingsStore.current().minUsableMbps   // снимок порога на прогон
             var connected: ServerProfile? = null
             var connectedSpeed = 0.0
             var best: ServerProfile? = null
@@ -84,7 +79,7 @@ object FullTestRunner {
                 servers = alive,
                 onResult = { p, mbps ->
                     onSpeedResult(p, mbps)
-                    if (mbps >= MIN_USABLE_MBPS) {
+                    if (mbps >= minUsable) {
                         if (mbps > bestSpeed) { bestSpeed = mbps; best = p }
                         if (connected == null) {
                             // Сначала — к ПЕРВОМУ живому: связь сразу, любая полезная скорость.

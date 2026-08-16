@@ -32,6 +32,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.LinearProgressIndicator
@@ -39,6 +40,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -57,6 +59,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
@@ -65,6 +68,8 @@ import androidx.core.content.ContextCompat
 import kotlin.math.roundToInt
 import com.picosoft.xrayproxydroid.service.ProxyState
 import com.picosoft.xrayproxydroid.service.XrayProxyService
+import com.picosoft.xrayproxydroid.settings.AppSettings
+import com.picosoft.xrayproxydroid.settings.SettingsStore
 import com.picosoft.xrayproxydroid.subscription.SubscriptionManager
 import com.picosoft.xrayproxydroid.ui.TestProgress
 import com.picosoft.xrayproxydroid.ui.theme.XrayProxyDroidTheme
@@ -77,6 +82,7 @@ import com.picosoft.xrayproxydroid.xray.link.ServerProfile
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        SettingsStore.init(applicationContext)   // загрузить настройки до первого замера
         enableEdgeToEdge()
         setContent {
             XrayProxyDroidTheme {
@@ -139,6 +145,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     val activity = context as ComponentActivity
 
     val proxy by ProxyState.state.collectAsState()
+    val settings by SettingsStore.state.collectAsState()   // живое применение порогов в UI
 
     var subUrl by remember { mutableStateOf("https://maxim-zodchy.ru/sub-black.php") }
     var subStatus by remember { mutableStateOf("") }
@@ -325,11 +332,11 @@ private fun BootScreen(modifier: Modifier = Modifier) {
 
     // Основной вид = ЖИВЫЕ (ping ответил, >=0) И с полезной скоростью (не «0.0»/«✗»).
     // Не тестированные по скорости (—) остаются видны. Непригодные и мёртвые — в «Все серверы».
-    // Порог общий с Авто (FullTestRunner.MIN_USABLE_MBPS): что скрыто — то и не выбирается в Авто.
+    // Порог общий с Авто (settings.minUsableMbps): что скрыто — то и не выбирается в Авто.
     val alive = shown.filter {
         val pg = effPing(it)
         val sp = effSpeed(it)
-        pg != null && pg >= 0 && (sp == null || sp >= FullTestRunner.MIN_USABLE_MBPS)
+        pg != null && pg >= 0 && (sp == null || sp >= settings.minUsableMbps)
     }
 
     // Весь экран — одна прокручиваемая лента (как веб-морда): шапка → статус → действия →
@@ -445,7 +452,15 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         }
         // Заглушки под будущие фичи — порядок эталона: Автомониторинг → Настройки → Стоп-лист.
         item { CollapsibleSection(title = "🛡️ Автомониторинг", initiallyExpanded = false) { StubText() } }
-        item { CollapsibleSection(title = "⚙️ Настройки", initiallyExpanded = false) { StubText() } }
+        item {
+            CollapsibleSection(title = "⚙️ Настройки", initiallyExpanded = false) {
+                SettingsSection(
+                    settings = settings,
+                    onChange = { SettingsStore.update(context, it) },
+                    onReset = { SettingsStore.resetToDefaults(context) },
+                )
+            }
+        }
         item { CollapsibleSection(title = "🚫 Стоп-лист", initiallyExpanded = false) { StubText() } }
 
         // ═══ ФУТЕР ═══
@@ -819,5 +834,175 @@ private fun DetailRow(key: String, value: String) {
     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
         Text("$key:", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodyMedium)
         Text(value, style = MaterialTheme.typography.bodyMedium)
+    }
+}
+
+// ═══════════════════════ НАСТРОЙКИ ═══════════════════════
+
+/**
+ * Содержимое секции «⚙️ Настройки»: все пороги/таймауты из [SettingsStore] единым плотным списком.
+ * Каждая строка валидирует диапазон (не даёт окно 0 / пул 0 / отрицательные); невалидное не сохраняется
+ * и подсвечивается. Изменённое значение помечено дефолтом мелким серым. Внизу — сброс к дефолтам.
+ */
+@Composable
+private fun SettingsSection(
+    settings: AppSettings,
+    onChange: (AppSettings) -> Unit,
+    onReset: () -> Unit,
+) {
+    val d = SettingsStore.DEFAULTS
+    Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        SettingsGroupLabel("Замер скорости")
+        IntSettingRow("Прогрев перед замером", "с", settings.speedWarmupSec, d.speedWarmupSec, 0, 60) {
+            onChange(settings.copy(speedWarmupSec = it))
+        }
+        IntSettingRow("Окно замера", "с", settings.speedWindowSec, d.speedWindowSec, 1, 120) {
+            onChange(settings.copy(speedWindowSec = it))
+        }
+        IntSettingRow("Одновременных замеров (пул)", "", settings.speedPool, d.speedPool, 1, 32) {
+            onChange(settings.copy(speedPool = it))
+        }
+        UrlSettingRow("URL пробника скорости", settings.speedProbeUrl, d.speedProbeUrl) {
+            onChange(settings.copy(speedProbeUrl = it))
+        }
+
+        SettingsGroupLabel("Пинг")
+        IntSettingRow("Таймаут пинга", "мс", settings.pingTimeoutMs, d.pingTimeoutMs, 500, 30_000) {
+            onChange(settings.copy(pingTimeoutMs = it))
+        }
+        IntSettingRow("Одновременных пингов (пул)", "", settings.pingPool, d.pingPool, 1, 32) {
+            onChange(settings.copy(pingPool = it))
+        }
+
+        SettingsGroupLabel("Выбор сервера")
+        DoubleSettingRow("Минимальная полезная скорость", "Мбит/с", settings.minUsableMbps, d.minUsableMbps, 0.0, 100.0) {
+            onChange(settings.copy(minUsableMbps = it))
+        }
+        IntSettingRow("Запас для апгрейда", "%", settings.upgradeMarginPercent, d.upgradeMarginPercent, 0, 100) {
+            onChange(settings.copy(upgradeMarginPercent = it))
+        }
+
+        SettingsGroupLabel("Прочее")
+        BoolSettingRow("Подробные логи", settings.verboseLogs, d.verboseLogs) {
+            onChange(settings.copy(verboseLogs = it))
+        }
+
+        Spacer(Modifier.height(4.dp))
+        OutlinedButton(onClick = onReset, modifier = Modifier.fillMaxWidth()) {
+            Text("Сбросить всё к дефолтам")
+        }
+    }
+}
+
+@Composable
+private fun SettingsGroupLabel(text: String) {
+    Text(
+        text,
+        style = MaterialTheme.typography.titleSmall,
+        fontWeight = FontWeight.Bold,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.padding(top = 6.dp),
+    )
+}
+
+/** Каркас строки: подпись (+ дефолт мелким серым, если изменено) слева, контрол справа. */
+@Composable
+private fun SettingRowScaffold(
+    label: String,
+    unit: String,
+    changed: Boolean,
+    defaultText: String,
+    control: @Composable () -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(if (unit.isEmpty()) label else "$label, $unit", style = MaterialTheme.typography.bodyMedium)
+            if (changed) {
+                Text("деф. $defaultText", style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
+            }
+        }
+        control()
+    }
+}
+
+@Composable
+private fun IntSettingRow(
+    label: String, unit: String, value: Int, default: Int, min: Int, max: Int,
+    onCommit: (Int) -> Unit,
+) {
+    var text by remember(value) { mutableStateOf(value.toString()) }
+    val parsed = text.toIntOrNull()
+    val valid = parsed != null && parsed in min..max
+    SettingRowScaffold(label, unit, changed = value != default, defaultText = default.toString()) {
+        OutlinedTextField(
+            value = text,
+            onValueChange = { t ->
+                text = t
+                t.toIntOrNull()?.let { if (it in min..max) onCommit(it) }   // сохраняем только валидное
+            },
+            isError = !valid,
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.width(110.dp),
+        )
+    }
+}
+
+@Composable
+private fun DoubleSettingRow(
+    label: String, unit: String, value: Double, default: Double, min: Double, max: Double,
+    onCommit: (Double) -> Unit,
+) {
+    var text by remember(value) { mutableStateOf(value.toString()) }
+    val parsed = text.replace(',', '.').toDoubleOrNull()
+    val valid = parsed != null && parsed in min..max
+    SettingRowScaffold(label, unit, changed = value != default, defaultText = default.toString()) {
+        OutlinedTextField(
+            value = text,
+            onValueChange = { t ->
+                text = t
+                t.replace(',', '.').toDoubleOrNull()?.let { if (it in min..max) onCommit(it) }
+            },
+            isError = !valid,
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+            modifier = Modifier.width(110.dp),
+        )
+    }
+}
+
+/** URL — во всю ширину (длинный), валиден если начинается с http(s):// и не пуст. */
+@Composable
+private fun UrlSettingRow(label: String, value: String, default: String, onCommit: (String) -> Unit) {
+    var text by remember(value) { mutableStateOf(value) }
+    val v = text.trim()
+    val valid = v.isNotBlank() && (v.startsWith("http://") || v.startsWith("https://"))
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Text(label, style = MaterialTheme.typography.bodyMedium)
+        if (value != default) {
+            Text("деф. $default", style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
+        }
+        OutlinedTextField(
+            value = text,
+            onValueChange = { t ->
+                text = t
+                val tv = t.trim()
+                if (tv.isNotBlank() && (tv.startsWith("http://") || tv.startsWith("https://"))) onCommit(tv)
+            },
+            isError = !valid,
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+        )
+    }
+}
+
+@Composable
+private fun BoolSettingRow(label: String, value: Boolean, default: Boolean, onCommit: (Boolean) -> Unit) {
+    SettingRowScaffold(label, "", changed = value != default, defaultText = if (default) "вкл" else "выкл") {
+        Switch(checked = value, onCheckedChange = onCommit)
     }
 }
