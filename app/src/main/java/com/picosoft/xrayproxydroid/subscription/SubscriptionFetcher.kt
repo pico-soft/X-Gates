@@ -2,6 +2,7 @@ package com.picosoft.xrayproxydroid.subscription
 
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLConnection
 
 /** Богатый результат загрузки подписки — для точной классификации отказа и диагностики. */
 data class FetchResult(
@@ -28,12 +29,20 @@ object SubscriptionFetcher {
 
     private const val MAX_REDIRECTS = 5
 
-    fun fetch(url: String, userAgent: String, timeoutMs: Int): FetchResult {
+    /**
+     * [open] — как открыть соединение для очередного URL: напрямую (`{ it.openConnection() }`), через
+     * прокси (`{ it.openConnection(proxy) }`) или с привязкой к сети (`{ network.openConnection(it) }`).
+     * Редиректы (в т.ч. http↔https) проходятся тем же способом.
+     */
+    fun fetch(
+        url: String, userAgent: String, timeoutMs: Int,
+        open: (URL) -> URLConnection = { it.openConnection() },
+    ): FetchResult {
         var current = url
         var redirects = 0
         try {
             while (true) {
-                val conn = (URL(current).openConnection() as HttpURLConnection).apply {
+                val conn = (open(URL(current)) as HttpURLConnection).apply {
                     requestMethod = "GET"
                     connectTimeout = timeoutMs
                     readTimeout = timeoutMs

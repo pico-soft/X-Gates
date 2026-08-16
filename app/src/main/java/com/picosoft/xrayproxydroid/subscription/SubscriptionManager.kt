@@ -2,7 +2,10 @@ package com.picosoft.xrayproxydroid.subscription
 
 import android.content.Context
 import android.util.Log
+import com.picosoft.xrayproxydroid.net.CascadeFetch
+import com.picosoft.xrayproxydroid.settings.BlocklistStore
 import com.picosoft.xrayproxydroid.settings.SettingsStore
+import com.picosoft.xrayproxydroid.xray.ServerFilter
 import com.picosoft.xrayproxydroid.xray.link.ParseResult
 import com.picosoft.xrayproxydroid.xray.link.ServerLinkParser
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
@@ -102,6 +105,41 @@ object SubscriptionManager {
         return file.servers.filter { rec -> rec.sourceIds.any { it in enabled } }.map { it.profile }
     }
 
+    /** Сколько серверов ПОЯВИТСЯ, если включить выключенные источники (сейчас скрыты — нет активного источника). */
+    fun serversFromDisabled(context: Context): Int {
+        val file = SubscriptionStore.load(context)
+        val enabled = file.sources.filter { it.enabled }.map { it.id }.toSet()
+        val disabled = file.sources.filterNot { it.enabled }.map { it.id }.toSet()
+        return file.servers.count { rec -> rec.sourceIds.none { it in enabled } && rec.sourceIds.any { it in disabled } }
+    }
+
+    /** Включить ВСЕ выключенные источники (пункт E, по согласию пользователя). Возвращает их id. */
+    fun enableAllDisabled(context: Context): List<String> {
+        val ids = SubscriptionStore.load(context).sources.filterNot { it.enabled }.map { it.id }
+        ids.forEach { setEnabled(context, it, true) }
+        return ids
+    }
+
+    /**
+     * Серверы, ПОДТВЕРЖДЁННО работавшие за последние [withinHours] часов (speedMbps>0 и свежий
+     * speedTestedTs), по убыванию известной скорости, через ЕДИНЫЙ предикат (протокол + стоп-лист).
+     * Для ступени 5 каскада ([CascadeFetch]) — обновить подписку через temp-инстанс, когда прямой путь
+     * заблокирован, а активный туннель упал.
+     */
+    fun recentWorkingServers(context: Context, withinHours: Int = 24): List<ServerProfile> {
+        val settings = SettingsStore.current()
+        val bl = BlocklistStore.current()
+        val cutoff = System.currentTimeMillis() - withinHours * 3600_000L
+        return allServers(context)
+            .filter { (it.speedMbps ?: 0.0) > 0.0 }
+            .filter { p -> parseTs(p.speedTestedTs)?.let { it >= cutoff } ?: false }
+            .filter { ServerFilter.protocolAllowed(it, settings) && !ServerFilter.isBlocked(it, bl) }
+            .sortedByDescending { it.speedMbps ?: 0.0 }
+    }
+
+    private fun parseTs(s: String?): Long? =
+        if (s == null) null else runCatching { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).parse(s)?.time }.getOrNull()
+
     // ─────────────────────────── применение замеров ───────────────────────────
 
     /** Обновить pingMs (ключ→мс) в реестре и сохранить ОДИН раз. */
@@ -197,28 +235,71 @@ object SubscriptionManager {
         if (src.url.isBlank()) return RefreshSummary(ok = false, error = "локальный источник — нечего скачивать")
 
         val url = normalizeUrl(src.url)
-        log("── refresh «${src.name}» url=${src.url} → norm=$url UA=${settings.subUserAgent} timeout=${settings.subTimeoutSec}s")
-        val res = SubscriptionFetcher.fetch(url, settings.subUserAgent, settings.subTimeoutSec * 1000)
-        log("  http=${res.httpCode} finalUrl=${res.finalUrl} type=${res.contentType} len=${res.contentLength} bytes=${res.bodyBytes} exc=${res.exceptionClass}")
-        log("  body[0..200]=${res.body.take(200).replace("\n", "⏎")}")
+        // КАСКАД (Промпт 51): напрямую → через свой активный SOCKS (если поднят). Прямой путь часто
+        // заблокирован — именно ради этих условий приложение и существует. Таймауты ступеней раздельные
+        // (прокси-ступень медленнее, +10с), плюс общий предел. «Скачано, но ссылок нет» = неудача ступени
+        // (панель могла отдать заглушку блокировщика) → пробуем следующую.
+        val directTimeout = settings.subTimeoutSec * 1000
+        val proxyTimeout = settings.subTimeoutSec * 1000 + 10_000
+        val totalTimeout = directTimeout + proxyTimeout + 5_000
+        log("── refresh «${src.name}» url=$url UA=${settings.subUserAgent} timeout=${settings.subTimeoutSec}s (каскад)")
+        val cascade = CascadeFetch.fetch(
+            context, url, settings.subUserAgent, directTimeout, proxyTimeout, totalTimeout,
+            acceptBody = { it.ok && hasSupportedLinks(it.body) },
+        )
 
-        val fetchDetail = buildString {
-            append("URL: ${res.finalUrl}\n")
-            append("HTTP: ${if (res.httpCode >= 0) res.httpCode else "—"}")
-            res.contentType?.let { append(" · $it") }
-            append("\nБайт: ${res.bodyBytes}")
-            res.exceptionClass?.let { append("\nИсключение: $it: ${res.errorMessage}") }
-            append("\nТело: ${res.body.take(200).replace("\n", " ")}")
+        // Диагностика по КАЖДОЙ ступени (типизация ошибок из Промпта 25 сохранена). Пропущенные ступени
+        // помечаем причиной (a.note), не считая неудачей.
+        fun stageLabel(a: com.picosoft.xrayproxydroid.net.CascadeAttempt): String {
+            val suffix = if (a.note.isNotEmpty()) " «${a.note}»" else ""
+            return a.stage.label + suffix
+        }
+        val stagesDetail = cascade.attempts.joinToString("\n") { a ->
+            val r = a.result
+            "• ${stageLabel(a)}: " + when {
+                a.skipped -> "пропущено (${a.note})"
+                r == null -> "нет ответа"
+                a.accepted -> "OK (HTTP ${r.httpCode}, ${r.bodyBytes} б)"
+                !r.ok -> classifyFetchFailure(r)
+                else -> "скачано ${r.bodyBytes} б, ссылок не найдено (похоже на ${sniff(r.body)})"
+            }
         }
 
-        // Классификация СЕТЕВОГО/HTTP отказа (до разбора тела).
-        if (!res.ok) {
-            val err = classifyFetchFailure(res)
-            setStatus(context, id, ok = false, error = err, detail = fetchDetail)
-            log("  → ОТКАЗ: $err")
+        if (!cascade.ok) {
+            // Итог ПО КАЖДОЙ ступени (кроме пропущенных по неприменимости — они отчёт не засоряют).
+            val err = "Не скачалось. " + cascade.attempts.filterNot { it.skipped }.joinToString("; ") { a ->
+                val r = a.result
+                a.stage.label + ": " + when {
+                    r == null -> "нет ответа"
+                    !r.ok -> classifyFetchFailure(r)
+                    else -> "ссылок не найдено (${sniff(r.body)})"
+                }
+            }.ifBlank { "все применимые ступени пропущены (нет прокси/сети/кандидатов)" }
+            setStatus(context, id, ok = false, error = err, detail = stagesDetail)
+            log("  → ОТКАЗ (все ступени): $err")
             return RefreshSummary(ok = false, error = err)
         }
-        return importInto(context, id, res.body, fetchDetail)
+
+        val res = cascade.result!!
+        val via = cascade.stage!!.label
+        log("  OK ступенью «$via» http=${res.httpCode} bytes=${res.bodyBytes}")
+        val detail = buildString {
+            append("Загружено: $via\n")                 // КАКОЙ ступенью удалось (Промпт 51.C)
+            append("URL: ${res.finalUrl}\n")
+            append("HTTP: ${res.httpCode}")
+            res.contentType?.let { append(" · $it") }
+            append("\nБайт: ${res.bodyBytes}\n\nСтупени:\n$stagesDetail")
+        }
+        return importInto(context, id, res.body, detail)
+    }
+
+    /** Есть ли в теле хотя бы одна распознаваемая ссылка (для предиката каскада «ответ пригоден»). */
+    private fun hasSupportedLinks(body: String): Boolean {
+        if (body.isBlank()) return false
+        for (line in SubscriptionDecoder.decode(body)) {
+            if (ServerLinkParser.parse(line) is ParseResult.Supported) return true
+        }
+        return false
     }
 
     /** Классификация не-успешной загрузки в русский текст (сеть/таймаут/cleartext/HTTP-код/пусто). */
