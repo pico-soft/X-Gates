@@ -290,11 +290,15 @@ object ServerSpeedTester {
 
         for (p in servers) {
             executor.execute {
-                if (cancelled.get()) return@execute
-                val mbps = measureSpeed(appCtx, p, warmupMs, measureMs)
-                if (cancelled.get()) return@execute
-                onResult(p, mbps)
-                onProgress(done.incrementAndGet(), total)
+                try {
+                    if (cancelled.get()) return@execute
+                    val mbps = measureSpeed(appCtx, p, warmupMs, measureMs)
+                    if (cancelled.get()) return@execute
+                    onResult(p, mbps)
+                    onProgress(done.incrementAndGet(), total)
+                } catch (e: Exception) {
+                    Log.w(TAG, "задача замера упала (проглочено): ${e.message}")
+                }
             }
         }
         executor.shutdown()   // новых не принимаем; поданные доработают

@@ -17,6 +17,7 @@ import com.picosoft.xrayproxydroid.settings.SettingsStore
 import com.picosoft.xrayproxydroid.traffic.TrafficTracker
 import com.picosoft.xrayproxydroid.xray.XrayConfig
 import com.picosoft.xrayproxydroid.xray.XrayController
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -40,7 +41,10 @@ class XrayProxyService : Service() {
     @Volatile private var polling = false
 
     // Корутина автомониторинга. Живёт ТОЛЬКО когда монитор включён И туннель активен (реактивно).
-    private val monitorScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    // Обработчик глушит НЕОБРАБОТАННЫЕ исключения фоновых корутин (монитор/обход/каскад) — фон не должен
+    // ронять процесс (Промпт 66.B). SupervisorJob — падение одной не гасит остальные.
+    private val bgErrors = CoroutineExceptionHandler { _, e -> Log.w("XrayProxyService", "фоновая корутина упала (проглочено): ${e.message}", e) }
+    private val monitorScope = CoroutineScope(Dispatchers.IO + SupervisorJob() + bgErrors)
     private var monitorJob: Job? = null
 
     // Подписка на системную сеть: появление сети мгновенно будит монитор из паузы «нет интернета».
@@ -112,6 +116,19 @@ class XrayProxyService : Service() {
      */
     @Synchronized
     private fun applyVpnBypass() {
+        try {
+            applyVpnBypassUnsafe()
+        } catch (e: Exception) {
+            // Обход — удобство, а не условие работы: любая ошибка → отказ от обхода, снять привязку, жить.
+            Log.w("XrayProxyService", "обход VPN недоступен (проглочено): ${e.message}", e)
+            runCatching { getSystemService(ConnectivityManager::class.java)?.bindProcessToNetwork(null) }
+            ourBinding = null
+            runCatching { SystemVpnState.update(VpnRelation.NONE, bypassed = false, bypassFailed = false) }
+        }
+    }
+
+    @Synchronized
+    private fun applyVpnBypassUnsafe() {
         val cm = getSystemService(ConnectivityManager::class.java) ?: return
         val relation = detectRelation(cm)   // БЕЗ глобального снятия привязки
 
@@ -189,6 +206,8 @@ class XrayProxyService : Service() {
         bypassRetryAfterMs = 0L   // ручной (пере)запуск = действие пользователя → снять троттлинг отката
 
         Thread {
+          // Весь поток старта под перехватом: любая ошибка (в т.ч. сетевого API) → сообщение + стоп, НЕ падение.
+          try {
             // Привязку МИМО чужого VPN ставим ДО старта ядра (его первый дозвон уже мимо VPN). На фоне,
             // т.к. applyVpnBypass делает блокирующую пробу связности (нельзя на main). В INSIDE это ~2.5с —
             // объясняем состоянием (в EXCLUDED/NONE пробы нет, задержки нет).
@@ -224,6 +243,11 @@ class XrayProxyService : Service() {
                     stopSelfAndForeground()
                 }
             )
+          } catch (e: Exception) {
+            Log.w("XrayProxyService", "старт упал (проглочено): ${e.message}", e)
+            runCatching { ProxyState.update(running = false, label = label, serverKey = serverKey, message = "ОШИБКА старта: ${e.message}") }
+            runCatching { stopSelfAndForeground() }
+          }
         }.start()
     }
 
@@ -264,11 +288,14 @@ class XrayProxyService : Service() {
             while (polling && XrayController.isRunning) {
                 try { Thread.sleep(POLL_MS) } catch (e: InterruptedException) { break }
                 if (!polling) break
-                XrayController.queryTunnelDelta()?.let { (rx, tx) ->
-                    // ДИАГНОСТИКА reset-семантики queryStats: два опроса подряд без трафика между ними
-                    // должны дать нулевую вторую дельту. Если повторяет первую — счётчик НЕ сбрасывается.
-                    if (SettingsStore.current().verboseLogs) Log.i("TrafficPoll", "delta ↓$rx ↑$tx (байт с прошлого опроса)")
-                    TrafficTracker.addTunnel(rx, tx)
+                // Ошибка одного опроса не должна ронять поток/процесс — пропускаем тик.
+                try {
+                    XrayController.queryTunnelDelta()?.let { (rx, tx) ->
+                        if (SettingsStore.current().verboseLogs) Log.i("TrafficPoll", "delta ↓$rx ↑$tx (байт с прошлого опроса)")
+                        TrafficTracker.addTunnel(rx, tx)
+                    }
+                } catch (e: Exception) {
+                    Log.w("TrafficPoll", "опрос трафика упал (проглочено): ${e.message}")
                 }
             }
         }.start()

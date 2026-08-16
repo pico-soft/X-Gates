@@ -72,11 +72,15 @@ object ServerTester {
 
         for (p in servers) {
             pool.execute {
-                if (cancelled.get()) return@execute
-                val ms = ping(appCtx, p)
-                if (cancelled.get()) return@execute
-                onResult(p, ms)
-                onProgress(done.incrementAndGet(), total)
+                try {
+                    if (cancelled.get()) return@execute
+                    val ms = ping(appCtx, p)
+                    if (cancelled.get()) return@execute
+                    onResult(p, ms)
+                    onProgress(done.incrementAndGet(), total)
+                } catch (e: Exception) {
+                    android.util.Log.w("ServerTester", "задача пинга упала (проглочено): ${e.message}")
+                }
             }
         }
         pool.shutdown() // новых не принимаем; уже поданные выполняются

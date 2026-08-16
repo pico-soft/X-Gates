@@ -4,6 +4,11 @@
 
     <!-- Required for xray to create/listen on TCP sockets (inet GID); without it socket() → EPERM -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- ConnectivityManager (сосуществование с чужим VPN: getActiveNetwork / getNetworkCapabilities /
+         allNetworks / registerNetworkCallback). Обычное разрешение, выдаётся при установке. Без него —
+         SecurityException в фоне убивает процесс при старте (Промпт 66). bindProcessToNetwork/getDefaultProxy
+         разрешений не требуют. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <!-- Foreground service, чтобы xray жил в фоне (non-VPN, тип specialUse) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
