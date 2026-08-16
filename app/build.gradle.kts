@@ -15,7 +15,8 @@ android {
         minSdk = 24
         targetSdk = 37
         versionCode = 1
-        versionName = "1.0"
+        // Бампим по +0.01 до принципиальных изменений (напр. sing-box → 2.0). versionCode ++ на релиз.
+        versionName = "0.1 beta"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -40,6 +41,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true   // для BuildConfig.VERSION_NAME в футере
     }
 
     // libv2ray.aar лежит в app/libs; забираем и его нативные .so оттуда.

@@ -116,7 +116,10 @@ private val BOTTOM_BAR_HEIGHT = 42.dp
 /** Корень с компактной нижней навигацией: «Главная» (рабочий экран) + «Настройки» (что настраивают). */
 @Composable
 private fun AppRoot() {
-    var tab by rememberSaveable { mutableStateOf(0) }
+    // tab — plain remember (НЕ saveable): переживает переключение вкладок и рекомпозиции, но при
+    // пересоздании Activity (блокировка экрана/память во время долгого теста) возвращается на ГЛАВНУЮ —
+    // рабочий экран, чтобы приложение НЕ оказывалось само на «Настройки». Раскрытие секций — saveable.
+    var tab by remember { mutableStateOf(0) }
     val stateHolder = rememberSaveableStateHolder()   // сохраняет состояние вкладки (раскрытые секции) при переключении
     Scaffold(
         modifier = Modifier.fillMaxSize(),
@@ -697,7 +700,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         // ═══ ФУТЕР ═══
         item {
             Text(
-                "pico-soft/XrayProxyDroid",
+                "pico-soft/XrayProxyDroid · v${BuildConfig.VERSION_NAME}",
                 style = MaterialTheme.typography.bodySmall,
                 color = Color(0xFF9E9E9E),
                 textAlign = TextAlign.Center,
@@ -895,7 +898,7 @@ private fun ActionsBar(
         if (fullTesting) {
             Button(onClick = onCancelFull) { Text("Прервать") }
         } else {
-            Button(onClick = onFullTest) { Text("🔍 Полный тест") }
+            Button(onClick = onFullTest) { Text("Подключиться к быстрейшему серверу") }
         }
         OutlinedButton(onClick = onStop, enabled = running) { Text("■ Стоп") }
         if (refreshingSubs) {
