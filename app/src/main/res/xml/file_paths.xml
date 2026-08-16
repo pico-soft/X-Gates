@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Приватный каталог скачанных APK обновления (filesDir/updates) для FileProvider (Промпт 70). -->
+<paths>
+    <files-path
+        name="updates"
+        path="updates/" />
+</paths>

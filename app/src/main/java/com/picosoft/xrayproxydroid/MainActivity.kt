@@ -1,7 +1,9 @@
 package com.picosoft.xrayproxydroid
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
@@ -89,6 +91,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -116,6 +119,10 @@ import com.picosoft.xrayproxydroid.subscription.SubscriptionManager
 import com.picosoft.xrayproxydroid.traffic.DayBucket
 import com.picosoft.xrayproxydroid.traffic.TrafficTracker
 import com.picosoft.xrayproxydroid.ui.TestProgress
+import com.picosoft.xrayproxydroid.update.UpdateCheckResult
+import com.picosoft.xrayproxydroid.update.UpdateChecker
+import com.picosoft.xrayproxydroid.update.UpdateInstaller
+import com.picosoft.xrayproxydroid.update.UpdateStore
 import com.picosoft.xrayproxydroid.ui.theme.XrayProxyDroidTheme
 import com.picosoft.xrayproxydroid.xray.ExternalIpChecker
 import com.picosoft.xrayproxydroid.xray.FullTestRunner
@@ -133,6 +140,16 @@ class MainActivity : ComponentActivity() {
         MonitorLog.init(applicationContext)      // журнал автомониторинга (переживает перезапуск)
         SubscriptionManager.init(applicationContext)   // миграция старой подписки в мультиподписки (однократно)
         TrafficTracker.init(applicationContext)  // загрузить дневные корзины трафика
+        UpdateStore.init(applicationContext)     // результат последней проверки обновления + время
+        // Авто-проверка обновления при холодном старте, но не чаще раза в сутки (несколько КБ через каскад;
+        // САМ APK без согласия не качаем). Метаданные — в поток «Тест». Ошибка не мешает запуску.
+        run {
+            val app = applicationContext
+            if (UpdateStore.dueForAutoCheck(System.currentTimeMillis())) Thread {
+                val r = runCatching { UpdateChecker.check(app) }.getOrNull() ?: return@Thread
+                UpdateStore.apply(app, r, System.currentTimeMillis())
+            }.start()
+        }
         enableEdgeToEdge()
         setContent {
             XrayProxyDroidTheme {
@@ -149,10 +166,11 @@ private val BOTTOM_BAR_HEIGHT = 42.dp
 /** Корень с компактной нижней навигацией: «Главная» (рабочий экран) + «Настройки» (что настраивают). */
 @Composable
 private fun AppRoot() {
-    // tab — plain remember (НЕ saveable): переживает переключение вкладок и рекомпозиции, но при
-    // пересоздании Activity (блокировка экрана/память во время долгого теста) возвращается на ГЛАВНУЮ —
-    // рабочий экран, чтобы приложение НЕ оказывалось само на «Настройки». Раскрытие секций — saveable.
-    var tab by remember { mutableStateOf(0) }
+    // tab — rememberSaveable: приложение НИКОГДА не переключает вкладку само. Переживает и рекомпозиции,
+    // и пересоздание Activity (поворот/тёмная тема/возврат из системного экрана/память во время долгого
+    // теста) — остаётся ровно там, где пользователь. Раньше был plain remember и на пересоздании прыгал
+    // на «Главную» (это тоже самопроизвольная смена вкладки — убрано).
+    var tab by rememberSaveable { mutableStateOf(0) }
     val stateHolder = rememberSaveableStateHolder()   // сохраняет состояние вкладки (раскрытые секции) при переключении
     Scaffold(
         modifier = Modifier.fillMaxSize(),
@@ -214,6 +232,7 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
     val heartbeat by MonitorStatus.state.collectAsState()
     val vpnStatus by SystemVpnState.state.collectAsState()   // сообщение о системном VPN — здесь, на цветном поле
     // Состояние раскрытия — на уровне вкладки (стабильное позиционное scoping), все свёрнуты по умолчанию.
+    var aboutExpanded by rememberSaveable { mutableStateOf(false) }
     var settingsExpanded by rememberSaveable { mutableStateOf(false) }
     var blocklistExpanded by rememberSaveable { mutableStateOf(false) }
     var monitorExpanded by rememberSaveable { mutableStateOf(false) }
@@ -228,7 +247,12 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
             item { VpnStatusCard(vpnStatus, onRetry = { XrayProxyService.retryVpnBypass(context) }) }
         }
         item {
-            CollapsibleSection("⚙️ Настройки", settingsExpanded, { settingsExpanded = !settingsExpanded }) {
+            CollapsibleSection("О приложении", aboutExpanded, { aboutExpanded = !aboutExpanded }, icon = UiIcon.INFO) {
+                AboutSection()
+            }
+        }
+        item {
+            CollapsibleSection("Настройки", settingsExpanded, { settingsExpanded = !settingsExpanded }, icon = UiIcon.GEAR) {
                 SettingsSection(
                     settings = settings,
                     protocolCounts = protocolCounts,
@@ -238,7 +262,7 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
             }
         }
         item {
-            CollapsibleSection("🚫 Стоп-лист", blocklistExpanded, { blocklistExpanded = !blocklistExpanded }) {
+            CollapsibleSection("Стоп-лист", blocklistExpanded, { blocklistExpanded = !blocklistExpanded }, icon = UiIcon.BLOCK) {
                 BlocklistSection(
                     blocklist = blocklist,
                     serverNames = serverNames,
@@ -249,7 +273,7 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
             }
         }
         item {
-            CollapsibleSection("🛡️ Автомониторинг", monitorExpanded, { monitorExpanded = !monitorExpanded }) {
+            CollapsibleSection("Автомониторинг", monitorExpanded, { monitorExpanded = !monitorExpanded }, icon = UiIcon.SHIELD) {
                 MonitorSection(
                     settings = settings,
                     heartbeat = heartbeat,
@@ -260,8 +284,10 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
             }
         }
         item {
-            CollapsibleSection("Трафик", trafficExpanded, { trafficExpanded = !trafficExpanded }) { TrafficSection() }
+            CollapsibleSection("Трафик", trafficExpanded, { trafficExpanded = !trafficExpanded }, icon = UiIcon.TRAFFIC) { TrafficSection() }
         }
+        // Проверка обновления — на виду (не в подменю), ниже «Трафик».
+        item { UpdateCheckSection() }
     }
 }
 
@@ -336,7 +362,7 @@ private fun SubscriptionsScreen(modifier: Modifier = Modifier) {
         item { Text("Подписки (${sources.size})", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold) }
         item {
             OutlinedButton(onClick = { onRefreshAll() }, enabled = !refreshing, modifier = Modifier.fillMaxWidth()) {
-                Text(if (refreshing) "Обновление…" else "↻ Обновить все")
+                if (refreshing) Text("Обновление…") else ButtonLabel(UiIcon.REFRESH, "Обновить все")
             }
         }
         item {
@@ -464,6 +490,110 @@ private fun NavIcon(index: Int, color: Color, size: androidx.compose.ui.unit.Dp)
             }
         }
     }
+}
+
+/**
+ * Единый набор ПЛОСКИХ монохромных line-иконок (тот же язык, что у нижней плашки [NavIcon]): рисуются
+ * Canvas'ом, тонируются переданным цветом (по умолчанию — цвет контента, т.е. подхватывают onPrimary в
+ * заливочной кнопке, primary в OutlinedButton, primary в заголовке секции). Заменяют разнобой эмодзи
+ * (ℹ️⚙️🚫🛡️📄) и глифов-шрифта (▶■↻✎) — чтобы ВСЕ иконки были единообразны, как на нижней плашке.
+ * Инлайновые статус-маркеры таблицы (●○✗) и каретки ▸▾ — это не «иконки», их не трогаем.
+ */
+private enum class UiIcon { INFO, GEAR, BLOCK, SHIELD, TRAFFIC, DOC, REFRESH, PLAY, STOP, PENCIL, WARN }
+
+@Composable
+private fun FlatIcon(
+    icon: UiIcon,
+    size: androidx.compose.ui.unit.Dp = 16.dp,
+    color: Color = androidx.compose.material3.LocalContentColor.current,
+) {
+    Canvas(Modifier.size(size)) {
+        val s = this.size.minDimension
+        val sw = s * 0.10f
+        val stroke = Stroke(width = sw, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        val c = Offset(s / 2f, s / 2f)
+        when (icon) {
+            UiIcon.INFO -> {   // кружок + точка + ножка «i»
+                drawCircle(color, s * 0.36f, c, style = stroke)
+                drawCircle(color, sw * 0.6f, Offset(s * 0.5f, s * 0.30f))
+                drawLine(color, Offset(s * 0.5f, s * 0.44f), Offset(s * 0.5f, s * 0.72f), sw)
+            }
+            UiIcon.GEAR -> {   // кольцо + отверстие + 8 зубьев (как у нижней плашки)
+                val r = s * 0.25f; val tooth = s * 0.10f
+                drawCircle(color, r, c, style = stroke)
+                drawCircle(color, r * 0.42f, c, style = stroke)
+                for (k in 0 until 8) {
+                    val a = Math.toRadians(k * 45.0); val dx = cos(a).toFloat(); val dy = sin(a).toFloat()
+                    drawLine(color, Offset(c.x + dx * r, c.y + dy * r), Offset(c.x + dx * (r + tooth), c.y + dy * (r + tooth)), sw * 1.3f)
+                }
+            }
+            UiIcon.BLOCK -> {   // «кирпич»: кольцо + диагональная черта
+                val r = s * 0.34f; val d = r * 0.7071f
+                drawCircle(color, r, c, style = stroke)
+                drawLine(color, Offset(c.x - d, c.y - d), Offset(c.x + d, c.y + d), sw)
+            }
+            UiIcon.SHIELD -> {   // щит (контур)
+                drawPath(Path().apply {
+                    moveTo(s * 0.5f, s * 0.14f)
+                    lineTo(s * 0.82f, s * 0.26f)
+                    lineTo(s * 0.82f, s * 0.52f)
+                    quadraticTo(s * 0.82f, s * 0.74f, s * 0.5f, s * 0.87f)
+                    quadraticTo(s * 0.18f, s * 0.74f, s * 0.18f, s * 0.52f)
+                    lineTo(s * 0.18f, s * 0.26f)
+                    close()
+                }, color, style = stroke)
+            }
+            UiIcon.TRAFFIC -> {   // две стрелки ↓↑ (приём/отдача туннеля)
+                val xL = s * 0.36f; val xR = s * 0.64f; val top = s * 0.20f; val bot = s * 0.80f
+                drawLine(color, Offset(xL, top), Offset(xL, bot), sw)
+                drawPath(Path().apply { moveTo(xL - s * 0.11f, bot - s * 0.15f); lineTo(xL, bot); lineTo(xL + s * 0.11f, bot - s * 0.15f) }, color, style = stroke)
+                drawLine(color, Offset(xR, top), Offset(xR, bot), sw)
+                drawPath(Path().apply { moveTo(xR - s * 0.11f, top + s * 0.15f); lineTo(xR, top); lineTo(xR + s * 0.11f, top + s * 0.15f) }, color, style = stroke)
+            }
+            UiIcon.DOC -> {   // лист с загнутым уголком
+                drawPath(Path().apply {
+                    moveTo(s * 0.28f, s * 0.14f); lineTo(s * 0.58f, s * 0.14f); lineTo(s * 0.72f, s * 0.28f)
+                    lineTo(s * 0.72f, s * 0.86f); lineTo(s * 0.28f, s * 0.86f); close()
+                }, color, style = stroke)
+                drawPath(Path().apply { moveTo(s * 0.58f, s * 0.14f); lineTo(s * 0.58f, s * 0.28f); lineTo(s * 0.72f, s * 0.28f) }, color, style = stroke)
+            }
+            UiIcon.REFRESH -> {   // круговая стрелка
+                drawArc(color, startAngle = 55f, sweepAngle = 280f, useCenter = false,
+                    topLeft = Offset(s * 0.22f, s * 0.22f), size = Size(s * 0.56f, s * 0.56f), style = stroke)
+                val a = Math.toRadians(55.0); val r = s * 0.28f
+                val p = Offset(c.x + r * cos(a).toFloat(), c.y + r * sin(a).toFloat())
+                drawPath(Path().apply { moveTo(p.x - s * 0.15f, p.y - s * 0.02f); lineTo(p.x, p.y); lineTo(p.x + s * 0.02f, p.y - s * 0.16f) }, color, style = stroke)
+            }
+            UiIcon.PLAY -> {   // залитый треугольник
+                drawPath(Path().apply { moveTo(s * 0.34f, s * 0.24f); lineTo(s * 0.34f, s * 0.76f); lineTo(s * 0.78f, s * 0.5f); close() }, color)
+            }
+            UiIcon.STOP -> {   // залитый квадрат
+                drawRoundRect(color, topLeft = Offset(s * 0.30f, s * 0.30f), size = Size(s * 0.40f, s * 0.40f),
+                    cornerRadius = CornerRadius(s * 0.06f, s * 0.06f))
+            }
+            UiIcon.PENCIL -> {   // карандаш по диагонали
+                drawLine(color, Offset(s * 0.30f, s * 0.70f), Offset(s * 0.66f, s * 0.34f), sw * 1.4f)
+                drawLine(color, Offset(s * 0.66f, s * 0.34f), Offset(s * 0.76f, s * 0.44f), sw * 1.4f)
+                drawLine(color, Offset(s * 0.76f, s * 0.44f), Offset(s * 0.40f, s * 0.80f), sw * 1.4f)
+                drawPath(Path().apply { moveTo(s * 0.24f, s * 0.80f); lineTo(s * 0.30f, s * 0.64f); lineTo(s * 0.40f, s * 0.74f); close() }, color)
+            }
+            UiIcon.WARN -> {   // треугольник + восклицательный знак
+                drawPath(Path().apply {
+                    moveTo(s * 0.5f, s * 0.16f); lineTo(s * 0.86f, s * 0.80f); lineTo(s * 0.14f, s * 0.80f); close()
+                }, color, style = stroke)
+                drawLine(color, Offset(s * 0.5f, s * 0.42f), Offset(s * 0.5f, s * 0.62f), sw)
+                drawCircle(color, sw * 0.6f, Offset(s * 0.5f, s * 0.72f))
+            }
+        }
+    }
+}
+
+/** Метка кнопки: плоская иконка + текст (внутри RowScope кнопки), единый стиль во всех кнопках. */
+@Composable
+private fun ButtonLabel(icon: UiIcon, text: String) {
+    FlatIcon(icon, size = 16.dp)
+    Spacer(Modifier.width(6.dp))
+    Text(text)
 }
 
 private fun serverLabel(p: ServerProfile, bl: Blocklist): String =
@@ -861,7 +991,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         if (alive.isEmpty()) item {
             Box(Modifier.fillMaxWidth().background(liveBg).padding(horizontal = 12.dp, vertical = 8.dp)) {
                 Text(
-                    if (servers.isEmpty()) "Список пуст — обновите подписку." else "Запусти тест (🔍)",
+                    if (servers.isEmpty()) "Список пуст — обновите подписку." else "Запусти тест кнопкой «Самый быстрый».",
                     style = MaterialTheme.typography.bodyMedium, color = Color(0xFF9E9E9E),
                 )
             }
@@ -1062,14 +1192,20 @@ private fun StatusBox(
         if (running) {
             // Активный сервер попал под стоп-лист — туннель не рвём молча, помечаем и предлагаем переключиться.
             if (blocked) {
-                Text(
-                    "🚫 активный сервер в стоп-листе — нажмите «▶ Самый быстрый»",
-                    style = MaterialTheme.typography.bodySmall, color = fg, fontWeight = FontWeight.Bold,
-                )
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.Top) {
+                    FlatIcon(UiIcon.BLOCK, size = 14.dp, color = fg)
+                    Text(
+                        "активный сервер в стоп-листе — нажмите «Самый быстрый»",
+                        style = MaterialTheme.typography.bodySmall, color = fg, fontWeight = FontWeight.Bold,
+                    )
+                }
             }
             // Активный сервер скрыт фильтром протоколов — туннель не рвём, но помечаем.
             if (hidden) {
-                Text("⚠ протокол скрыт настройками", style = MaterialTheme.typography.bodySmall, color = fg, fontWeight = FontWeight.Bold)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    FlatIcon(UiIcon.WARN, size = 14.dp, color = fg)
+                    Text("протокол скрыт настройками", style = MaterialTheme.typography.bodySmall, color = fg, fontWeight = FontWeight.Bold)
+                }
             }
             // Сообщение о системном VPN переехало на вкладку «Настройки» ([VpnStatusCard]).
             // Мелко: протокол · network · security активного сервера (вместо портов).
@@ -1103,22 +1239,22 @@ private fun StatusBox(
  */
 @Composable
 private fun VpnStatusCard(vpn: VpnStatus, onRetry: () -> Unit) {
-    val text: String; val bg: Color; val fg: Color
+    val text: String; val bg: Color; val fg: Color; val icon: UiIcon
     when {
         vpn.relation == VpnRelation.EXCLUDED -> {
-            text = "🛡 системный VPN активен, но нас не касается (мы вне его)"; bg = Color(0xFF1B5E20); fg = Color(0xFFA5D6A7)
+            icon = UiIcon.SHIELD; text = "системный VPN активен, но нас не касается (мы вне его)"; bg = Color(0xFF1B5E20); fg = Color(0xFFA5D6A7)
         }
         vpn.relation == VpnRelation.INSIDE && vpn.bypassed -> {
-            text = "🛡 системный VPN активен — идём мимо него"; bg = Color(0xFF1B5E20); fg = Color(0xFFA5D6A7)
+            icon = UiIcon.SHIELD; text = "системный VPN активен — идём мимо него"; bg = Color(0xFF1B5E20); fg = Color(0xFFA5D6A7)
         }
         vpn.relation == VpnRelation.INSIDE && vpn.noExit -> {
-            text = "⛔ системный VPN не пропускает трафик, а обход запрещён его настройками (lockdown) — наружу не выходит никто"; bg = Color(0xFF7F1D1D); fg = Color(0xFFFFCDD2)
+            icon = UiIcon.BLOCK; text = "системный VPN не пропускает трафик, а обход запрещён его настройками (lockdown) — наружу не выходит никто"; bg = Color(0xFF7F1D1D); fg = Color(0xFFFFCDD2)
         }
         vpn.relation == VpnRelation.INSIDE && vpn.bypassFailed -> {
-            text = "⚠ обход не удался (lockdown) — идём ЧЕРЕЗ системный VPN, замер = его канал"; bg = Color(0xFF6D4C00); fg = Color(0xFFFFE082)
+            icon = UiIcon.WARN; text = "обход не удался (lockdown) — идём ЧЕРЕЗ системный VPN, замер = его канал"; bg = Color(0xFF6D4C00); fg = Color(0xFFFFE082)
         }
         vpn.relation == VpnRelation.INSIDE -> {
-            text = "⚠ системный VPN активен — трафик и замеры идут ЧЕРЕЗ него (двойной туннель, замер = канал VPN)"; bg = Color(0xFF6D4C00); fg = Color(0xFFFFE082)
+            icon = UiIcon.WARN; text = "системный VPN активен — трафик и замеры идут ЧЕРЕЗ него (двойной туннель, замер = канал VPN)"; bg = Color(0xFF6D4C00); fg = Color(0xFFFFE082)
         }
         else -> return   // NONE — не показываем (гейт в вызывающем)
     }
@@ -1126,13 +1262,18 @@ private fun VpnStatusCard(vpn: VpnStatus, onRetry: () -> Unit) {
         modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(bg).padding(horizontal = 14.dp, vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        Text(text, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold, color = fg)
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.Top) {
+            FlatIcon(icon, size = 16.dp, color = fg)
+            Text(text, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold, color = fg)
+        }
         if (vpn.bypassFailed || vpn.noExit) {
-            Text(
-                "↻ Повторить обход",
-                style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold, color = fg,
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.clip(RoundedCornerShape(4.dp)).clickable { onRetry() }.padding(vertical = 2.dp),
-            )
+            ) {
+                FlatIcon(UiIcon.REFRESH, size = 14.dp, color = fg)
+                Text("Повторить обход", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold, color = fg)
+            }
         }
     }
 }
@@ -1158,13 +1299,13 @@ private fun ActionsBar(
         if (fullTesting) {
             Button(onClick = onCancelFull) { Text("Прервать") }
         } else {
-            Button(onClick = onFullTest) { Text("▶ Самый быстрый") }
+            Button(onClick = onFullTest) { ButtonLabel(UiIcon.PLAY, "Самый быстрый") }
         }
-        OutlinedButton(onClick = onStop, enabled = running) { Text("■ Стоп") }
+        OutlinedButton(onClick = onStop, enabled = running) { ButtonLabel(UiIcon.STOP, "Стоп") }
         if (refreshingSubs) {
-            OutlinedButton(onClick = onCancelRefreshSubs) { Text("⏹ Обновление") }
+            OutlinedButton(onClick = onCancelRefreshSubs) { ButtonLabel(UiIcon.STOP, "Обновление") }
         } else {
-            OutlinedButton(onClick = onRefreshSubs) { Text("↻ Подписки") }
+            OutlinedButton(onClick = onRefreshSubs) { ButtonLabel(UiIcon.REFRESH, "Подписки") }
         }
     }
 }
@@ -1324,6 +1465,7 @@ private fun CollapsibleSection(
     title: String,
     expanded: Boolean,
     onToggle: () -> Unit,
+    icon: UiIcon? = null,
     content: @Composable () -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxWidth()) {
@@ -1337,6 +1479,7 @@ private fun CollapsibleSection(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Text(if (expanded) "▾" else "▸", style = MaterialTheme.typography.titleMedium)
+            if (icon != null) FlatIcon(icon, size = 18.dp, color = MaterialTheme.colorScheme.primary)
             Text(
                 title,
                 style = MaterialTheme.typography.titleMedium,
@@ -1406,7 +1549,7 @@ private fun ServerDetailDialog(
                 Spacer(Modifier.height(8.dp))
                 // Переименование (оверрайд по serverKey; remarks провайдера не трогаем).
                 OutlinedButton(onClick = onRename, modifier = Modifier.fillMaxWidth()) {
-                    Text("✎ Переименовать")
+                    ButtonLabel(UiIcon.PENCIL, "Переименовать")
                 }
                 if (hasCustomName) {
                     TextButton(onClick = onResetName, modifier = Modifier.fillMaxWidth()) {
@@ -1415,7 +1558,7 @@ private fun ServerDetailDialog(
                 }
                 // Точечная блокировка ИМЕННО этого serverKey (не всех одноимённых).
                 OutlinedButton(onClick = onToggleBlock, modifier = Modifier.fillMaxWidth()) {
-                    Text(if (blockedByKey) "Убрать из стоп-листа" else "🚫 В стоп-лист")
+                    if (blockedByKey) Text("Убрать из стоп-листа") else ButtonLabel(UiIcon.BLOCK, "В стоп-лист")
                 }
                 // Если сервер УЖЕ скрыт правилом-словом — точечное снятие не поможет, объясняем куда идти.
                 if (blockedByWord && !blockedByKey) {
@@ -1627,7 +1770,7 @@ private fun BlocklistSection(
         SettingsGroupLabel("Персонально заблокированные")
         if (blocklist.servers.isEmpty()) {
             Text(
-                "Пусто. Заблокировать конкретный сервер: тап по строке → «🚫 В стоп-лист».",
+                "Пусто. Заблокировать конкретный сервер: тап по строке → «В стоп-лист».",
                 style = MaterialTheme.typography.bodyMedium, color = TABLE_GRAY,
             )
         } else {
@@ -1986,7 +2129,7 @@ private fun SubscriptionsSection(
         ) { Text("Добавить из текста") }
 
         OutlinedButton(onClick = onImportFile, modifier = Modifier.fillMaxWidth()) {
-            Text("📄 Импорт из файла")
+            ButtonLabel(UiIcon.DOC, "Импорт из файла")
         }
     }
 }
@@ -2032,6 +2175,192 @@ private fun fmtBytes(b: Long): String = when {
 private fun fmtUptime(ms: Long): String {
     val s = (ms / 1000).coerceAtLeast(0)
     return String.format(Locale.US, "%d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60)
+}
+
+private val UPDATE_DATE_FMT get() = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.US)
+
+/** Метрическая (мобильная) сеть — на ней спрашиваем согласие перед скачиванием ~50 МБ APK. */
+private fun isMeteredNetwork(context: Context): Boolean =
+    context.getSystemService(ConnectivityManager::class.java)?.isActiveNetworkMetered ?: false
+
+/** Строка «подпись … значение» для блока версий. */
+@Composable
+private fun InfoLine(label: String, value: String) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text(label, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+        Text(value, style = MaterialTheme.typography.bodyMedium, color = TABLE_GRAY)
+    }
+}
+
+/**
+ * Секция «ℹ️ О приложении» — ТОЛЬКО версии (приложение/ядро). Кнопка «Проверить обновление» и её
+ * результат вынесены на верхний уровень вкладки, ниже «Трафик» ([UpdateCheckSection]) — по просьбе:
+ * держать проверку обновлений на виду, а не в подменю.
+ */
+@Composable
+private fun AboutSection() {
+    val coreVersion = remember { UpdateStore.coreVersion() }
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        SettingsGroupLabel("Версия")
+        InfoLine("Приложение", UpdateStore.appVersion())
+        InfoLine("Ядро xray", coreVersion ?: "недоступна")
+    }
+}
+
+/**
+ * Проверка обновления (Промпт 70) — ВЕРХНЕУРОВНЕВЫЙ блок вкладки «Настройки», ниже «Трафик»: кнопка
+ * «Проверить обновление», результат последней проверки с временем; при доступном обновлении — размер,
+ * изменения, скачивание с прогрессом/отменой и «Установить» (СИСТЕМНЫЙ установщик — подтверждает
+ * пользователь). Проверки суммы и подписи делает [UpdateInstaller] ДО передачи файла установщику.
+ */
+@Composable
+private fun UpdateCheckSection() {
+    val context = LocalContext.current
+    val activity = context as ComponentActivity
+    val record by UpdateStore.record.collectAsState()
+    val live by UpdateStore.live.collectAsState()
+
+    var checking by remember { mutableStateOf(false) }
+    var downloading by remember { mutableStateOf(false) }
+    var downloaded by remember { mutableStateOf(0L) }
+    var totalBytes by remember { mutableStateOf(-1L) }
+    var cancelFlag by remember { mutableStateOf(false) }
+    var readyFile by remember { mutableStateOf<File?>(null) }
+    var message by remember { mutableStateOf<String?>(null) }
+    var confirmMetered by remember { mutableStateOf(false) }
+
+    fun startCheck() {
+        if (checking || downloading) return
+        checking = true; message = null; readyFile = null
+        Thread {
+            val result = runCatching { UpdateChecker.check(context) }
+                .getOrElse { UpdateCheckResult.Error(com.picosoft.xrayproxydroid.update.UpdateErrorKind.API_UNAVAILABLE, it.message ?: "") }
+            UpdateStore.apply(context, result, System.currentTimeMillis())
+            activity.runOnUiThread { checking = false }
+        }.start()
+    }
+
+    fun startDownload(available: UpdateCheckResult.Available) {
+        if (downloading) return
+        downloading = true; cancelFlag = false; downloaded = 0L
+        totalBytes = available.sizeBytes; message = null; readyFile = null
+        Thread {
+            var lastShown = 0L
+            val outcome = UpdateInstaller.download(
+                context, available,
+                isCancelled = { cancelFlag },
+                onProgress = { d, t ->
+                    if (d == t || d - lastShown >= 512 * 1024) {   // не флудим рекомпозицией на каждый чанк
+                        lastShown = d; downloaded = d
+                        if (t > 0) totalBytes = t
+                    }
+                },
+            )
+            activity.runOnUiThread {
+                downloading = false
+                when (outcome) {
+                    is UpdateInstaller.DownloadOutcome.Ok -> {
+                        readyFile = outcome.file
+                        message = "Файл проверен (контрольная сумма и подпись). Нажмите «Установить» — откроется системный установщик, подтверждаете вы."
+                    }
+                    is UpdateInstaller.DownloadOutcome.Fail -> {
+                        readyFile = null
+                        message = if (outcome.kind == com.picosoft.xrayproxydroid.update.UpdateErrorKind.CANCELLED) null
+                        else outcome.kind.text + if (outcome.detail.isNotBlank()) "\n${outcome.detail}" else ""
+                    }
+                }
+            }
+        }.start()
+    }
+
+    fun install(file: File) {
+        if (!UpdateInstaller.canInstall(context)) {
+            message = "Нужно разрешить установку приложений из этого источника — открываю системный экран."
+            UpdateInstaller.openInstallPermissionSettings(context)
+            return
+        }
+        UpdateInstaller.launchInstaller(context, file)
+    }
+
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        SettingsGroupLabel("Обновление")
+        if (record.checkedAtMs > 0) {
+            Text(record.summary, style = MaterialTheme.typography.bodyMedium)
+            Text("Проверено: ${UPDATE_DATE_FMT.format(Date(record.checkedAtMs))}",
+                style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
+        } else {
+            Text("Проверка ещё не выполнялась.", style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
+        }
+
+        Button(onClick = { startCheck() }, enabled = !checking && !downloading, modifier = Modifier.fillMaxWidth()) {
+            if (checking) Text("Проверяю…") else ButtonLabel(UiIcon.REFRESH, "Проверить обновление")
+        }
+
+        // Подтверждённое обновление (update.json): размер, изменения, скачивание/установка.
+        val avail = live as? UpdateCheckResult.Available
+        if (avail != null) {
+            Text("Новая версия: ${avail.versionName}",
+                style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+            Text(
+                "Размер: " + (if (avail.sizeBytes > 0) fmtBytes(avail.sizeBytes) else "неизвестен") +
+                    (if (avail.usingUniversal) " · универсальная сборка (нет точной под вашу архитектуру)" else ""),
+                style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+            )
+            if (avail.notes.isNotBlank()) Text(avail.notes, style = MaterialTheme.typography.bodySmall)
+
+            when {
+                downloading -> {
+                    val frac = if (totalBytes > 0) (downloaded.toFloat() / totalBytes).coerceIn(0f, 1f) else 0f
+                    if (totalBytes > 0) LinearProgressIndicator(progress = { frac }, modifier = Modifier.fillMaxWidth())
+                    else LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    Text(
+                        if (totalBytes > 0) "Скачано ${fmtBytes(downloaded)} из ${fmtBytes(totalBytes)} (${(frac * 100).roundToInt()}%)"
+                        else "Скачано ${fmtBytes(downloaded)}",
+                        style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+                    )
+                    OutlinedButton(onClick = { cancelFlag = true }, modifier = Modifier.fillMaxWidth()) { Text("Отменить") }
+                }
+                readyFile != null -> {
+                    Button(onClick = { install(readyFile!!) }, modifier = Modifier.fillMaxWidth()) { Text("Установить") }
+                }
+                else -> {
+                    Button(onClick = {
+                        if (isMeteredNetwork(context)) confirmMetered = true else startDownload(avail)
+                    }, modifier = Modifier.fillMaxWidth()) {
+                        Text("Скачать" + if (avail.sizeBytes > 0) " (${fmtBytes(avail.sizeBytes)})" else "")
+                    }
+                    Text(
+                        "Скачаем файл, сверим контрольную сумму и подпись с установленным приложением, затем откроется системный установщик — подтверждаете вы.",
+                        style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+                    )
+                }
+            }
+        }
+
+        // Новее по метке, но без update.json — только сообщаем (менее надёжный путь).
+        (live as? UpdateCheckResult.AvailableUnverified)?.let { u ->
+            Text(
+                "Есть версия новее (метка ${u.tag}), но в релизе нет update.json — надёжно проверить и установить нельзя. Обновите вручную со страницы релизов.",
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error,
+            )
+        }
+
+        message?.let {
+            Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+        }
+    }
+
+    if (confirmMetered) {
+        val a = live as? UpdateCheckResult.Available
+        val sizeSuffix = a?.let { if (it.sizeBytes > 0) " (${fmtBytes(it.sizeBytes)})" else "" } ?: ""
+        AlertDialog(
+            onDismissRequest = { confirmMetered = false },
+            title = { Text("Мобильная сеть") },
+            text = { Text("Сейчас активна мобильная сеть. Скачать обновление$sizeSuffix по ней?") },
+            confirmButton = { TextButton(onClick = { confirmMetered = false; a?.let { startDownload(it) } }) { Text("Скачать") } },
+            dismissButton = { TextButton(onClick = { confirmMetered = false }) { Text("Отмена") } },
+        )
+    }
 }
 
 /**
