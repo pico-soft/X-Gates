@@ -725,6 +725,8 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                     speedMbps = activeServer?.let { effSpeed(it) },
                     hidden = activeHidden, blocked = activeBlocked,
                     vpnRelation = vpnStatus.relation, vpnBypassed = vpnStatus.bypassed,
+                    vpnBypassFailed = vpnStatus.bypassFailed, vpnNoExit = vpnStatus.noExit,
+                    onRetryBypass = { XrayProxyService.retryVpnBypass(context) },
                     message = proxy.message,
                 )
                 ActionsBar(
@@ -980,6 +982,9 @@ private fun StatusBox(
     blocked: Boolean,
     vpnRelation: VpnRelation,
     vpnBypassed: Boolean,
+    vpnBypassFailed: Boolean,
+    vpnNoExit: Boolean,
+    onRetryBypass: () -> Unit,
     message: String,
 ) {
     val bg = when {
@@ -1020,17 +1025,28 @@ private fun StatusBox(
             if (hidden) {
                 Text("⚠ протокол скрыт настройками", style = MaterialTheme.typography.bodySmall, color = fg, fontWeight = FontWeight.Bold)
             }
-            // Чужой системный VPN — три состояния (Промпт 60). Предупреждение о «канале VPN» ТОЛЬКО когда
-            // мы ВНУТРИ и не идём мимо; в EXCLUDED замеры честные — говорим честно, что нас не касается.
+            // Чужой системный VPN — состояния (Промпт 60/62). Предупреждение о «канале VPN» ТОЛЬКО когда мы
+            // ВНУТРИ и не идём мимо; в EXCLUDED замеры честные. noExit (E3) — отличаем от «нет интернета».
             val vpnLine = when (vpnRelation) {
-                VpnRelation.INSIDE ->
-                    if (vpnBypassed) "🛡 системный VPN активен — идём мимо него"
-                    else "⚠ системный VPN активен — трафик и замеры идут ЧЕРЕЗ него (двойной туннель, замер = канал VPN)"
+                VpnRelation.INSIDE -> when {
+                    vpnBypassed -> "🛡 системный VPN активен — идём мимо него"
+                    vpnNoExit -> "⛔ системный VPN не пропускает трафик, а обход запрещён его настройками (lockdown) — наружу не выходит никто"
+                    vpnBypassFailed -> "⚠ обход не удался (lockdown) — идём ЧЕРЕЗ системный VPN, замер = его канал"
+                    else -> "⚠ системный VPN активен — трафик и замеры идут ЧЕРЕЗ него (двойной туннель, замер = канал VPN)"
+                }
                 VpnRelation.EXCLUDED -> "🛡 системный VPN активен, но нас не касается (мы вне его)"
                 VpnRelation.NONE -> null
             }
             if (vpnLine != null) {
                 Text(vpnLine, style = MaterialTheme.typography.bodySmall, color = fg, fontWeight = FontWeight.Bold)
+            }
+            // Повторить обход сразу (не ждать троттлинга 5 мин), напр. после выключения lockdown.
+            if (vpnBypassFailed || vpnNoExit) {
+                Text(
+                    "↻ Повторить обход",
+                    style = MaterialTheme.typography.bodySmall, color = fg, fontWeight = FontWeight.Bold,
+                    modifier = Modifier.clip(RoundedCornerShape(4.dp)).clickable { onRetryBypass() }.padding(vertical = 2.dp),
+                )
             }
             // Мелко: протокол · network · security активного сервера (вместо портов).
             if (subtitle != null) {

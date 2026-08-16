@@ -52,6 +52,9 @@ class XrayProxyService : Service() {
     @Volatile private var coreActive = false
     @Volatile private var lastRelation = VpnRelation.NONE
     @Volatile private var bypassRetryAfterMs = 0L
+    // Сеть, к которой МЫ привязали процесс (null = не привязывали). Нужно, чтобы определять состояние
+    // БЕЗ глобального снятия привязки (иначе параллельные запросы уйдут не тем маршрутом, Промпт 62.A).
+    @Volatile private var ourBinding: Network? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -74,9 +77,11 @@ class XrayProxyService : Service() {
     private fun registerNetworkCallback() {
         val cm = getSystemService(ConnectivityManager::class.java) ?: return
         val cb = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) { MonitorCoordinator.wake(); scheduleVpnBypass() }
-            override fun onLost(network: Network) { scheduleVpnBypass() }
-            override fun onCapabilitiesChanged(network: Network, caps: android.net.NetworkCapabilities) { scheduleVpnBypass() }
+            // Любое сетевое событие СБРАСЫВАЕТ троттлинг отката (Промпт 62.C): выключил пользователь
+            // lockdown — обход должен вернуться сразу, а не по 5-минутному таймеру.
+            override fun onAvailable(network: Network) { bypassRetryAfterMs = 0L; MonitorCoordinator.wake(); scheduleVpnBypass() }
+            override fun onLost(network: Network) { bypassRetryAfterMs = 0L; scheduleVpnBypass() }
+            override fun onCapabilitiesChanged(network: Network, caps: android.net.NetworkCapabilities) { bypassRetryAfterMs = 0L; scheduleVpnBypass() }
         }
         runCatching { cm.registerDefaultNetworkCallback(cb); netCallback = cb }
     }
@@ -85,53 +90,70 @@ class XrayProxyService : Service() {
     private fun scheduleVpnBypass() { monitorScope.launch { applyVpnBypass() } }
 
     /**
-     * Обход ЧУЖОГО системного VPN (Промпт 60), 3 состояния. В libv2ray НЕТ API привязать исходящие ядра к
-     * сети → ядро в НАШЕМ процессе уводим `bindProcessToNetwork(физ.сеть)` МИМО VPN. Loopback (локальный
-     * SOCKS + клиенты вроде Телеграма) привязка не трогает.
-     *  - Состояние определяем ФАКТОМ (getActiveNetwork per-UID), СНЯВ нашу привязку.
-     *  - Привязку ставим ТОЛЬКО в INSIDE (мы внутри VPN) при вкл. настройке; в EXCLUDED/NONE — не ставим.
-     *  - После привязки — лёгкая проверка связности: не прошла мимо, а через VPN проходит → LOCKDOWN,
-     *    авто-откат (идём через VPN), троттлинг повторов. Настройку при этом НЕ трогаем.
-     * @Synchronized — привязку/состояние трогают несколько источников (callback/collector/старт).
+     * Определить отношение к чужому VPN БЕЗ снятия глобальной привязки (Промпт 62.A). Если МЫ уже
+     * привязали процесс (ourBinding != null) — значит вошли в INSIDE осознанно, состояние INSIDE. Иначе
+     * процесс не связан нами → getActiveNetwork (per-UID) говорит правду. lockdown не путает: детекция по
+     * маршруту нашего uid, а не по пробе (которую фаервол блокирует).
+     */
+    private fun detectRelation(cm: ConnectivityManager): VpnRelation {
+        if (!NetworkUtils.vpnActive(cm)) return VpnRelation.NONE
+        if (ourBinding != null) return VpnRelation.INSIDE
+        return NetworkUtils.vpnRelation(cm)
+    }
+
+    /**
+     * Обход ЧУЖОГО системного VPN (Промпт 60/62). В libv2ray НЕТ API привязать исходящие ядра к сети →
+     * ядро в НАШЕМ процессе уводим `bindProcessToNetwork(физ.сеть)` МИМО VPN. Loopback (локальный SOCKS +
+     * клиенты вроде Телеграма) не трогается.
+     *  - EXCLUDED (боевой режим Elyor) и NONE — НЕ привязываем, НЕ пробуем, ничего не тратим.
+     *  - INSIDE + настройка вкл — привязка к физ.сети + лёгкая проба: мимо есть → bypassed; мимо нет, через
+     *    VPN есть → lockdown-откат (идём через VPN); мимо нет и через VPN нет → naружу никто (noExit, E3).
+     * @Synchronized — привязку/состояние трогают callback/collector/старт.
      */
     @Synchronized
     private fun applyVpnBypass() {
         val cm = getSystemService(ConnectivityManager::class.java) ?: return
-        runCatching { cm.bindProcessToNetwork(null) }   // снять нашу привязку, чтобы увидеть ИСТИННЫЙ маршрут
-        val relation = NetworkUtils.vpnRelation(cm)
+        val relation = detectRelation(cm)   // БЕЗ глобального снятия привязки
 
         if (relation != lastRelation) {
             MonitorLog.event(applicationContext, "net", "Системный VPN: ${relationText(relation)}", "")
-            bypassRetryAfterMs = 0L    // смена состояния сети → снова можно пробовать обход
+            bypassRetryAfterMs = 0L    // смена состояния → снова можно пробовать обход
             lastRelation = relation
         }
 
         var bypassed = false
         var bypassFailed = false
+        var noExit = false
         if (relation == VpnRelation.INSIDE && coreActive && SettingsStore.current().bypassSystemVpn) {
             if (System.currentTimeMillis() < bypassRetryAfterMs) {
                 bypassFailed = true    // недавно откатились по lockdown — идём через VPN, не долбим
             } else {
                 val phys = NetworkUtils.physicalNetwork(cm)
                 if (phys != null && runCatching { cm.bindProcessToNetwork(phys) }.getOrDefault(false)) {
+                    ourBinding = phys
                     if (NetworkUtils.probeConnectivity(2_500)) {
                         bypassed = true    // мимо VPN есть связь
                     } else {
-                        runCatching { cm.bindProcessToNetwork(null) }
+                        runCatching { cm.bindProcessToNetwork(null) }; ourBinding = null
                         if (NetworkUtils.probeConnectivity(2_500)) {
-                            // мимо не проходит, а через VPN — да → LOCKDOWN. Авто-откат.
+                            // мимо не проходит, а через VPN — да → LOCKDOWN. Авто-откат (идём через VPN).
                             bypassFailed = true
                             bypassRetryAfterMs = System.currentTimeMillis() + LOCKDOWN_RETRY_MS
                             MonitorLog.event(applicationContext, "net", "Обход VPN не удался (lockdown)",
                                 "иду через системный VPN, замер = его канал")
+                        } else {
+                            // ни мимо, ни через VPN → наружу не выходит НИКТО (VPN не пропускает + lockdown). E3.
+                            noExit = true
+                            bypassRetryAfterMs = System.currentTimeMillis() + LOCKDOWN_RETRY_MS
+                            MonitorLog.event(applicationContext, "net", "Наружу не выходит никто",
+                                "системный VPN не пропускает трафик, а обход запрещён его настройками (lockdown)")
                         }
-                        // иначе связи нет вовсе — не lockdown, просто остаёмся без привязки
                     }
                 }
             }
         }
-        if (!bypassed) runCatching { cm.bindProcessToNetwork(null) }   // гарантированно без битой привязки
-        SystemVpnState.update(relation = relation, bypassed = bypassed, bypassFailed = bypassFailed)
+        if (!bypassed && ourBinding != null) { runCatching { cm.bindProcessToNetwork(null) }; ourBinding = null }
+        SystemVpnState.update(relation = relation, bypassed = bypassed, bypassFailed = bypassFailed, noExit = noExit)
     }
 
     private fun relationText(r: VpnRelation): String = when (r) {
@@ -144,6 +166,7 @@ class XrayProxyService : Service() {
         when (intent?.action) {
             ACTION_START -> handleStart(intent)
             ACTION_STOP -> handleStop()
+            ACTION_RETRY_BYPASS -> { bypassRetryAfterMs = 0L; scheduleVpnBypass() }   // «Повторить» из статус-бокса
             else -> stopSelfAndForeground()
         }
         return START_NOT_STICKY
@@ -163,10 +186,15 @@ class XrayProxyService : Service() {
         ProxyState.update(running = false, label = label, serverKey = serverKey, message = "запуск…")
 
         coreActive = true
+        bypassRetryAfterMs = 0L   // ручной (пере)запуск = действие пользователя → снять троттлинг отката
 
         Thread {
             // Привязку МИМО чужого VPN ставим ДО старта ядра (его первый дозвон уже мимо VPN). На фоне,
-            // т.к. applyVpnBypass делает блокирующую пробу связности (нельзя на main).
+            // т.к. applyVpnBypass делает блокирующую пробу связности (нельзя на main). В INSIDE это ~2.5с —
+            // объясняем состоянием (в EXCLUDED/NONE пробы нет, задержки нет).
+            if (getSystemService(ConnectivityManager::class.java)?.let { NetworkUtils.vpnActive(it) } == true) {
+                ProxyState.update(running = false, label = label, serverKey = serverKey, message = "проверка маршрута (системный VPN)…")
+            }
             applyVpnBypass()
             polling = false   // остановить опрос прежнего туннеля при переключении сервера
             if (XrayController.isRunning) {
@@ -215,6 +243,7 @@ class XrayProxyService : Service() {
         coreActive = false
         // Снять привязку сразу и без блокирующей пробы (main-поток) — полное applyVpnBypass не зовём.
         runCatching { getSystemService(ConnectivityManager::class.java)?.bindProcessToNetwork(null) }
+        ourBinding = null
         SystemVpnState.reset()
         Thread {
             polling = false
@@ -256,6 +285,7 @@ class XrayProxyService : Service() {
         coreActive = false
         // ОБЯЗАТЕЛЬНО снять привязку процесса к сети — иначе приложение осталось бы прибито к сети и после стопа.
         runCatching { getSystemService(ConnectivityManager::class.java)?.bindProcessToNetwork(null) }
+        ourBinding = null
         SystemVpnState.reset()
         monitorScope.cancel()   // погасить цикл монитора + реактивный коллектор вместе с сервисом
         netCallback?.let { cb -> runCatching { getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb) } }
@@ -282,6 +312,7 @@ class XrayProxyService : Service() {
         private const val LOCKDOWN_RETRY_MS = 5 * 60_000L   // после отката по lockdown — не пробуем обход чаще
         const val ACTION_START = "com.picosoft.xrayproxydroid.action.START"
         const val ACTION_STOP = "com.picosoft.xrayproxydroid.action.STOP"
+        const val ACTION_RETRY_BYPASS = "com.picosoft.xrayproxydroid.action.RETRY_BYPASS"
         const val EXTRA_CONFIG = "config"
         const val EXTRA_LABEL = "label"
         const val EXTRA_SERVERKEY = "serverKey"
@@ -299,6 +330,12 @@ class XrayProxyService : Service() {
         fun stop(context: Context) {
             val intent = Intent(context, XrayProxyService::class.java).setAction(ACTION_STOP)
             context.startService(intent)
+        }
+
+        /** «Повторить обход» из статус-бокса (Промпт 62.C): сбросить троттлинг и пере-попробовать сразу. */
+        fun retryVpnBypass(context: Context) {
+            val intent = Intent(context, XrayProxyService::class.java).setAction(ACTION_RETRY_BYPASS)
+            runCatching { context.startService(intent) }
         }
     }
 }
