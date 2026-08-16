@@ -34,8 +34,10 @@ import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
@@ -62,7 +64,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -81,10 +86,17 @@ import java.util.Locale
 import kotlin.math.roundToInt
 import com.picosoft.xrayproxydroid.service.LastServerStore
 import com.picosoft.xrayproxydroid.service.ProxyState
+import com.picosoft.xrayproxydroid.service.SystemVpnState
 import com.picosoft.xrayproxydroid.service.XrayProxyService
+import com.picosoft.xrayproxydroid.monitor.LogEvent
 import com.picosoft.xrayproxydroid.monitor.MonitorCoordinator
-import com.picosoft.xrayproxydroid.monitor.MonitorEvent
+import com.picosoft.xrayproxydroid.monitor.MonitorHeartbeat
 import com.picosoft.xrayproxydroid.monitor.MonitorLog
+import com.picosoft.xrayproxydroid.monitor.MonitorPrompt
+import com.picosoft.xrayproxydroid.monitor.MonitorStatus
+import com.picosoft.xrayproxydroid.monitor.ServerLabels
+import com.picosoft.xrayproxydroid.net.VpnRelation
+import com.picosoft.xrayproxydroid.service.NotificationHelper
 import com.picosoft.xrayproxydroid.settings.AppSettings
 import com.picosoft.xrayproxydroid.settings.Blocklist
 import com.picosoft.xrayproxydroid.settings.BlocklistStore
@@ -143,6 +155,31 @@ private fun AppRoot() {
             }
         }
     }
+
+    // Предложение включить выключенные источники (пункт E) — поверх любой вкладки. Не включаем сами.
+    val context = LocalContext.current
+    val enablePrompt by MonitorPrompt.state.collectAsState()
+    enablePrompt?.let { p ->
+        AlertDialog(
+            onDismissRequest = { MonitorPrompt.decline(); NotificationHelper.cancelEnableSources(context) },
+            title = { Text("Нет живых серверов") },
+            text = { Text("Все включённые серверы перебраны — живых нет. Есть ${p.sources} выключенных источников (~${p.servers} серверов). Включить их и обновить?") },
+            confirmButton = {
+                TextButton(onClick = {
+                    MonitorPrompt.clear(); NotificationHelper.cancelEnableSources(context)
+                    Thread {
+                        SubscriptionManager.enableAllDisabled(context)
+                        SubscriptionManager.refreshAllEnabled(context, cancelled = { false }, onEach = { _, _ -> })
+                        MonitorPrompt.resetDeclined()
+                        MonitorCoordinator.wake()   // продолжить перебор с начала
+                    }.start()
+                }) { Text("Включить") }
+            },
+            dismissButton = {
+                TextButton(onClick = { MonitorPrompt.decline(); NotificationHelper.cancelEnableSources(context) }) { Text("Не сейчас") }
+            },
+        )
+    }
 }
 
 /**
@@ -163,6 +200,7 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
         allServers.map { providerName(it) to blocklist.customName(SubscriptionManager.serverKey(it)) }
     }
     val monitorLog by MonitorLog.state.collectAsState()
+    val heartbeat by MonitorStatus.state.collectAsState()
     // Состояние раскрытия — на уровне вкладки (стабильное позиционное scoping), все свёрнуты по умолчанию.
     var settingsExpanded by rememberSaveable { mutableStateOf(false) }
     var blocklistExpanded by rememberSaveable { mutableStateOf(false) }
@@ -198,6 +236,7 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
             CollapsibleSection("🛡️ Автомониторинг", monitorExpanded, { monitorExpanded = !monitorExpanded }) {
                 MonitorSection(
                     settings = settings,
+                    heartbeat = heartbeat,
                     onChange = { SettingsStore.update(context, it) },
                     log = monitorLog,
                     onClearLog = { MonitorLog.clear(context) },
@@ -329,6 +368,7 @@ private fun speedColor(mbps: Double?): Color = when {
 // перезапуске приложения — тогда автозапуск повторится, что и требуется).
 private var autoStartDone = false
 
+@OptIn(ExperimentalFoundationApi::class)   // stickyHeader
 @Composable
 private fun BootScreen(modifier: Modifier = Modifier) {
     val context = LocalContext.current
@@ -337,6 +377,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     val proxy by ProxyState.state.collectAsState()
     val settings by SettingsStore.state.collectAsState()   // живое применение порогов в UI
     val blocklist by BlocklistStore.state.collectAsState() // стоп-лист: пересчёт списков при изменении
+    val vpnStatus by SystemVpnState.state.collectAsState() // чужой системный VPN: активен / идём мимо
 
     var subStatus by remember { mutableStateOf("") }
     var servers by remember { mutableStateOf(SubscriptionManager.allServers(context)) }
@@ -394,7 +435,21 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         XrayProxyService.start(context, cfg, serverLabel(p, blocklist), SubscriptionManager.serverKey(p))
     }
 
-    fun onStop() { XrayProxyService.stop(context) }
+    // Подключение с записью в журнал СМЕНЫ активного сервера (причина: ручной выбор/автозапуск).
+    // Полный тест и монитор логируют свои переключения сами (знают числа/причину).
+    fun connectServer(p: ServerProfile, cause: String) {
+        val from = ServerLabels.displayForKey(context, proxy.serverKey)
+        MonitorLog.switch(context, from, displayName(p, blocklist), cause)
+        startServer(p)
+        MonitorCoordinator.wake()   // действие пользователя сбрасывает паузу монитора / прерывает перебор
+    }
+
+    fun onStop() {
+        if (proxy.running) {
+            MonitorLog.event(context, "switch", "Прокси остановлен", "ручная остановка — ${ServerLabels.displayForKey(context, proxy.serverKey) ?: proxy.label ?: "—"}")
+        }
+        XrayProxyService.stop(context)
+    }
 
     // Внешний IP ЧЕРЕЗ активный SOCKS — реальная живость туннеля (не просто «сокет слушает»).
     fun refreshIp() {
@@ -524,6 +579,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         if (all.isEmpty()) { subStatus = "нет серверов"; return }
         fullTesting = true
         MonitorCoordinator.fullTestRunning = true   // монитор молчит, пока идёт ручной тест
+        MonitorCoordinator.wake()                   // прервать возможный перебор/паузу монитора
         TestProgress.startIndeterminate("запуск…")   // до первого done/total — indeterminate
         pingResults = emptyMap(); speedResults = emptyMap()
 
@@ -628,7 +684,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         if (!proxy.running) {
             val lastKey = LastServerStore.load(context)
             val last = lastKey?.let { k -> servers.firstOrNull { SubscriptionManager.serverKey(it) == k } }
-            if (last != null) startServer(last)
+            if (last != null) connectServer(last, "автозапуск (последний сервер)")
         }
         val hasSubs = sources.any { it.enabled && it.url.isNotBlank() }
         if (hasSubs) onRefreshAll(onComplete = { onFullTest() }) else onFullTest()
@@ -642,140 +698,125 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     // Активный сервер попал под стоп-лист — соединение НЕ рвём молча, помечаем и предлагаем переключиться.
     val activeBlocked = activeServer != null && ServerFilter.isBlocked(activeServer, blocklist)
 
-    // Весь экран — одна прокручиваемая лента (как веб-морда): шапка → статус → действия →
-    // список серверов → сворачиваемые секции. Единый LazyColumn, чтобы раскрытые секции
-    // прокручивались вместе со всем холстом (не упирались в фикс. высоту списка).
+    // Пастельные фоны секций из ПАЛИТРЫ ТЕМЫ (не hex): lerp(surface, container) даёт НЕПРОЗРАЧНЫЙ
+    // слабый тон → прилипший заголовок не просвечивает строками, и оттенки корректны в тёмной теме.
+    val surface = MaterialTheme.colorScheme.surface
+    val liveBg = lerp(surface, MaterialTheme.colorScheme.tertiaryContainer, 0.18f)   // светло-зелёный тон
+    val allBg = lerp(surface, MaterialTheme.colorScheme.secondaryContainer, 0.18f)   // серо-голубой тон
+    val subsBg = lerp(surface, MaterialTheme.colorScheme.primaryContainer, 0.14f)    // сиреневый тон
+    val divCol = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.10f)             // волосок-разделитель
+
+    // Единый LazyColumn. verticalArrangement=0: строки одной секции примыкают (сплошной фон-блок без
+    // полос), зазоры между секциями задаём Spacer'ами. Заголовки секций — stickyHeader (прилипают).
     LazyColumn(
-        modifier = modifier
-            .fillMaxSize()
-            .padding(horizontal = 14.dp),
+        modifier = modifier.fillMaxSize().padding(horizontal = 14.dp),
         contentPadding = PaddingValues(vertical = 10.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
+        verticalArrangement = Arrangement.spacedBy(0.dp),
     ) {
-        // ═══ 1. ШАПКА + СТАТУС-БОКС ═══
+        // ═══ ШАПКА + СТАТУС + ДЕЙСТВИЯ + ПРОГРЕСС (не красим — Промпт 53.D) ═══
         item {
-            AppHeader()
-        }
-        item {
-            StatusBox(
-                running = proxy.running,
-                verified = ipVerified,
-                ipText = externalIp,
-                onRefreshIp = { refreshIp() },
-                serverName = activeServer?.let { displayName(it, blocklist) } ?: proxy.label,
-                subtitle = activeServer?.let { protoNetSec(it) },
-                speedMbps = activeServer?.let { effSpeed(it) },
-                hidden = activeHidden,
-                blocked = activeBlocked,
-                message = proxy.message,
-            )
-        }
-
-        // ═══ 2. ДЕЙСТВИЯ ═══
-        item {
-            ActionsBar(
-                fullTesting = fullTesting,
-                running = proxy.running,
-                refreshingSubs = refreshingSubs,
-                onFullTest = { onFullTest() },
-                onCancelFull = { onCancelFull() },
-                onStop = { onStop() },
-                onRefreshSubs = { onRefreshAll() },
-                onCancelRefreshSubs = { subRefreshCancel = true },
-            )
-        }
-        // Прогресс-бар Полного теста — сразу под кнопками, над «Живые серверы». Свой item со
-        // стабильным ключом → структура списка не меняется; collectAsState внутри бара → на тик
-        // рекомпозится только бар, не строки.
-        item(key = "full-test-progress") { FullTestProgressBar() }
-        if (subStatus.isNotEmpty()) {
-            item { Text(subStatus, style = MaterialTheme.typography.bodySmall) }
-        }
-
-        // ═══ 3. ЖИВЫЕ СЕРВЕРЫ (основной вид — плотная таблица) ═══
-        item {
-            Text(
-                "Живые серверы (${alive.size})",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-            )
-        }
-        // Чтобы серверы не пропадали молча — сколько скрыто (протокол + стоп-лист).
-        if (hiddenCount > 0) {
-            item {
-                Text(
-                    "скрыто настройками: $hiddenCount",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = TABLE_GRAY,
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.padding(bottom = 12.dp)) {
+                AppHeader()
+                StatusBox(
+                    running = proxy.running, verified = ipVerified, ipText = externalIp,
+                    onRefreshIp = { refreshIp() },
+                    serverName = activeServer?.let { displayName(it, blocklist) } ?: proxy.label,
+                    subtitle = activeServer?.let { protoNetSec(it) },
+                    speedMbps = activeServer?.let { effSpeed(it) },
+                    hidden = activeHidden, blocked = activeBlocked,
+                    vpnRelation = vpnStatus.relation, vpnBypassed = vpnStatus.bypassed,
+                    message = proxy.message,
                 )
+                ActionsBar(
+                    fullTesting = fullTesting, running = proxy.running, refreshingSubs = refreshingSubs,
+                    onFullTest = { onFullTest() }, onCancelFull = { onCancelFull() }, onStop = { onStop() },
+                    onRefreshSubs = { onRefreshAll() }, onCancelRefreshSubs = { subRefreshCancel = true },
+                )
+                FullTestProgressBar()
+                if (subStatus.isNotEmpty()) Text(subStatus, style = MaterialTheme.typography.bodySmall)
             }
         }
-        if (settings.allowedProtocols.isEmpty() && servers.isNotEmpty()) {
-            item {
-                Text(
-                    "Все протоколы отключены в Настройках → Протоколы.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = Color(0xFFD32F2F),
-                    modifier = Modifier.padding(vertical = 8.dp),
-                )
+
+        // ═══ ЖИВЫЕ СЕРВЕРЫ (основной вид) — светло-зелёный, заголовок прилипает ═══
+        stickyHeader(key = "h-live") {
+            SectionHeader("Живые серверы (${alive.size})", liveBg, roundedBottom = false, arrow = null, onClick = null)
+        }
+        if (hiddenCount > 0) item {
+            Box(Modifier.fillMaxWidth().background(liveBg).padding(horizontal = 12.dp, vertical = 2.dp)) {
+                Text("скрыто настройками: $hiddenCount", style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
             }
         }
-        item { ServerTableHeader() }
-        items(alive) { p ->
+        if (settings.allowedProtocols.isEmpty() && servers.isNotEmpty()) item {
+            Box(Modifier.fillMaxWidth().background(liveBg).padding(horizontal = 12.dp, vertical = 6.dp)) {
+                Text("Все протоколы отключены в Настройках → Протоколы.", style = MaterialTheme.typography.bodyMedium, color = Color(0xFFD32F2F))
+            }
+        }
+        item { Box(Modifier.fillMaxWidth().background(liveBg).bottomHairline(divCol)) { ServerTableHeader() } }
+        itemsIndexed(alive, key = { _, it -> "live-" + SubscriptionManager.serverKey(it) }) { index, p ->
             val isActive = proxy.running && proxy.serverKey == SubscriptionManager.serverKey(p)
-            ServerRow(
-                profile = p,
-                name = displayName(p, blocklist),
-                isActive = isActive,
-                speedMbps = effSpeed(p),
-                caption = discriminators[SubscriptionManager.serverKey(p)] ?: "",
-                onConnect = { startServer(p) },
-                onDetails = { detailProfile = p; remeasureStatus = "" },
-            )
-        }
-        if (alive.isEmpty()) {
-            item {
-                Text(
-                    if (servers.isEmpty()) "Список пуст — обновите подписку."
-                    else "Запусти тест (🔍)",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = Color(0xFF9E9E9E),
-                    modifier = Modifier.padding(vertical = 8.dp),
+            val rowMod = if (index < alive.lastIndex) Modifier.bottomHairline(divCol) else Modifier
+            Box(Modifier.fillMaxWidth().background(liveBg).then(rowMod)) {
+                ServerRow(
+                    profile = p, name = displayName(p, blocklist), isActive = isActive,
+                    speedMbps = effSpeed(p), caption = discriminators[SubscriptionManager.serverKey(p)] ?: "",
+                    onConnect = { connectServer(p, "ручной выбор") },
+                    onDetails = { detailProfile = p; remeasureStatus = "" },
                 )
             }
         }
+        if (alive.isEmpty()) item {
+            Box(Modifier.fillMaxWidth().background(liveBg).padding(horizontal = 12.dp, vertical = 8.dp)) {
+                Text(
+                    if (servers.isEmpty()) "Список пуст — обновите подписку." else "Запусти тест (🔍)",
+                    style = MaterialTheme.typography.bodyMedium, color = Color(0xFF9E9E9E),
+                )
+            }
+        }
+        item { SectionBottomCap(liveBg) }
+        item { Spacer(Modifier.height(12.dp)) }
 
-        // ═══ 4. СВОРАЧИВАЕМЫЕ СЕКЦИИ (порядок как эталон) ═══
-        // Все серверы (вкл. мёртвые ✗ и не тестированные —) — свёрнут, не мозолит глаза.
-        item {
-            CollapsibleSection("Все серверы (${shown.size})", allServersExpanded, { allServersExpanded = !allServersExpanded }) {
-                ServerTableHeader()
-                shown.forEach { p ->
-                    val isActive = proxy.running && proxy.serverKey == SubscriptionManager.serverKey(p)
+        // ═══ СВОРАЧИВАЕМЫЕ СЕКЦИИ (порядок как эталон) ═══
+        // Все серверы (вкл. мёртвые ✗ и не тестированные —) — свёрнут, не мозолит глаза. Серо-голубой.
+        stickyHeader(key = "h-all") {
+            SectionHeader("Все серверы (${shown.size})", allBg, roundedBottom = !allServersExpanded,
+                arrow = if (allServersExpanded) "▾" else "▸", onClick = { allServersExpanded = !allServersExpanded })
+        }
+        if (allServersExpanded) {
+            item { Box(Modifier.fillMaxWidth().background(allBg).bottomHairline(divCol)) { ServerTableHeader() } }
+            itemsIndexed(shown, key = { _, it -> "all-" + SubscriptionManager.serverKey(it) }) { index, p ->
+                val isActive = proxy.running && proxy.serverKey == SubscriptionManager.serverKey(p)
+                val rowMod = if (index < shown.lastIndex) Modifier.bottomHairline(divCol) else Modifier
+                Box(Modifier.fillMaxWidth().background(allBg).then(rowMod)) {
                     ServerRow(
-                        profile = p,
-                        name = displayName(p, blocklist),
-                        isActive = isActive,
-                        speedMbps = effSpeed(p),
-                        caption = discriminators[SubscriptionManager.serverKey(p)] ?: "",
-                        onConnect = { startServer(p) },
+                        profile = p, name = displayName(p, blocklist), isActive = isActive,
+                        speedMbps = effSpeed(p), caption = discriminators[SubscriptionManager.serverKey(p)] ?: "",
+                        onConnect = { connectServer(p, "ручной выбор") },
                         onDetails = { detailProfile = p; remeasureStatus = "" },
                     )
                 }
             }
+            item { SectionBottomCap(allBg) }
         }
-        // Подписки — рабочее действие, остаётся на главной (список источников/добавление/вставка/файл).
-        item {
-            CollapsibleSection("Подписки (${sources.size})", subscriptionsExpanded, { subscriptionsExpanded = !subscriptionsExpanded }) {
-                SubscriptionsSection(
-                    sources = sources,
-                    onAddUrl = { url, name -> onAddUrl(url, name) },
-                    onAddPaste = { onAddPaste(it) },
-                    onImportFile = { filePickerLauncher.launch("*/*") },
-                    onToggle = { id, en -> onToggleSource(id, en) },
-                    onDeleteRequest = { pendingDelete = it },
-                    onRenameRequest = { renameSource = it },
-                )
+        item { Spacer(Modifier.height(12.dp)) }
+
+        // Подписки — рабочее действие, остаётся на главной. Сиреневый.
+        stickyHeader(key = "h-subs") {
+            SectionHeader("Подписки (${sources.size})", subsBg, roundedBottom = !subscriptionsExpanded,
+                arrow = if (subscriptionsExpanded) "▾" else "▸", onClick = { subscriptionsExpanded = !subscriptionsExpanded })
+        }
+        if (subscriptionsExpanded) {
+            item {
+                Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(bottomStart = 14.dp, bottomEnd = 14.dp)).background(subsBg).padding(horizontal = 10.dp, vertical = 8.dp)) {
+                    SubscriptionsSection(
+                        sources = sources,
+                        onAddUrl = { url, name -> onAddUrl(url, name) },
+                        onAddPaste = { onAddPaste(it) },
+                        onImportFile = { filePickerLauncher.launch("*/*") },
+                        onToggle = { id, en -> onToggleSource(id, en) },
+                        onDeleteRequest = { pendingDelete = it },
+                        onRenameRequest = { renameSource = it },
+                    )
+                }
             }
         }
         // Настройки / Стоп-лист / Автомониторинг / Трафик переехали во вкладку «Настройки».
@@ -787,7 +828,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                 style = MaterialTheme.typography.bodySmall,
                 color = Color(0xFF9E9E9E),
                 textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                modifier = Modifier.fillMaxWidth().padding(top = 16.dp, bottom = 8.dp),
             )
         }
     }
@@ -937,6 +978,8 @@ private fun StatusBox(
     speedMbps: Double?,
     hidden: Boolean,
     blocked: Boolean,
+    vpnRelation: VpnRelation,
+    vpnBypassed: Boolean,
     message: String,
 ) {
     val bg = when {
@@ -976,6 +1019,18 @@ private fun StatusBox(
             // Активный сервер скрыт фильтром протоколов — туннель не рвём, но помечаем.
             if (hidden) {
                 Text("⚠ протокол скрыт настройками", style = MaterialTheme.typography.bodySmall, color = fg, fontWeight = FontWeight.Bold)
+            }
+            // Чужой системный VPN — три состояния (Промпт 60). Предупреждение о «канале VPN» ТОЛЬКО когда
+            // мы ВНУТРИ и не идём мимо; в EXCLUDED замеры честные — говорим честно, что нас не касается.
+            val vpnLine = when (vpnRelation) {
+                VpnRelation.INSIDE ->
+                    if (vpnBypassed) "🛡 системный VPN активен — идём мимо него"
+                    else "⚠ системный VPN активен — трафик и замеры идут ЧЕРЕЗ него (двойной туннель, замер = канал VPN)"
+                VpnRelation.EXCLUDED -> "🛡 системный VPN активен, но нас не касается (мы вне его)"
+                VpnRelation.NONE -> null
+            }
+            if (vpnLine != null) {
+                Text(vpnLine, style = MaterialTheme.typography.bodySmall, color = fg, fontWeight = FontWeight.Bold)
             }
             // Мелко: протокол · network · security активного сервера (вместо портов).
             if (subtitle != null) {
@@ -1048,6 +1103,52 @@ private val TABLE_GRAY = Color(0xFF9E9E9E)
 private fun cappedDensity(): Density {
     val d = LocalDensity.current
     return Density(d.density, d.fontScale.coerceAtMost(1.15f))
+}
+
+/** Цвет разделителя = onSurface с низкой альфой: выводится из фона секции (не серым), в тёмной теме
+ *  onSurface светлый → линия светлее фона. Ориентир 0.10. */
+@Composable
+private fun dividerColor(): Color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.10f)
+
+/**
+ * Тонкий разделитель ВНИЗУ элемента: ровно 1 физический пиксель (strokeWidth=1px, НЕ 1.dp — на плотности
+ * ~3.5 стал бы трёхпиксельным). Рисуется в существующем отступе (высоту строки не увеличивает), с
+ * горизонтальным отступом от краёв (не касается скруглений). drawBehind → под контентом строки, поэтому
+ * подсветка активного сервера (непрозрачный primaryContainer поверх) перекрывает линию у своих границ.
+ */
+private fun Modifier.bottomHairline(color: Color): Modifier = this.drawBehind {
+    val inset = 12.dp.toPx()
+    val y = size.height - 0.5f
+    drawLine(color, Offset(inset, y), Offset(size.width - inset, y), strokeWidth = 1f)
+}
+
+/**
+ * Прилипающий заголовок секции с фоном секции (непрозрачным — не просвечивает строками) и счётчиком.
+ * [roundedBottom]=true (свёрнутая секция) — скруглены все углы; иначе только верхние (снизу примыкают строки).
+ */
+@Composable
+private fun SectionHeader(title: String, bg: Color, roundedBottom: Boolean, arrow: String?, onClick: (() -> Unit)?) {
+    val shape = if (roundedBottom) RoundedCornerShape(14.dp) else RoundedCornerShape(topStart = 14.dp, topEnd = 14.dp)
+    // Линия под прилипшим заголовком — только у РАЗВЁРНУТОЙ секции (снизу идут строки); у свёрнутой
+    // (roundedBottom) её нет, чтобы не пересекать скруглённый низ пилюли-заголовка.
+    val dc = dividerColor()
+    val divider = if (!roundedBottom) Modifier.bottomHairline(dc) else Modifier
+    Row(
+        modifier = Modifier.fillMaxWidth().clip(shape).background(bg).then(divider)
+            .then(if (onClick != null) Modifier.clickable { onClick() } else Modifier)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+        if (arrow != null) Text(arrow, style = MaterialTheme.typography.titleMedium, color = TABLE_GRAY)
+    }
+}
+
+/** Нижняя «крышка» секции: скругляет нижние углы цветного блока. */
+@Composable
+private fun SectionBottomCap(bg: Color) {
+    Box(Modifier.fillMaxWidth().height(12.dp).clip(RoundedCornerShape(bottomStart = 14.dp, bottomEnd = 14.dp)).background(bg))
 }
 
 /** Шапка таблицы серверов: Сервер | Мб/с | (кнопка). Колонки как у строк. */
@@ -1380,6 +1481,13 @@ private fun SettingsSection(
         BoolSettingRow("Автозапуск при старте", settings.autoStartOnLaunch, d.autoStartOnLaunch) {
             onChange(settings.copy(autoStartOnLaunch = it))
         }
+        BoolSettingRow("Обходить системный VPN", settings.bypassSystemVpn, d.bypassSystemVpn) {
+            onChange(settings.copy(bypassSystemVpn = it))
+        }
+        Text(
+            "Если включён другой (платный) VPN — вести наш туннель и замеры МИМО него (иначе туннель-в-туннеле: медленнее, и падение внешнего VPN роняет наш прокси). Выключите, если нужно наоборот.",
+            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+        )
         BoolSettingRow("Подробные логи", settings.verboseLogs, d.verboseLogs) {
             onChange(settings.copy(verboseLogs = it))
         }
@@ -1486,22 +1594,37 @@ private fun WordChip(word: String, count: Int, onRemove: () -> Unit) {
 private val monitorTimeFmt = SimpleDateFormat("dd.MM HH:mm:ss", Locale.getDefault())
 
 /**
- * Секция «🛡️ Автомониторинг» — этап 1: наблюдение + журнал, БЕЗ переключений.
- * Настройки (через SettingsStore) + журнал последних событий (свежие сверху).
+ * Секция «🛡️ Автомониторинг». Признак жизни в шапке (обновляется на месте, не в журнал) + настройки +
+ * журнал ТОЛЬКО событий (смены состояния/происшествия/смены сервера). Описание режима зависит от того,
+ * включено ли автопереключение.
  */
 @Composable
 private fun MonitorSection(
     settings: AppSettings,
+    heartbeat: MonitorHeartbeat,
     onChange: (AppSettings) -> Unit,
-    log: List<MonitorEvent>,
+    log: List<LogEvent>,
     onClearLog: () -> Unit,
 ) {
     val d = SettingsStore.DEFAULTS
     Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        // Честное описание текущего режима.
         Text(
-            "Этап 1: монитор только НАБЛЮДАЕТ и пишет журнал (что сделал бы). Серверы НЕ переключает.",
+            if (settings.monitorEnabled)
+                "Монитор следит за туннелем и при падении сам переключает на живого кандидата (только при активном прокси)."
+            else
+                "Выключен — не выполняет ничего (ни проверок, ни замеров), бережём батарею.",
             style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
         )
+        // Признак жизни: время последней проверки, состояние, число циклов.
+        if (settings.monitorEnabled) {
+            val t = if (heartbeat.lastCheckMs > 0) monitorTimeFmt.format(Date(heartbeat.lastCheckMs)) else "—"
+            Text(
+                "● проверка: $t · ${heartbeat.state} · циклов: ${heartbeat.cycles}",
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary,
+            )
+        }
+
         BoolSettingRow("Автомониторинг", settings.monitorEnabled, d.monitorEnabled) {
             onChange(settings.copy(monitorEnabled = it))
         }
@@ -1524,12 +1647,12 @@ private fun MonitorSection(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            SettingsGroupLabel("Журнал (${log.size})")
+            SettingsGroupLabel("Журнал событий (${log.size})")
             if (log.isNotEmpty()) TextButton(onClick = onClearLog) { Text("Очистить") }
         }
         if (log.isEmpty()) {
             Text(
-                "Пока пусто. Включите автомониторинг — события появятся здесь.",
+                "Происшествий не было — журнал пуст. Здесь появятся падения, восстановления и смены сервера.",
                 style = MaterialTheme.typography.bodyMedium, color = TABLE_GRAY,
             )
         } else {
@@ -1538,20 +1661,22 @@ private fun MonitorSection(
     }
 }
 
-/** Одна запись журнала: время + вердикт, под ним состояния сигналов и (если есть) гипотетическое действие. */
+/** Одна запись журнала: время + заголовок (цвет по виду), под ним — детали/числа/причина. */
 @Composable
-private fun MonitorLogRow(e: MonitorEvent) {
+private fun MonitorLogRow(e: LogEvent) {
+    val color = when (e.kind) {
+        "switch" -> MaterialTheme.colorScheme.primary
+        "error" -> Color(0xFFD32F2F)
+        "net" -> Color(0xFFF9A825)
+        else -> MaterialTheme.colorScheme.onSurface
+    }
     Column(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
         Text(
-            "${monitorTimeFmt.format(Date(e.ts))} · ${e.verdict}",
-            style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold,
+            "${monitorTimeFmt.format(Date(e.ts))} · ${e.text}",
+            style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold, color = color,
         )
-        Text(
-            "прямой: ${e.direct} · туннель: ${e.tunnel}",
-            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
-        )
-        if (e.wouldDo.isNotEmpty()) {
-            Text("→ ${e.wouldDo}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+        if (e.detail.isNotEmpty()) {
+            Text(e.detail, style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
         }
     }
 }
