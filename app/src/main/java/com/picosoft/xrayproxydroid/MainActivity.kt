@@ -86,8 +86,10 @@ import com.picosoft.xrayproxydroid.ui.TestProgress
 import com.picosoft.xrayproxydroid.ui.theme.XrayProxyDroidTheme
 import com.picosoft.xrayproxydroid.xray.ExternalIpChecker
 import com.picosoft.xrayproxydroid.xray.FullTestRunner
+import com.picosoft.xrayproxydroid.xray.ServerFilter
 import com.picosoft.xrayproxydroid.xray.ServerSpeedTester
 import com.picosoft.xrayproxydroid.xray.XrayConfigBuilder
+import com.picosoft.xrayproxydroid.xray.link.Protocol
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
 
 class MainActivity : ComponentActivity() {
@@ -462,8 +464,13 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         }.start()
     }
 
+    // Отсев по протоколу (единый предикат [ServerFilter]) — скрывает из ВИДИМОЙ части (Живые и Все).
+    // Замер идёт по всем всегда; скрытые считаем отдельно, чтобы показать «скрыто настройками: N».
+    val allowedServers = servers.filter { ServerFilter.protocolAllowed(it, settings) }
+    val hiddenByProtocol = servers.size - allowedServers.size
+
     // Сортировка как Termux sort_servers_by_speed: скорость>0 (убыв.) → живые по пингу (возр.) → остальные.
-    val shown = servers.sortedWith(Comparator { a, b ->
+    val shown = allowedServers.sortedWith(Comparator { a, b ->
         fun rank(p: ServerProfile): Int {
             val s = effSpeed(p) ?: 0.0
             val pg = effPing(p) ?: -1
@@ -498,14 +505,11 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     }
     val ipVerified = externalIp.isNotEmpty() && externalIp != "…" && externalIp != "нет ответа"
 
-    // Основной вид = ЖИВЫЕ (ping ответил, >=0) И с полезной скоростью (не «0.0»/«✗»).
-    // Не тестированные по скорости (—) остаются видны. Непригодные и мёртвые — в «Все серверы».
-    // Порог общий с Авто (settings.minUsableMbps): что скрыто — то и не выбирается в Авто.
-    val alive = shown.filter {
-        val pg = effPing(it)
-        val sp = effSpeed(it)
-        pg != null && pg >= 0 && (sp == null || sp >= settings.minUsableMbps)
-    }
+    // Основной вид = ЖИВЫЕ — через единый предикат [ServerFilter.isVisible] (протокол+пинг+мин.скорость).
+    val alive = shown.filter { ServerFilter.isVisible(it, effPing(it), effSpeed(it), settings) }
+
+    // Активный сервер скрыт настройками (протокол выключен)? Соединение НЕ рвём — только пометка в статусе.
+    val activeHidden = activeServer != null && !ServerFilter.protocolAllowed(activeServer, settings)
 
     // Весь экран — одна прокручиваемая лента (как веб-морда): шапка → статус → действия →
     // список серверов → сворачиваемые секции. Единый LazyColumn, чтобы раскрытые секции
@@ -530,6 +534,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                 serverName = activeServer?.let { serverName(it) } ?: proxy.label,
                 subtitle = activeServer?.let { protoNetSec(it) },
                 speedMbps = activeServer?.let { effSpeed(it) },
+                hidden = activeHidden,
                 message = proxy.message,
             )
         }
@@ -563,6 +568,26 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                 fontWeight = FontWeight.Bold,
             )
         }
+        // Чтобы серверы не пропадали молча — сколько скрыто фильтром протоколов.
+        if (hiddenByProtocol > 0) {
+            item {
+                Text(
+                    "скрыто настройками: $hiddenByProtocol",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TABLE_GRAY,
+                )
+            }
+        }
+        if (settings.allowedProtocols.isEmpty() && servers.isNotEmpty()) {
+            item {
+                Text(
+                    "Все протоколы отключены в Настройках → Протоколы.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color(0xFFD32F2F),
+                    modifier = Modifier.padding(vertical = 8.dp),
+                )
+            }
+        }
         item { ServerTableHeader() }
         items(alive) { p ->
             val isActive = proxy.running && proxy.serverKey == SubscriptionManager.serverKey(p)
@@ -590,7 +615,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         // ═══ 4. СВОРАЧИВАЕМЫЕ СЕКЦИИ (порядок как эталон) ═══
         // Все серверы (вкл. мёртвые ✗ и не тестированные —) — свёрнут, не мозолит глаза.
         item {
-            CollapsibleSection(title = "Все серверы (${servers.size})", initiallyExpanded = false) {
+            CollapsibleSection(title = "Все серверы (${shown.size})", initiallyExpanded = false) {
                 ServerTableHeader()
                 shown.forEach { p ->
                     val isActive = proxy.running && proxy.serverKey == SubscriptionManager.serverKey(p)
@@ -624,6 +649,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
             CollapsibleSection(title = "⚙️ Настройки", initiallyExpanded = false) {
                 SettingsSection(
                     settings = settings,
+                    protocolCounts = servers.groupingBy { it.protocol }.eachCount(),
                     onChange = { SettingsStore.update(context, it) },
                     onReset = { SettingsStore.resetToDefaults(context) },
                 )
@@ -754,6 +780,7 @@ private fun StatusBox(
     serverName: String?,
     subtitle: String?,
     speedMbps: Double?,
+    hidden: Boolean,
     message: String,
 ) {
     val bg = when {
@@ -783,6 +810,10 @@ private fun StatusBox(
             color = fg,
         )
         if (running) {
+            // Активный сервер скрыт фильтром протоколов — туннель не рвём, но помечаем.
+            if (hidden) {
+                Text("⚠ протокол скрыт настройками", style = MaterialTheme.typography.bodySmall, color = fg, fontWeight = FontWeight.Bold)
+            }
             // Мелко: протокол · network · security активного сервера (вместо портов).
             if (subtitle != null) {
                 Text(subtitle, style = MaterialTheme.typography.bodySmall, color = fg)
@@ -1042,11 +1073,25 @@ private fun DetailRow(key: String, value: String) {
 @Composable
 private fun SettingsSection(
     settings: AppSettings,
+    protocolCounts: Map<Protocol, Int>,
     onChange: (AppSettings) -> Unit,
     onReset: () -> Unit,
 ) {
     val d = SettingsStore.DEFAULTS
     Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        SettingsGroupLabel("Протоколы")
+        // Фильтр отображения+выбора (НЕ замера): выключенный протокол исчезает из списка и Авто.
+        Protocol.entries.forEach { proto ->
+            val on = proto in settings.allowedProtocols
+            val n = protocolCounts[proto] ?: 0
+            SettingRowScaffold("${proto.name} ($n серв.)", "", changed = on != (proto in d.allowedProtocols), defaultText = "вкл") {
+                Switch(checked = on, onCheckedChange = { enabled ->
+                    val next = if (enabled) settings.allowedProtocols + proto else settings.allowedProtocols - proto
+                    onChange(settings.copy(allowedProtocols = next))
+                })
+            }
+        }
+
         SettingsGroupLabel("Замер скорости")
         DoubleSettingRow("Прогрев перед замером", "с", settings.speedWarmupSec, d.speedWarmupSec, 0.0, 60.0) {
             onChange(settings.copy(speedWarmupSec = it))
@@ -1382,18 +1427,21 @@ private fun fmtUptime(ms: Long): String {
 private fun TrafficScreen(modifier: Modifier = Modifier) {
     val t by TrafficTracker.state.collectAsState()
 
-    // Живой аптайм: тикаем раз в секунду, пока сессия активна.
+    // Живой таймер: тикаем раз в секунду ВСЕГДА (сессия идёт с запуска приложения).
     var nowElapsed by remember { mutableStateOf(SystemClock.elapsedRealtime()) }
-    LaunchedEffect(t.sessionActive) {
-        while (t.sessionActive) {
+    LaunchedEffect(Unit) {
+        while (true) {
             nowElapsed = SystemClock.elapsedRealtime()
             delay(1000)
         }
     }
-    val uptimeMs = when {
-        t.sessionStartElapsed == 0L -> 0L
-        t.sessionActive -> nowElapsed - t.sessionStartElapsed
-        else -> t.sessionEndElapsed - t.sessionStartElapsed
+    // Время работы блока = время СЕССИИ приложения (от той же точки, что и байты).
+    val uptimeMs = if (t.sessionStartElapsed == 0L) 0L else nowElapsed - t.sessionStartElapsed
+    // Отдельно — время работы ПРОКСИ (не смешивать с сессией приложения).
+    val proxyUptime = when {
+        t.proxyActive -> nowElapsed - t.proxyStartElapsed
+        t.proxyEndElapsed > t.proxyStartElapsed && t.proxyStartElapsed > 0L -> t.proxyEndElapsed - t.proxyStartElapsed
+        else -> -1L
     }
     var confirmToday by remember { mutableStateOf(false) }
     var confirmAll by remember { mutableStateOf(false) }
@@ -1411,6 +1459,7 @@ private fun TrafficScreen(modifier: Modifier = Modifier) {
                     Text("Нет данных", style = MaterialTheme.typography.bodyMedium, color = TABLE_GRAY)
                 } else {
                     MetricRow("Время работы", fmtUptime(uptimeMs))
+                    MetricRow("Прокси активен", if (proxyUptime < 0) "—" else fmtUptime(proxyUptime))
                     MetricRow("Туннель ↓ (приём)", fmtBytes(t.sessionRx))
                     MetricRow("Туннель ↑ (отдача)", fmtBytes(t.sessionTx))
                     MetricRow("Тест", fmtBytes(t.sessionTest))

@@ -9,6 +9,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import com.picosoft.xrayproxydroid.xray.link.Protocol
 import java.io.File
 import kotlin.math.roundToInt
 
@@ -43,6 +44,9 @@ data class AppSettings(
     // --- Выбор сервера ---
     val minUsableMbps: Double = 0.05,   // порог видимости в списке / «живой»
     val upgradeMarginPercent: Int = 10, // запас для апгрейда на более быстрый
+    // Разрешённые протоколы (фильтр ОТОБРАЖЕНИЯ+ВЫБОРА, НЕ замера). ДЕФОЛТ обязателен: старый JSON
+    // без этого поля должен разобраться (иначе все настройки слетят) → все 4 по умолчанию.
+    val allowedProtocols: Set<Protocol> = setOf(Protocol.VLESS, Protocol.VMESS, Protocol.TROJAN, Protocol.SHADOWSOCKS),
 
     // --- Прочее ---
     val verboseLogs: Boolean = true,    // детальный лог ServerSpeedTester (промпт 18)

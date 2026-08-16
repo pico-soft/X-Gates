@@ -42,12 +42,14 @@ data class TrafficFile(
 
 /** Снимок для UI: сессия «с последнего запуска» + сегодня + сумма 30 дней + список по дням. */
 data class TrafficSnapshot(
-    val sessionActive: Boolean = false,
-    val sessionStartElapsed: Long = 0,   // база SystemClock.elapsedRealtime для аптайма
-    val sessionEndElapsed: Long = 0,     // фиксация аптайма после остановки
+    val sessionStartElapsed: Long = 0,   // точка отсчёта СЕССИИ (запуск приложения / последний сброс) — И байты, И таймер
     val sessionRx: Long = 0,
     val sessionTx: Long = 0,
     val sessionTest: Long = 0,
+    // ОТДЕЛЬНО «Прокси активен» — время работы туннеля, не путать с временем сессии приложения.
+    val proxyActive: Boolean = false,
+    val proxyStartElapsed: Long = 0,
+    val proxyEndElapsed: Long = 0,
     val today: DayBucket = DayBucket(),
     val total30: DayBucket = DayBucket(),
     val days: List<Pair<String, DayBucket>> = emptyList(),  // свежие сверху
@@ -94,12 +96,15 @@ object TrafficTracker {
     private var days = LinkedHashMap<String, DayBucket>()   // история (30д + список), НЕЗАВИСИМА от суточного
     private var todayDate = ""                              // дата независимого суточного счётчика
     private var todayRx = 0L; private var todayTx = 0L; private var todayTest = 0L
-    private var sessionActive = false
+    // Сессия «с последнего запуска»: отсчёт с запуска приложения / последнего сброса. Пополняется БЕЗУСЛОВНО.
     private var sessionStartElapsed = 0L
-    private var sessionEndElapsed = 0L
     private var sessionRx = 0L
     private var sessionTx = 0L
     private var sessionTest = 0L
+    // «Прокси активен» — отдельная величина (время работы туннеля).
+    private var proxyActive = false
+    private var proxyStartElapsed = 0L
+    private var proxyEndElapsed = 0L
     private var lastPersistElapsed = 0L
     private var appContext: Context? = null
 
@@ -112,10 +117,15 @@ object TrafficTracker {
         todayRx = file.today.tunnelRx; todayTx = file.today.tunnelTx; todayTest = file.today.test
     }
 
+    private fun ensureSessionStarted() {
+        if (sessionStartElapsed == 0L) sessionStartElapsed = SystemClock.elapsedRealtime()
+    }
+
     /** Загрузить историю + суточный счётчик, отсечь старше 30 дней. Вызвать при старте приложения. */
     fun init(context: Context) = synchronized(lock) {
         appContext = context.applicationContext
         loadFrom(TrafficStore.load(appContext!!))
+        ensureSessionStarted()   // отсчёт сессии = запуск приложения
         prune()
         publish()
     }
@@ -126,24 +136,24 @@ object TrafficTracker {
             appContext = context.applicationContext
             loadFrom(TrafficStore.load(appContext!!))
             prune()
-            publish()
         }
+        ensureSessionStarted()
+        publish()
     }
 
-    /** Сервис поднялся: новая сессия. */
+    /** Прокси поднялся — только отметка «активен» (сессию НЕ трогаем: она считается безусловно). */
     fun onServiceStart() = synchronized(lock) {
-        sessionActive = true
-        sessionStartElapsed = SystemClock.elapsedRealtime()
-        sessionEndElapsed = 0
-        sessionRx = 0; sessionTx = 0; sessionTest = 0
+        proxyActive = true
+        proxyStartElapsed = SystemClock.elapsedRealtime()
+        proxyEndElapsed = 0
         lastPersistElapsed = SystemClock.elapsedRealtime()
         publish()
     }
 
-    /** Сервис остановлен: зафиксировать аптайм, сохранить. Счётчики сессии остаются видны до нового старта. */
+    /** Прокси остановлен — зафиксировать его аптайм, сохранить. Сессию НЕ трогаем. */
     fun onServiceStop() = synchronized(lock) {
-        sessionActive = false
-        sessionEndElapsed = SystemClock.elapsedRealtime()
+        proxyActive = false
+        proxyEndElapsed = SystemClock.elapsedRealtime()
         persist()
         publish()
     }
@@ -154,28 +164,30 @@ object TrafficTracker {
         if (todayDate != k) { todayDate = k; todayRx = 0; todayTx = 0; todayTest = 0 }
     }
 
-    /** Дельты туннеля из core queryStats (приём/отдача). Обновляют ТРИ независимых счётчика. */
+    /** Дельты туннеля из core queryStats (приём/отдача). Обновляют ТРИ счётчика БЕЗУСЛОВНО из ОДНОЙ дельты. */
     fun addTunnel(rx: Long, tx: Long) = synchronized(lock) {
         val r = rx.coerceAtLeast(0); val t = tx.coerceAtLeast(0)
         if (r > 0 || t > 0) {
+            ensureSessionStarted()
             val k = today()
             val b = days[k] ?: DayBucket()
             days[k] = b.copy(tunnelRx = b.tunnelRx + r, tunnelTx = b.tunnelTx + t)  // история/30д
-            rollToday(); todayRx += r; todayTx += t                                 // «за сутки» (независимо)
-            if (sessionActive) { sessionRx += r; sessionTx += t }                    // сессия (независимо)
+            rollToday(); todayRx += r; todayTx += t                                 // «за сутки»
+            sessionRx += r; sessionTx += t                                          // сессия — БЕЗУСЛОВНО
             maybePersist()
             publish()
         }
     }
 
-    /** Тестовый трафик (всего_байт пробника). Считается всегда; в сессию — только пока сервис активен. */
+    /** Тестовый трафик (всего_байт пробника). Обновляет ТРИ счётчика БЕЗУСЛОВНО (полный тест идёт без сервиса!). */
     fun addTest(bytes: Long) = synchronized(lock) {
         if (bytes > 0) {
+            ensureSessionStarted()
             val k = today()
             val b = days[k] ?: DayBucket()
             days[k] = b.copy(test = b.test + bytes)      // история/30д
             rollToday(); todayTest += bytes              // «за сутки»
-            if (sessionActive) sessionTest += bytes       // сессия
+            sessionTest += bytes                          // сессия — БЕЗУСЛОВНО
             maybePersist()
             publish()
         }
@@ -183,11 +195,10 @@ object TrafficTracker {
 
     // Три кнопки — три НЕЗАВИСИМЫХ счётчика: сброс одного не трогает другие.
 
-    /** «С последнего запуска»: обнулить ТОЛЬКО счётчики сессии и таймер. Без подтверждения, без диска. */
+    /** «С последнего запуска»: обнулить ТОЛЬКО счётчики сессии и её таймер (общая точка отсчёта). */
     fun resetSession() = synchronized(lock) {
         sessionRx = 0; sessionTx = 0; sessionTest = 0
-        sessionStartElapsed = SystemClock.elapsedRealtime()
-        sessionEndElapsed = if (sessionActive) 0 else sessionStartElapsed
+        sessionStartElapsed = SystemClock.elapsedRealtime()   // байты И таймер — от одной точки
         publish()
     }
 
@@ -235,10 +246,9 @@ object TrafficTracker {
         for (b in days.values) { rx += b.tunnelRx; tx += b.tunnelTx; test += b.test }
         val list = days.entries.sortedByDescending { it.key }.map { it.key to it.value }
         _state.value = TrafficSnapshot(
-            sessionActive = sessionActive,
             sessionStartElapsed = sessionStartElapsed,
-            sessionEndElapsed = sessionEndElapsed,
             sessionRx = sessionRx, sessionTx = sessionTx, sessionTest = sessionTest,
+            proxyActive = proxyActive, proxyStartElapsed = proxyStartElapsed, proxyEndElapsed = proxyEndElapsed,
             today = today, total30 = DayBucket(rx, tx, test), days = list,
         )
     }

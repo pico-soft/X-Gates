@@ -68,7 +68,7 @@ object FullTestRunner {
             onPhase("Этап 2: скорость по ${alive.size} живым…")
             emitProgress(0, alive.size)   // новая шкала фазы скорости — сброс в 0
 
-            val minUsable = SettingsStore.current().minUsableMbps   // снимок порога на прогон
+            val settings = SettingsStore.current()   // снимок порога/протоколов на прогон
             var connected: ServerProfile? = null
             var connectedSpeed = 0.0
             var best: ServerProfile? = null
@@ -78,8 +78,9 @@ object FullTestRunner {
                 context = appCtx,
                 servers = alive,
                 onResult = { p, mbps ->
-                    onSpeedResult(p, mbps)
-                    if (mbps >= minUsable) {
+                    onSpeedResult(p, mbps)   // МЕРЯЕМ ВСЕХ; результат сохраняем всегда
+                    // ВЫБОР — через единый предикат (протокол + мин.скорость). Замер не фильтруем.
+                    if (ServerFilter.isSelectable(p, mbps, settings)) {
                         if (mbps > bestSpeed) { bestSpeed = mbps; best = p }
                         if (connected == null) {
                             // Сначала — к ПЕРВОМУ живому: связь сразу, любая полезная скорость.
