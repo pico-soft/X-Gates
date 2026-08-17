@@ -16,6 +16,7 @@ data class FetchResult(
     val exceptionClass: String?,   // напр. UnknownHostException / SocketTimeoutException
     val errorMessage: String?,
     val redirectChain: List<String> = emptyList(),   // все URL по цепочке редиректов (для диагностики)
+    val retryAfterSec: Int? = null,   // заголовок Retry-After (сек), если сервер прислал (HTTP 429/503)
 )
 
 /**
@@ -29,6 +30,22 @@ data class FetchResult(
 object SubscriptionFetcher {
 
     private const val MAX_REDIRECTS = 5
+
+    /**
+     * Заголовок Retry-After (HTTP 429/503): либо число секунд, либо HTTP-дата. Возвращаем секунды до
+     * повтора (0..) или null, если заголовка/разобрать нет. Отрицательную дельту зажимаем в 0.
+     */
+    private fun parseRetryAfter(raw: String?): Int? {
+        val v = raw?.trim().orEmpty()
+        if (v.isEmpty()) return null
+        v.toIntOrNull()?.let { return it.coerceAtLeast(0) }   // форма «секунды»
+        return try {                                           // форма HTTP-дата (RFC 1123)
+            val fmt = java.text.SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz", java.util.Locale.US)
+                .apply { timeZone = java.util.TimeZone.getTimeZone("GMT") }
+            val whenMs = fmt.parse(v)?.time ?: return null
+            ((whenMs - System.currentTimeMillis()) / 1000L).coerceAtLeast(0L).toInt()
+        } catch (e: Exception) { null }
+    }
 
     /**
      * [open] — как открыть соединение для очередного URL: напрямую (`{ it.openConnection() }`), через
@@ -75,6 +92,7 @@ object SubscriptionFetcher {
 
                 val contentType = conn.contentType
                 val contentLength = conn.contentLengthLong
+                val retryAfter = parseRetryAfter(conn.getHeaderField("Retry-After"))
                 val stream = if (code in 200..299) conn.inputStream else (conn.errorStream ?: conn.inputStream)
                 val body = try {
                     stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
@@ -87,6 +105,7 @@ object SubscriptionFetcher {
                     finalUrl = current, httpCode = code, contentType = contentType,
                     contentLength = contentLength, bodyBytes = body.toByteArray(Charsets.UTF_8).size,
                     body = body, exceptionClass = null, errorMessage = null, redirectChain = hops,
+                    retryAfterSec = retryAfter,
                 )
             }
             // вышли по исчерпанию редиректов без финального ответа

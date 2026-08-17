@@ -23,6 +23,9 @@ data class RefreshSummary(
     val invalid: Int = 0,       // битые/неизвестные строки
     val duplicates: Int = 0,    // повторы в самом источнике — отброшены
     val error: String? = null,
+    val outcome: SourceOutcome = if (ok) SourceOutcome.OK else SourceOutcome.ERROR,
+    val rateLimited: Boolean = false,   // HTTP 429 — панель ограничивает частоту (Промпт 81.A)
+    val retryAfterSec: Int? = null,     // из Retry-After (когда можно повторить)
 )
 
 /** Итог склейки при импорте (факт-проверка дедупа между источниками). */
@@ -77,6 +80,8 @@ object SubscriptionManager {
         if (!f.seededDefaultRuBypass && f.sources.isNotEmpty()) {
             SubscriptionStore.save(context, f.copy(seededDefaultRuBypass = true))
         }
+        // Промпт 85.E: самопроверка — неполные (осиротевшие) профили пересобрать из сырья + записать в журнал.
+        runCatching { verifyAndHeal(context) }
     }
 
     /**
@@ -218,7 +223,12 @@ object SubscriptionManager {
 
     // ─────────────────────────── управление источниками ───────────────────────────
 
-    /** Добавить источник по URL (нормализуем, дедуп по нормализованному url). Возвращает id или null. */
+    /**
+     * Добавить источник по URL (нормализуем, дедуп по ТОЧНОМУ нормализованному url). Возвращает id или null.
+     * NB (Промпт 81, уточнение): дубли РАЗНЫХ адресов, ведущих к одному списку (raw.githack.com и свой
+     * домен) — НАМЕРЕННАЯ страховка (недоступен один путь — работает другой), их не блокируем и не помечаем.
+     * Блокируем лишь ТОЧНОЕ повторное добавление одного и того же url.
+     */
     fun addUrl(context: Context, url: String, name: String? = null): String? {
         val u = normalizeUrl(url)
         if (u.isEmpty()) return null
@@ -249,27 +259,34 @@ object SubscriptionManager {
         }))
     }
 
-    /** Удалить источник; серверы убираем ТОЛЬКО там, где не осталось ни одного источника. */
+    /**
+     * Удалить источник. Промпт 85: реестр ПЕРЕСОБИРАЕМ из оставшихся источников (по их сырым телам), а НЕ
+     * вычитаем записи на месте. Вычитание оставляло осиротевшие профили у пары-страховки (общий сервер
+     * числился за второй подпиской, но с данными от удалённой первой → список есть, подключиться нельзя).
+     */
     fun remove(context: Context, id: String) {
         val file = SubscriptionStore.load(context)
-        val sources = file.sources.filterNot { it.id == id }
-        val servers = file.servers.mapNotNull { rec ->
-            val ids = rec.sourceIds - id
-            if (ids.isEmpty()) null else rec.copy(sourceIds = ids)
-        }
-        SubscriptionStore.save(context, recount(file.copy(sources = sources, servers = servers)))
+        val trimmed = file.copy(
+            sources = file.sources.filterNot { it.id == id },
+            rawBodies = file.rawBodies - id,
+        )
+        SubscriptionStore.save(context, recount(rebuildRegistry(trimmed)))
     }
 
     /** Сколько серверов ИСЧЕЗНЕТ при удалении источника (принадлежат только ему). */
     fun serversLostOnRemove(context: Context, id: String): Int =
         SubscriptionStore.load(context).servers.count { it.sourceIds.singleOrNull() == id }
 
-    /** Вкл/выкл источник (серверы не удаляем — фильтруются при чтении по enabled). */
+    /**
+     * Вкл/выкл источник. Промпт 85: тоже ПЕРЕСОБИРАЕМ реестр (та же болезнь возможна и здесь). Данные
+     * выключенного источника НЕ теряются — пересборка идёт из ВСЕХ источников с сырым телом (не только
+     * включённых), а фильтр вкл/выкл применяется при ЧТЕНИИ ([allServers]) → включение обратно возвращает
+     * полноценные записи без ручного переимпорта.
+     */
     fun setEnabled(context: Context, id: String, enabled: Boolean) {
         val file = SubscriptionStore.load(context)
-        SubscriptionStore.save(context, file.copy(sources = file.sources.map {
-            if (it.id == id) it.copy(enabled = enabled) else it
-        }))
+        val updated = file.copy(sources = file.sources.map { if (it.id == id) it.copy(enabled = enabled) else it })
+        SubscriptionStore.save(context, recount(rebuildRegistry(updated)))
     }
 
     // ─────────────────────────── обновление ───────────────────────────
@@ -316,6 +333,24 @@ object SubscriptionManager {
         }
 
         if (!cascade.ok) {
+            // Терминальный код (Промпт 81.A): каскад ОБОРВАН, маршрут ни при чём. Классифицируем отдельно —
+            // 429 это ограничение частоты (не поломка), 401/403/404 — адрес/токен/ресурс. НЕ «перебор ступеней».
+            val term = cascade.result?.takeIf { CascadeFetch.isTerminalHttp(it.httpCode) }
+            if (term != null) {
+                val rateLimited = term.httpCode == 429
+                val retry = term.retryAfterSec
+                val msg = when (term.httpCode) {
+                    429 -> "Панель ограничивает частоту запросов (HTTP 429) — это не блокировка и не поломка " +
+                        "подписки. " + (if (retry != null) "Повторите через ~$retry с." else "Повторите через минуту.")
+                    401, 403 -> "Доступ к подписке отклонён (HTTP ${term.httpCode}) — проверьте адрес/токен. " +
+                        "Смена маршрута не поможет."
+                    else -> "Подписка не найдена (HTTP ${term.httpCode}) — проверьте адрес. Смена маршрута не поможет."
+                }
+                val outcome = if (rateLimited) SourceOutcome.RATE_LIMITED else SourceOutcome.ERROR
+                setStatus(context, id, ok = false, outcome = outcome, error = msg, detail = stagesDetail, retryAfter = retry)
+                log("  → ТЕРМИНАЛ HTTP ${term.httpCode} (каскад оборван): $msg")
+                return RefreshSummary(ok = false, error = msg, outcome = outcome, rateLimited = rateLimited, retryAfterSec = retry)
+            }
             // Итог ПО КАЖДОЙ ступени (кроме пропущенных по неприменимости — они отчёт не засоряют).
             val err = "Не скачалось. " + cascade.attempts.filterNot { it.skipped }.joinToString("; ") { a ->
                 val r = a.result
@@ -375,7 +410,13 @@ object SubscriptionManager {
     ): Map<String, RefreshSummary> {
         val result = LinkedHashMap<String, RefreshSummary>()
         val targets = SubscriptionStore.load(context).sources.filter { it.enabled && it.url.isNotBlank() }
-        for (src in targets) {
+        // Промпт 81.B (уточнён Elyor): НЕ ограничиваем по хосту — хосты у источников разные, но упираются в
+        // ОДНУ панель. Просто разносим запросы во времени (пауза между источниками). 429 обрывает ступени
+        // ТОЛЬКО для своего источника (81.A); остальные обновляем как обычно — «другой путь» пары-страховки
+        // (тот же список серверов иным адресом) может пройти, в этом и смысл.
+        for ((i, src) in targets.withIndex()) {
+            if (cancelled()) break
+            if (i > 0) runCatching { Thread.sleep(BETWEEN_SOURCES_PAUSE_MS) }
             if (cancelled()) break
             val summary = runCatching { refreshOne(context, src.id) }
                 .getOrElse { RefreshSummary(ok = false, error = it.message ?: "ошибка") }
@@ -384,6 +425,8 @@ object SubscriptionManager {
         }
         return result
     }
+
+    private const val BETWEEN_SOURCES_PAUSE_MS = 1200L   // разнос запросов во времени при «Обновить все» (81.B)
 
     /**
      * Оффлайн-ядро: тело → decode → parse → склейка в реестр под источник [id] → пересчёт → save.
@@ -397,7 +440,8 @@ object SubscriptionManager {
         val bytes = body.toByteArray(Charsets.UTF_8).size
         if (body.isBlank()) {
             val err = "Тело пустое (0 байт)"
-            persistMerge(context, id, emptyList(), ok = false, error = err, detail = detail)
+            // Промпт 85: неудача НЕ вычитает серверы — только статус. Прежние записи целы (сырое тело не трогаем).
+            setStatus(context, id, ok = false, error = err, detail = detail)
             log("  → $err")
             return RefreshSummary(ok = false, error = err)
         }
@@ -424,26 +468,123 @@ object SubscriptionManager {
                 else ->
                     "Скачано $bytes байт, ссылок не найдено (похоже на ${sniff(body)})"
             }
-            persistMerge(context, id, emptyList(), ok = false, error = err, detail = detail)
+            // Промпт 85: разобрано 0 ссылок — статус-ошибка БЕЗ вычитания серверов и БЕЗ перезаписи сырого тела.
+            setStatus(context, id, ok = false, error = err, detail = detail)
             log("  → $err")
             return RefreshSummary(ok = false, added = 0, unsupported = unsupported, invalid = invalid, error = err)
         }
 
-        persistMerge(context, id, profiles, ok = true, error = null, detail = detail)
+        // Промпт 85: успех — СОХРАНИТЬ сырое тело источника и ПЕРЕСОБРАТЬ реестр из всех тел (а не дописывать
+        // записи на месте). Профили всегда парсятся заново из сырья → полны и не зависят от порядка источников.
+        storeRawAndRebuild(context, id, body, detail)
         return RefreshSummary(ok = true, added = profiles.size, unsupported = unsupported, invalid = invalid, duplicates = duplicates)
     }
 
-    /** Влить профили под источник [id] в реестр + выставить статус/детали источника + пересчёт + save. */
-    private fun persistMerge(
-        context: Context, id: String, profiles: List<ServerProfile>,
-        ok: Boolean, error: String?, detail: String?,
-    ) {
+    /** Сохранить сырое тело источника [id] и ПЕРЕСОБРАТЬ реестр (Промпт 85). Статус источника — успех. */
+    private fun storeRawAndRebuild(context: Context, id: String, body: String, detail: String?) {
         val file = SubscriptionStore.load(context)
-        val (registry, _) = mergeIntoRegistry(file.servers, id, profiles)
-        val sources = file.sources.map {
-            if (it.id == id) it.copy(lastOk = ok, lastError = error, lastDetail = detail, lastRefreshTs = now()) else it
+        val withRaw = file.copy(rawBodies = file.rawBodies + (id to body))
+        val rebuilt = rebuildRegistry(withRaw)
+        val sources = rebuilt.sources.map {
+            if (it.id == id) applyStatus(it, true, SourceOutcome.OK, null, detail, null) else it
         }
-        SubscriptionStore.save(context, recount(file.copy(sources = sources, servers = registry)))
+        SubscriptionStore.save(context, recount(rebuilt.copy(sources = sources)))
+    }
+
+    /**
+     * ПЕРЕСБОРКА реестра из сырых тел источников (Промпт 85) — единственная точка формирования [servers].
+     * Для каждого источника С СЫРЫМ ТЕЛОМ парсим профили заново (полные, независимо от порядка) и склеиваем
+     * по serverKey (union членства). Источники БЕЗ сырья (legacy до первого обновления) сохраняют прежние
+     * записи. ИЗМЕРЕНИЯ (ping/speed/ts) переносятся по serverKey из прежнего реестра — пересборка их не теряет.
+     */
+    private fun rebuildRegistry(file: SourcesFile): SourcesFile {
+        val meas = HashMap<String, ServerProfile>()
+        for (rec in file.servers) meas[serverKey(rec.profile)] = rec.profile
+
+        val byKey = LinkedHashMap<String, ServerRecord>()
+        fun add(p: ServerProfile, sid: String) {
+            val k = serverKey(p)
+            val ex = byKey[k]
+            if (ex == null) {
+                val m = meas[k]
+                val prof = if (m != null) p.copy(
+                    pingMs = m.pingMs, lastTestedTs = m.lastTestedTs,
+                    speedMbps = m.speedMbps, speedTestedTs = m.speedTestedTs,
+                ) else p
+                byKey[k] = ServerRecord(prof, listOf(sid))
+            } else if (sid !in ex.sourceIds) {
+                byKey[k] = ex.copy(sourceIds = ex.sourceIds + sid)
+            }
+        }
+
+        val validIds = file.sources.map { it.id }.toHashSet()
+        val withRaw = HashSet<String>()
+        for (src in file.sources) {
+            val raw = file.rawBodies[src.id] ?: continue
+            withRaw.add(src.id)
+            for (p in parseProfiles(raw)) add(p, src.id)
+        }
+        // Legacy-источники без сырья: сохранить прежние записи (до первого обновления, которое положит сырьё).
+        for (rec in file.servers) for (sid in rec.sourceIds) {
+            if (sid in withRaw || sid !in validIds) continue
+            add(rec.profile, sid)
+        }
+        return file.copy(servers = byKey.values.toList())
+    }
+
+    /** Разбор тела в профили (decode → parse → дедуп внутри источника). Для пересборки реестра (Промпт 85). */
+    private fun parseProfiles(body: String): List<ServerProfile> {
+        val out = ArrayList<ServerProfile>()
+        val seen = HashSet<String>()
+        for (line in SubscriptionDecoder.decode(body)) {
+            val r = ServerLinkParser.parse(line)
+            if (r is ParseResult.Supported && seen.add(serverKey(r.profile))) out.add(r.profile)
+        }
+        return out
+    }
+
+    /** Профиль полон (можно подключиться): есть адрес, порт и учётные данные. Пустой credential = осиротевшая запись. */
+    private fun isProfileComplete(p: ServerProfile): Boolean =
+        p.address.isNotBlank() && p.port > 0 && p.credential.isNotBlank()
+
+    /**
+     * САМОПРОВЕРКА реестра (Промпт 85.E): если есть записи с НЕПОЛНЫМ профилем — ПЕРЕСОБРАТЬ реестр из сырья
+     * и записать событие в журнал, а не оставлять пользователю неподключаемый список. Вызывать на старте.
+     */
+    fun verifyAndHeal(context: Context) {
+        val file = SubscriptionStore.load(context)
+        val bad = file.servers.count { !isProfileComplete(it.profile) }
+        if (bad == 0) return
+        val rebuilt = recount(rebuildRegistry(file))
+        val after = rebuilt.servers.count { !isProfileComplete(it.profile) }
+        SubscriptionStore.save(context, rebuilt)
+        runCatching {
+            com.picosoft.xrayproxydroid.monitor.MonitorLog.event(
+                context, "monitor", "Реестр: неполные профили — пересборка",
+                "было $bad, после пересборки $after" + if (after > 0) " (нужно обновить источники)" else "",
+            )
+        }
+        Log.w(TAG, "verifyAndHeal: неполных было $bad, стало $after")
+    }
+
+    /**
+     * Единая запись статуса источника (Промпт 81.C). Успех обновляет время УДАЧИ (lastOkTs) и ОЧИЩАЕТ
+     * lastError; неудача сохраняет прежнее время удачи (ошибка не залипает поверх свежих данных). Время
+     * ПОПЫТКИ (lastRefreshTs) обновляется всегда. retryAfterSec держим только для RATE_LIMITED.
+     */
+    private fun applyStatus(
+        s: SubSource, ok: Boolean, outcome: SourceOutcome, error: String?, detail: String?, retryAfter: Int?,
+    ): SubSource {
+        val ts = now()
+        return s.copy(
+            lastRefreshTs = ts,
+            lastOkTs = if (ok) ts else s.lastOkTs,
+            lastOk = ok,
+            lastOutcome = outcome,
+            lastError = if (ok) null else error,
+            lastDetail = detail,
+            retryAfterSec = if (outcome == SourceOutcome.RATE_LIMITED) retryAfter else null,
+        )
     }
 
     /** На что похоже тело (для сообщения «ссылок не найдено»). */
@@ -521,10 +662,13 @@ object SubscriptionManager {
     // ─────────────────────────── helpers ───────────────────────────
 
     /** Выставить статус источника (сетевой/HTTP отказ — без изменения серверов). */
-    private fun setStatus(context: Context, id: String, ok: Boolean, error: String?, detail: String?) {
+    private fun setStatus(
+        context: Context, id: String, ok: Boolean, error: String?, detail: String?,
+        outcome: SourceOutcome = if (ok) SourceOutcome.OK else SourceOutcome.ERROR, retryAfter: Int? = null,
+    ) {
         val file = SubscriptionStore.load(context)
         SubscriptionStore.save(context, file.copy(sources = file.sources.map {
-            if (it.id == id) it.copy(lastOk = ok, lastError = error, lastDetail = detail, lastRefreshTs = now()) else it
+            if (it.id == id) applyStatus(it, ok, outcome, error, detail, retryAfter) else it
         }))
     }
 

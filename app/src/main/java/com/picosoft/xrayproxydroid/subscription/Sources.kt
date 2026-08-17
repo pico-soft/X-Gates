@@ -4,15 +4,29 @@ import com.picosoft.xrayproxydroid.xray.link.ServerProfile
 import kotlinx.serialization.Serializable
 
 /**
+ * Исход последней ПОПЫТКИ обновления источника (Промпт 81.A/C). Не «ok: Boolean» — 429 и отложенность
+ * это НЕ поломка, и красным их показывать неверно: панель жива, просто ограничивает частоту.
+ */
+@Serializable
+enum class SourceOutcome {
+    OK,            // успешно загружено
+    ERROR,         // реальная неудача (сеть/парсинг/40x-кроме-429)
+    RATE_LIMITED,  // HTTP 429 — панель ограничивает частоту, не поломка; смена маршрута не помогает
+}
+
+/**
  * Источник серверов (подписка по URL или локальная вставка). ТОЛЬКО метаданные — серверы лежат
  * в общем реестре [ServerRecord] (склеены по serverKey между источниками), не вложены сюда.
  *
  * @param id            стабильный уникальный id (UUID) — членство сервера ссылается на него
  * @param url           адрес подписки; ПУСТОЙ для локальных источников (вставка/файл)
  * @param enabled       выключенный источник не даёт серверов и не обновляется
- * @param lastRefreshTs время последнего обновления ("yyyy-MM-dd HH:mm")
- * @param lastOk        итог последнего обновления: true/false/null (ни разу)
- * @param lastError     текст ошибки последнего обновления (для тапа по красной точке)
+ * @param lastRefreshTs время ПОСЛЕДНЕЙ ПОПЫТКИ обновления ("yyyy-MM-dd HH:mm")
+ * @param lastOkTs      время последней УСПЕШНОЙ загрузки (Промпт 81.C — отдельно от попытки)
+ * @param lastOk        итог последней попытки: true/false/null (ни разу) — оставлен для совместимости
+ * @param lastOutcome   типизированный исход последней попытки (Промпт 81) — для цвета точки и текста
+ * @param lastError     текст ошибки последней НЕУДАЧНОЙ попытки; ОЧИЩАЕТСЯ при первой успешной (81.C)
+ * @param retryAfterSec для RATE_LIMITED — через сколько секунд можно повторить (заголовок Retry-After)
  * @param serverCount   сколько серверов принадлежит этому источнику (денормализовано, пересчёт при записи)
  */
 @Serializable
@@ -22,9 +36,12 @@ data class SubSource(
     val url: String = "",
     val enabled: Boolean = true,
     val lastRefreshTs: String? = null,
+    val lastOkTs: String? = null,
     val lastOk: Boolean? = null,
-    val lastError: String? = null,     // суть ошибки (видна всегда, красным)
+    val lastOutcome: SourceOutcome? = null,
+    val lastError: String? = null,     // суть ошибки последней НЕУДАЧИ (очищается при успехе)
     val lastDetail: String? = null,    // диагностика под тапом (URL/код/байты/тело-200/исключение)
+    val retryAfterSec: Int? = null,    // для RATE_LIMITED (сколько ждать)
     val serverCount: Int = 0,
 )
 
@@ -52,4 +69,9 @@ data class SourcesFile(
     val seededDefaultRuBypass: Boolean = false,
     val sources: List<SubSource> = emptyList(),
     val servers: List<ServerRecord> = emptyList(),
+    // Промпт 85: СЫРОЙ ответ каждого источника (sourceId → тело). Позволяет ПЕРЕСОБРАТЬ реестр целиком из
+    // оставшихся источников при удалении/выключении/включении/обновлении — вместо вычитания записей на месте
+    // (вычитание оставляло осиротевшие профили: запись числится за источником, но данные потеряны). Реестр
+    // [servers] — производный КЭШ (несёт измерения); источник истины для пересборки — эти тела.
+    val rawBodies: Map<String, String> = emptyMap(),
 )
