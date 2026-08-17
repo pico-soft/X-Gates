@@ -77,6 +77,15 @@ object CascadeFetch {
     private const val MAX_REDIRECTS = 5
     private const val DOWNLOAD_BUFFER = 64 * 1024
 
+    /**
+     * Коды, при которых каскад ОБРЫВАЕТСЯ немедленно (Промпт 81.A) — маршрут ни при чём, перебор ступеней
+     * бессмыслен и вреден: 429 = «слишком много запросов» (смена пути бьёт по ТОЙ ЖЕ панели повторно и
+     * усугубляет лимит); 401/403 = доступ отклонён (токен/адрес); 404 = ресурса нет. Ответ ОТ СЕРВЕРА —
+     * значит путь рабочий, дело в самом запросе/ресурсе.
+     */
+    private val TERMINAL_HTTP = setOf(401, 403, 404, 429)
+    fun isTerminalHttp(code: Int): Boolean = code in TERMINAL_HTTP
+
     /** План одной HTTP-ступени: либо [open] (пробуем), либо [skipNote]≠"" (пропускаем с причиной). */
     private class StagePlan(
         val stage: FetchStage,
@@ -178,6 +187,7 @@ object CascadeFetch {
         totalTimeoutMs: Int,
         acceptBody: (FetchResult) -> Boolean = { it.ok && it.body.isNotBlank() },
         proxyFirst: Boolean = false,
+        allowTempInstance: Boolean = true,
     ): CascadeResult {
         val app = context.applicationContext
         val cm = app.getSystemService(ConnectivityManager::class.java)
@@ -193,10 +203,16 @@ object CascadeFetch {
             val ok = acceptBody(r)
             attempts.add(CascadeAttempt(plan.stage, skipped = false, accepted = ok, result = r))
             if (ok) return CascadeResult(true, plan.stage, r, attempts)
+            // Терминальный код (429/401/403/404, Промпт 81.A): сервер ОТВЕТИЛ — путь рабочий, менять
+            // маршрут бессмысленно и вредно. ОБРЫВАЕМ каскад, остальные ступени/temp-инстанс не трогаем.
+            if (isTerminalHttp(r.httpCode)) return CascadeResult(false, plan.stage, r, attempts)
         }
 
-        // 6 — temp-инстанс на недавно рабочих серверах (только текстовый путь)
-        if (MonitorCoordinator.fullTestRunning || MonitorCoordinator.monitorSearchRunning) {
+        // 6 — temp-инстанс на недавно рабочих серверах (только текстовый путь). Промпт 81.E: для обновлений
+        //     (килобайтный манифест) отключаем — незачем перебирать временные серверы ради мелкого файла.
+        if (!allowTempInstance) {
+            attempts.add(skip(FetchStage.TEMP_RECENT, "temp-инстанс отключён для этого запроса"))
+        } else if (MonitorCoordinator.fullTestRunning || MonitorCoordinator.monitorSearchRunning) {
             attempts.add(skip(FetchStage.TEMP_RECENT, "идёт полный тест / перебор монитора"))
         } else {
             val candidates = SubscriptionManager.recentWorkingServers(app).take(MAX_TEMP_CANDIDATES)
@@ -255,7 +271,11 @@ object CascadeFetch {
                     attempts.add(CascadeAttempt(plan.stage, skipped = false, accepted = true, result = null, note = "OK, ${res.bytes} б"))
                     return CascadeDownloadResult(true, plan.stage, res.bytes, attempts)
                 }
-                else -> attempts.add(CascadeAttempt(plan.stage, skipped = false, accepted = false, result = null, note = res.note))
+                else -> {
+                    attempts.add(CascadeAttempt(plan.stage, skipped = false, accepted = false, result = null, note = res.note))
+                    // Терминальный код (Промпт 81.A): ОБРЫВ, остальные ступени не пробуем.
+                    if (isTerminalHttp(res.code)) return CascadeDownloadResult(false, plan.stage, res.bytes, attempts)
+                }
             }
         }
 
@@ -263,7 +283,7 @@ object CascadeFetch {
         return CascadeDownloadResult(false, null, 0, attempts)
     }
 
-    private class StreamOutcome(val ok: Boolean, val bytes: Long, val note: String, val cancelled: Boolean = false)
+    private class StreamOutcome(val ok: Boolean, val bytes: Long, val note: String, val cancelled: Boolean = false, val code: Int = -1)
 
     /** Одна попытка стрима в файл: проходим редиректы (в т.ч. GitHub asset → CDN), пишем чанками. */
     private fun streamTo(
@@ -298,7 +318,7 @@ object CascadeFetch {
                     redirects++
                     continue
                 }
-                if (code !in 200..299) { conn.disconnect(); return StreamOutcome(false, 0, "HTTP $code") }
+                if (code !in 200..299) { conn.disconnect(); return StreamOutcome(false, 0, "HTTP $code", code = code) }
 
                 val total = if (conn.contentLengthLong > 0) conn.contentLengthLong else expectedSize
                 var downloaded = 0L
