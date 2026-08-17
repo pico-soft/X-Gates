@@ -80,8 +80,11 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import kotlin.math.cos
 import kotlin.math.sin
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
@@ -128,6 +131,7 @@ import com.picosoft.xrayproxydroid.xray.ExternalIpChecker
 import com.picosoft.xrayproxydroid.xray.FullTestRunner
 import com.picosoft.xrayproxydroid.xray.ServerFilter
 import com.picosoft.xrayproxydroid.xray.ServerSpeedTester
+import com.picosoft.xrayproxydroid.xray.XrayConfig
 import com.picosoft.xrayproxydroid.xray.XrayConfigBuilder
 import com.picosoft.xrayproxydroid.xray.link.Protocol
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
@@ -233,6 +237,8 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
     val vpnStatus by SystemVpnState.state.collectAsState()   // сообщение о системном VPN — здесь, на цветном поле
     // Состояние раскрытия — на уровне вкладки (стабильное позиционное scoping), все свёрнуты по умолчанию.
     var aboutExpanded by rememberSaveable { mutableStateOf(false) }
+    var proxyExpanded by rememberSaveable { mutableStateOf(false) }
+    var browserExpanded by rememberSaveable { mutableStateOf(false) }
     var settingsExpanded by rememberSaveable { mutableStateOf(false) }
     var blocklistExpanded by rememberSaveable { mutableStateOf(false) }
     var monitorExpanded by rememberSaveable { mutableStateOf(false) }
@@ -249,6 +255,16 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
         item {
             CollapsibleSection("О приложении", aboutExpanded, { aboutExpanded = !aboutExpanded }, icon = UiIcon.INFO) {
                 AboutSection()
+            }
+        }
+        item {
+            CollapsibleSection("Локальный прокси", proxyExpanded, { proxyExpanded = !proxyExpanded }, icon = UiIcon.LINK) {
+                LocalProxySection()
+            }
+        }
+        item {
+            CollapsibleSection("Настройте браузер", browserExpanded, { browserExpanded = !browserExpanded }, icon = UiIcon.GLOBE) {
+                BrowserSetupSection()
             }
         }
         item {
@@ -499,7 +515,7 @@ private fun NavIcon(index: Int, color: Color, size: androidx.compose.ui.unit.Dp)
  * (ℹ️⚙️🚫🛡️📄) и глифов-шрифта (▶■↻✎) — чтобы ВСЕ иконки были единообразны, как на нижней плашке.
  * Инлайновые статус-маркеры таблицы (●○✗) и каретки ▸▾ — это не «иконки», их не трогаем.
  */
-private enum class UiIcon { INFO, GEAR, BLOCK, SHIELD, TRAFFIC, DOC, REFRESH, PLAY, STOP, PENCIL, WARN }
+private enum class UiIcon { INFO, GEAR, BLOCK, SHIELD, TRAFFIC, DOC, REFRESH, PLAY, STOP, PENCIL, WARN, LINK, GLOBE, COPY }
 
 @Composable
 private fun FlatIcon(
@@ -583,6 +599,27 @@ private fun FlatIcon(
                 }, color, style = stroke)
                 drawLine(color, Offset(s * 0.5f, s * 0.42f), Offset(s * 0.5f, s * 0.62f), sw)
                 drawCircle(color, sw * 0.6f, Offset(s * 0.5f, s * 0.72f))
+            }
+            UiIcon.LINK -> {   // два узла, соединённые линией (локальный прокси/подключение)
+                val rN = s * 0.13f
+                drawCircle(color, rN, Offset(s * 0.28f, s * 0.34f), style = stroke)
+                drawCircle(color, rN, Offset(s * 0.72f, s * 0.66f), style = stroke)
+                drawLine(color, Offset(s * 0.38f, s * 0.44f), Offset(s * 0.62f, s * 0.56f), sw)
+            }
+            UiIcon.GLOBE -> {   // глобус: круг + меридиан + экватор
+                val r = s * 0.36f
+                drawCircle(color, r, c, style = stroke)
+                drawLine(color, Offset(c.x - r, c.y), Offset(c.x + r, c.y), sw)
+                drawArc(color, startAngle = 90f, sweepAngle = 180f, useCenter = false,
+                    topLeft = Offset(c.x - r * 0.5f, c.y - r), size = Size(r, 2 * r), style = stroke)
+                drawArc(color, startAngle = 270f, sweepAngle = 180f, useCenter = false,
+                    topLeft = Offset(c.x - r * 0.5f, c.y - r), size = Size(r, 2 * r), style = stroke)
+            }
+            UiIcon.COPY -> {   // две наложенные страницы
+                drawRoundRect(color, topLeft = Offset(s * 0.34f, s * 0.20f), size = Size(s * 0.40f, s * 0.48f),
+                    cornerRadius = CornerRadius(s * 0.06f, s * 0.06f), style = stroke)
+                drawRoundRect(color, topLeft = Offset(s * 0.22f, s * 0.32f), size = Size(s * 0.40f, s * 0.48f),
+                    cornerRadius = CornerRadius(s * 0.06f, s * 0.06f), style = stroke)
             }
         }
     }
@@ -2204,6 +2241,105 @@ private fun AboutSection() {
         SettingsGroupLabel("Версия")
         InfoLine("Приложение", UpdateStore.appVersion())
         InfoLine("Ядро xray", coreVersion ?: "недоступна")
+    }
+}
+
+private fun copyToast(ctx: Context, msg: String) =
+    android.widget.Toast.makeText(ctx, msg, android.widget.Toast.LENGTH_SHORT).show()
+
+/** Кликабельный текст: тап копирует [copy] в буфер + Toast. */
+@Composable
+private fun CopyText(text: String, copy: String = text, mono: Boolean = false, modifier: Modifier = Modifier) {
+    val clip = LocalClipboardManager.current
+    val ctx = LocalContext.current
+    Text(
+        text,
+        style = MaterialTheme.typography.bodyMedium,
+        fontFamily = if (mono) FontFamily.Monospace else null,
+        modifier = modifier
+            .clip(RoundedCornerShape(4.dp))
+            .clickable { clip.setText(AnnotatedString(copy)); copyToast(ctx, "Скопировано: $copy") }
+            .padding(vertical = 2.dp, horizontal = 2.dp),
+    )
+}
+
+/**
+ * Секция «Локальный прокси» — адрес нашего SOCKS/HTTP для приложений НА ЭТОМ ЖЕ телефоне (127.0.0.1).
+ * Заменяет отсутствующую «плашку про туннель»: она (VpnStatusCard) появляется только при ЧУЖОМ системном
+ * VPN, а этот блок в Настройках виден всегда и даёт адрес+порт (тап — скопировать).
+ */
+@Composable
+private fun LocalProxySection() {
+    val proxy by ProxyState.state.collectAsState()
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            if (proxy.running) "Прокси запущен — приложения на этом телефоне могут ходить через него."
+            else "Прокси сейчас не запущен (адрес заработает после запуска на «Главной»).",
+            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+        )
+        SettingsGroupLabel("Адрес прокси (тап — скопировать)")
+        ProxyAddrRow("SOCKS5 (рекомендуется)", "${XrayConfig.LISTEN}:${XrayConfig.SOCKS_PORT}")
+        ProxyAddrRow("HTTP", "${XrayConfig.LISTEN}:${XrayConfig.HTTP_PORT}")
+        Text(
+            "Хост 127.0.0.1 — это сам телефон. Для полного обхода включите DNS через прокси (см. «Настройте браузер»).",
+            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+        )
+    }
+}
+
+@Composable
+private fun ProxyAddrRow(label: String, value: String) {
+    val clip = LocalClipboardManager.current
+    val ctx = LocalContext.current
+    Row(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp))
+            .clickable { clip.setText(AnnotatedString(value)); copyToast(ctx, "Скопировано: $value") }
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(label, style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
+            Text(value, style = MaterialTheme.typography.bodyMedium, fontFamily = FontFamily.Monospace)
+        }
+        FlatIcon(UiIcon.COPY, size = 16.dp, color = MaterialTheme.colorScheme.primary)
+    }
+}
+
+/**
+ * Секция «Настройте браузер» — как направить Fennec/Iceraven (движок Firefox) в наш локальный прокси
+ * через about:config. Значения копируются тапом (и ключ, и значение), чтобы не набирать вручную.
+ */
+@Composable
+private fun BrowserSetupSection() {
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            "Fennec / Iceraven (на движке Firefox). Новая вкладка → в адресной строке наберите about:config → примите предупреждение. Для каждой строки: скопируйте ключ, вставьте в поиск, откройте и задайте значение. Тап по ключу или значению — копировать.",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        SettingsGroupLabel("about:config — ключ → значение")
+        ConfigRow("network.proxy.type", "1")
+        ConfigRow("network.proxy.socks", "127.0.0.1")
+        ConfigRow("network.proxy.socks_port", XrayConfig.SOCKS_PORT.toString())
+        ConfigRow("network.proxy.socks_version", "5")
+        ConfigRow("network.proxy.socks_remote_dns", "true")
+        ConfigRow("network.proxy.allow_hijacking_localhost", "true")
+        Text(
+            "После — перезапустите вкладку. Проверка: откройте 2ip.ru, адрес и страна должны быть зарубежными. Выключить обход в браузере — network.proxy.type = 0.",
+            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+        )
+    }
+}
+
+@Composable
+private fun ConfigRow(key: String, value: String) {
+    Row(
+        Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        CopyText(key, mono = true, modifier = Modifier.weight(1f))
+        Text("→", style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
+        CopyText(value, mono = true)
     }
 }
 
