@@ -99,13 +99,15 @@ object CascadeFetch {
         // 1 — напрямую (всегда пробуем)
         plans.add(StagePlan(FetchStage.DIRECT, directTimeoutMs, { it.openConnection() }, ""))
 
-        // 2 — через свой активный SOCKS
-        if (!ProxyState.state.value.running)
-            plans.add(StagePlan(FetchStage.OWN_PROXY, proxyTimeoutMs, null, "прокси не запущен"))
-        else
+        // 2 — через свой активный SOCKS. Доступность определяем ПОПЫТКОЙ СОЕДИНЕНИЯ с портом (Промпт 77.A),
+        //     а НЕ флагом ProxyState.running: флаг — производная величина и может отстать; открытый порт — ФАКТ.
+        if (socksReachable())
             plans.add(StagePlan(FetchStage.OWN_PROXY, proxyTimeoutMs, {
                 it.openConnection(Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", XrayConfig.SOCKS_PORT)))
             }, ""))
+        else
+            plans.add(StagePlan(FetchStage.OWN_PROXY, proxyTimeoutMs, null,
+                "SOCKS-порт ${XrayConfig.SOCKS_PORT} не отвечает (флаг running=${ProxyState.state.value.running})"))
 
         // Отношение НАШЕГО трафика к VPN — из единого источника (сервис вычислил, сняв нашу привязку).
         val vpn = SystemVpnState.state.value
@@ -146,10 +148,27 @@ object CascadeFetch {
         return plans
     }
 
+    /** Ступень OWN_PROXY доступна, если SOCKS-порт РЕАЛЬНО слушает (факт), а не по флагу состояния (77.A). */
+    private fun socksReachable(): Boolean = try {
+        java.net.Socket().use { it.connect(InetSocketAddress("127.0.0.1", XrayConfig.SOCKS_PORT), 300); true }
+    } catch (e: Exception) { false }
+
+    /** Публичная проверка: слушает ли наш SOCKS-порт (факт). Для авто-проверки обновления — дождаться прокси. */
+    fun isOwnProxyUp(): Boolean = socksReachable()
+
+    /** Порядок ступеней. [proxyFirst] (для обновлений, 77.B): если свой SOCKS доступен — ставим его ПЕРВЫМ
+     *  (прямая попытка к GitHub чаще уходит в таймаут впустую). Иначе — обычный порядок «сначала напрямую». */
+    private fun orderedPlans(plans: List<StagePlan>, proxyFirst: Boolean): List<StagePlan> {
+        if (!proxyFirst) return plans
+        val own = plans.firstOrNull { it.stage == FetchStage.OWN_PROXY && it.open != null } ?: return plans
+        return listOf(own) + plans.filterNot { it === own }
+    }
+
     private fun skip(stage: FetchStage, note: String) =
         CascadeAttempt(stage, skipped = true, accepted = false, result = null, note = note)
 
-    /** ТЕКСТОВАЯ загрузка (подписки/JSON): тело в строку, плюс 6-я ступень temp-инстанс. */
+    /** ТЕКСТОВАЯ загрузка (подписки/JSON): тело в строку, плюс 6-я ступень temp-инстанс.
+     *  [proxyFirst] — для запросов обновления: пробовать свой SOCKS ПЕРВЫМ (77.B). */
     fun fetch(
         context: Context,
         url: String,
@@ -158,6 +177,7 @@ object CascadeFetch {
         proxyTimeoutMs: Int,
         totalTimeoutMs: Int,
         acceptBody: (FetchResult) -> Boolean = { it.ok && it.body.isNotBlank() },
+        proxyFirst: Boolean = false,
     ): CascadeResult {
         val app = context.applicationContext
         val cm = app.getSystemService(ConnectivityManager::class.java)
@@ -165,8 +185,8 @@ object CascadeFetch {
         val start = System.nanoTime()
         fun overBudget() = (System.nanoTime() - start) / 1_000_000 > totalTimeoutMs
 
-        // Ступени 1–5 из общего планировщика.
-        for ((i, plan) in httpStagePlans(cm, directTimeoutMs, proxyTimeoutMs).withIndex()) {
+        // Ступени 1–5 из общего планировщика (с учётом proxyFirst для обновлений).
+        for ((i, plan) in orderedPlans(httpStagePlans(cm, directTimeoutMs, proxyTimeoutMs), proxyFirst).withIndex()) {
             if (plan.open == null) { attempts.add(skip(plan.stage, plan.skipNote)); continue }
             if (i > 0 && overBudget()) { attempts.add(skip(plan.stage, "общий таймаут")); continue }
             val r = SubscriptionFetcher.fetch(url, userAgent, plan.timeoutMs, plan.open)
