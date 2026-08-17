@@ -7,8 +7,12 @@ import com.picosoft.xrayproxydroid.BuildConfig
 import com.picosoft.xrayproxydroid.net.CascadeFetch
 import com.picosoft.xrayproxydroid.net.CascadeResult
 import com.picosoft.xrayproxydroid.settings.SettingsStore
+import com.picosoft.xrayproxydroid.subscription.SubscriptionFetcher
 import com.picosoft.xrayproxydroid.traffic.TrafficTracker
+import com.picosoft.xrayproxydroid.xray.XrayConfig
 import kotlinx.serialization.json.Json
+import java.net.InetSocketAddress
+import java.net.Proxy
 
 /**
  * Проверка обновления (Промпт 70, приборы+запасной путь — Промпт 76). БЛОКИРУЮЩАЯ — вызывать в фоне.
@@ -35,6 +39,21 @@ object UpdateChecker {
     private const val LATEST_DOWNLOAD = "https://github.com/pico-soft/XrayProxyDroid/releases/latest/download"
     const val UA = "XrayProxyDroid-Updater"
     private const val MANIFEST_NAME = "update.json"
+
+    /**
+     * Сколько ждать подъёма СВОЕГО SOCKS перед АВТО-проверкой на холодном старте (Промпт 80.B). Автозапуск
+     * коннектится не мгновенно; на сети с заблокированным напрямую GitHub проверка без туннеля обречена,
+     * поэтому авто-проверка ждёт порт, а не уходит впустую напрямую. Единственное место с этой величиной —
+     * ручной кнопке ожидание не нужно. Раньше было 60с (Промпт 77) — избыточно для необязательной проверки.
+     */
+    const val AUTO_CHECK_PROXY_WAIT_MS = 20_000
+
+    // Три РАЗНЫХ узла GitHub, блокируются в РФ раздельно (Промпт 76/80.C). Доступность одного ничего не
+    // говорит про остальные, поэтому в подробностях показываем результат по каждому отдельно.
+    private const val NODE_API = "https://api.github.com/"
+    private const val NODE_WEB = "https://github.com/robots.txt"
+    private const val NODE_CDN = "$LATEST_DOWNLOAD/$MANIFEST_NAME"   // github.com → редирект на release-assets.githubusercontent.com
+    private const val NODE_PROBE_TIMEOUT_MS = 4000   // короткий: проба узла для диагностики, не тянем контент
 
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -118,14 +137,60 @@ object UpdateChecker {
                     assetUrl = { fn -> "$LATEST_DOWNLOAD/$fn" })
             }
 
-            // ── всё не вышло → типизированная ошибка с КОНЕЧНЫМ хостом (77.C) ──
-            if (!rel.ok)
-                UpdateCheckResult.Error(UpdateErrorKind.API_UNAVAILABLE, "не дошли: API=${lastHost(rel)}; запасной=${lastHost(fb)}")
-            else
-                UpdateCheckResult.Error(UpdateErrorKind.MANIFEST_DOWNLOAD_FAILED, "не дошли: вложение=${lastHost(fb)}")
+            // ── всё не вышло → типизированная ошибка (77.C / 80.C) ──
+            when {
+                // Прямой путь к GitHub заблокирован, а свой SOCKS не слушает = НЕ «GitHub недоступен»
+                // (узел жив, недоступен ПУТЬ). Нормально для приложения, которое туннель и даёт: подключить
+                // и повторить. Условие проверяем по факту порта, не по флагу (77.A). В деталь берём узел,
+                // который РЕАЛЬНО не пустил (загрузка вложения = CDN), а не API: тот мог ответить 200, но
+                // вложение всё равно качается с заблокированного CDN — иначе деталь противоречит («не дошли,
+                // но HTTP 200»). Полный разбор по трём узлам — ниже в probeNodes().
+                !CascadeFetch.isOwnProxyUp() ->
+                    UpdateCheckResult.Error(UpdateErrorKind.NO_TUNNEL, "напрямую не дошли до вложения: ${lastHost(fb)}")
+                !rel.ok ->
+                    UpdateCheckResult.Error(UpdateErrorKind.API_UNAVAILABLE, "не дошли: API=${lastHost(rel)}; запасной=${lastHost(fb)}")
+                else ->
+                    UpdateCheckResult.Error(UpdateErrorKind.MANIFEST_DOWNLOAD_FAILED, "не дошли: вложение=${lastHost(fb)}")
+            }
         }
 
+        // Разбор по ТРЁМ узлам GitHub раздельно (80.C) — только на неуспехе (диагностика; happy-path не грузим).
+        if (result is UpdateCheckResult.Error)
+            det.append("\n").append(probeNodes()).append("\n")
+
         return CheckReport(result, det.toString().trim())
+    }
+
+    /**
+     * Три РАЗНЫХ узла GitHub раздельно (80.C): по каждому — попытка напрямую и (если SOCKS слушает) через
+     * свой прокси, короткий таймаут. Показывает то же, что Elyor руками через curl: прямой путь к узлу
+     * заблокирован, а через туннель — открыт. Итоговый host из finalUrl (для CDN — release-assets после
+     * редиректа с github.com). Только для «Подробностей» на неуспехе.
+     */
+    private fun probeNodes(): String {
+        val socksUp = CascadeFetch.isOwnProxyUp()
+        val nodes = listOf(
+            "api.github.com" to NODE_API,
+            "github.com" to NODE_WEB,
+            "release-assets.githubusercontent.com" to NODE_CDN,
+        )
+        val sb = StringBuilder("Узлы GitHub (блокируются раздельно):\n")
+        for ((label, url) in nodes) {
+            val direct = probeOne(url, direct = true)
+            val viaProxy = if (socksUp) probeOne(url, direct = false) else "прокси не запущен"
+            sb.append("  • $label — напрямую: $direct · через прокси: $viaProxy\n")
+        }
+        return sb.toString().trimEnd()
+    }
+
+    private fun probeOne(url: String, direct: Boolean): String {
+        val open: (java.net.URL) -> java.net.URLConnection =
+            if (direct) { { it.openConnection() } }
+            else { { it.openConnection(Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", XrayConfig.SOCKS_PORT))) } }
+        val r = SubscriptionFetcher.fetch(url, UA, NODE_PROBE_TIMEOUT_MS, open)
+        val finalHost = host(r.finalUrl)
+        return if (r.exceptionClass != null) r.exceptionClass!!
+        else "HTTP ${r.httpCode}" + (if (finalHost.isNotBlank() && !url.contains(finalHost)) " ($finalHost)" else "")
     }
 
     /**

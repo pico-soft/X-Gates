@@ -151,15 +151,19 @@ class MainActivity : ComponentActivity() {
         UpdateStore.init(applicationContext)     // результат последней проверки обновления + время
         // Авто-проверка обновления при холодном старте, но не чаще раза в сутки (несколько КБ через каскад;
         // САМ APK без согласия не качаем). Метаданные — в поток «Тест». Ошибка не мешает запуску.
-        // Промпт 77: СНАЧАЛА ждём, пока поднимется наш SOCKS (автозапуск коннектится ~50с) — иначе проверка
-        // фиктивно уходит НАПРЯМУЮ до появления туннеля, а на сети с заблокированным CDN GitHub это провал.
+        // Промпт 80.B: ВСЁ в фоновом потоке — экран открывается сразу (setContent ниже не ждёт). Ждём подъёма
+        // своего SOCKS не дольше UpdateChecker.AUTO_CHECK_PROXY_WAIT_MS (авто-проверка без туннеля на
+        // заблокированной сети обречена); если туннель так и не поднялся — МОЛЧА выходим, ничего не записывая
+        // (необязательная авто-проверка не должна навязывать ошибку; ручная кнопка объяснит честно).
         run {
             val app = applicationContext
             if (UpdateStore.dueForAutoCheck(System.currentTimeMillis())) Thread {
                 var waited = 0
-                while (waited < 60_000 && !com.picosoft.xrayproxydroid.net.CascadeFetch.isOwnProxyUp()) {
-                    Thread.sleep(2_000); waited += 2_000
+                while (waited < UpdateChecker.AUTO_CHECK_PROXY_WAIT_MS &&
+                       !com.picosoft.xrayproxydroid.net.CascadeFetch.isOwnProxyUp()) {
+                    Thread.sleep(1_000); waited += 1_000
                 }
+                if (!com.picosoft.xrayproxydroid.net.CascadeFetch.isOwnProxyUp()) return@Thread  // туннеля нет — молчим
                 val r = runCatching { UpdateChecker.check(app) }.getOrNull() ?: return@Thread
                 UpdateStore.apply(app, r, System.currentTimeMillis())
             }.start()
@@ -2591,6 +2595,14 @@ private fun UpdateCheckSection() {
         SettingsGroupLabel("Обновление")
         if (record.checkedAtMs > 0) {
             Text(record.summary, style = MaterialTheme.typography.bodyMedium)
+            // Честный случай (80.C): прямой путь к GitHub заблокирован, а туннель не запущен — узел жив,
+            // недоступен ПУТЬ. Предлагаем подключиться и повторить, а не показываем «GitHub недоступен».
+            if ((live as? UpdateCheckResult.Error)?.kind == com.picosoft.xrayproxydroid.update.UpdateErrorKind.NO_TUNNEL) {
+                Text(
+                    "Запустите прокси на главном экране (▶), затем нажмите «Проверить обновление» ещё раз — проверка пойдёт через туннель.",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary,
+                )
+            }
             Text("Проверено: ${UPDATE_DATE_FMT.format(Date(record.checkedAtMs))}",
                 style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
             // Полная постадийная диагностика по адресам обновления (77.E) — разбор в одно нажатие.
