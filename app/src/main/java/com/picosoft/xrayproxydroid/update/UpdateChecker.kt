@@ -91,8 +91,11 @@ object UpdateChecker {
         fun addTest(c: CascadeResult) { c.result?.let { if (it.bodyBytes > 0) TrafficTracker.addTest(it.bodyBytes.toLong()) } }
         // Один запрос обновления = один блок диагностики (лог + подробности UI). proxyFirst=true (77.B).
         fun request(label: String, url: String): CascadeResult {
+            // Промпт 81.E: temp-инстанс НЕ используем — незачем перебирать временные серверы (по ~15с
+            // каждый) ради килобайтного манифеста; без туннеля и при заблокированном прямом пути это и
+            // давало ~90с. Свой SOCKS первым (77.B); терминальные коды (429/40x) обрывают каскад (81.A).
             val c = CascadeFetch.fetch(context, url, UA, directT, proxyT, totalT,
-                acceptBody = { it.ok && it.body.isNotBlank() }, proxyFirst = true)
+                acceptBody = { it.ok && it.body.isNotBlank() }, proxyFirst = true, allowTempInstance = false)
             addTest(c)
             val d = diag(c)
             det.append(label).append("\n").append(d).append("\n\n")
