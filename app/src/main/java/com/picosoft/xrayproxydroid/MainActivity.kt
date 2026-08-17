@@ -151,9 +151,15 @@ class MainActivity : ComponentActivity() {
         UpdateStore.init(applicationContext)     // результат последней проверки обновления + время
         // Авто-проверка обновления при холодном старте, но не чаще раза в сутки (несколько КБ через каскад;
         // САМ APK без согласия не качаем). Метаданные — в поток «Тест». Ошибка не мешает запуску.
+        // Промпт 77: СНАЧАЛА ждём, пока поднимется наш SOCKS (автозапуск коннектится ~50с) — иначе проверка
+        // фиктивно уходит НАПРЯМУЮ до появления туннеля, а на сети с заблокированным CDN GitHub это провал.
         run {
             val app = applicationContext
             if (UpdateStore.dueForAutoCheck(System.currentTimeMillis())) Thread {
+                var waited = 0
+                while (waited < 60_000 && !com.picosoft.xrayproxydroid.net.CascadeFetch.isOwnProxyUp()) {
+                    Thread.sleep(2_000); waited += 2_000
+                }
                 val r = runCatching { UpdateChecker.check(app) }.getOrNull() ?: return@Thread
                 UpdateStore.apply(app, r, System.currentTimeMillis())
             }.start()
@@ -2524,14 +2530,17 @@ private fun UpdateCheckSection() {
     var readyFile by remember { mutableStateOf<File?>(null) }
     var message by remember { mutableStateOf<String?>(null) }
     var confirmMetered by remember { mutableStateOf(false) }
+    var detailsExpanded by remember { mutableStateOf(false) }
 
     fun startCheck() {
         if (checking || downloading) return
         checking = true; message = null; readyFile = null
         Thread {
-            val result = runCatching { UpdateChecker.check(context) }
-                .getOrElse { UpdateCheckResult.Error(com.picosoft.xrayproxydroid.update.UpdateErrorKind.API_UNAVAILABLE, it.message ?: "") }
-            UpdateStore.apply(context, result, System.currentTimeMillis())
+            val report = runCatching { UpdateChecker.check(context) }
+                .getOrElse { com.picosoft.xrayproxydroid.update.CheckReport(
+                    UpdateCheckResult.Error(com.picosoft.xrayproxydroid.update.UpdateErrorKind.API_UNAVAILABLE, it.message ?: ""),
+                    "исключение: ${it.javaClass.simpleName}: ${it.message}") }
+            UpdateStore.apply(context, report, System.currentTimeMillis())
             activity.runOnUiThread { checking = false }
         }.start()
     }
@@ -2584,6 +2593,18 @@ private fun UpdateCheckSection() {
             Text(record.summary, style = MaterialTheme.typography.bodyMedium)
             Text("Проверено: ${UPDATE_DATE_FMT.format(Date(record.checkedAtMs))}",
                 style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
+            // Полная постадийная диагностика по адресам обновления (77.E) — разбор в одно нажатие.
+            if (record.details.isNotBlank()) {
+                Text(
+                    if (detailsExpanded) "▾ Подробности (ступени, host, редиректы)" else "▸ Подробности (ступени, host, редиректы)",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.clip(RoundedCornerShape(4.dp)).clickable { detailsExpanded = !detailsExpanded }.padding(vertical = 2.dp),
+                )
+                if (detailsExpanded) {
+                    Text(record.details, style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace, color = TABLE_GRAY)
+                }
+            }
         } else {
             Text("Проверка ещё не выполнялась.", style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
         }

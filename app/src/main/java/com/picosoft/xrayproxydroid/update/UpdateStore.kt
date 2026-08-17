@@ -30,6 +30,7 @@ object UpdateStore {
         val checkedAtMs: Long = 0,     // время последней завершённой проверки (0 = не было)
         val summary: String = "",      // человекочитаемый итог
         val updateAvailable: Boolean = false,
+        val details: String = "",      // полная постадийная диагностика (77.E) — под «Подробности» в UI
     )
 
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
@@ -52,13 +53,15 @@ object UpdateStore {
         }
     }
 
-    /** Сохранить итог проверки: живой результат (для кнопок) + персистентная запись (для показа с временем). */
-    fun apply(context: Context, result: UpdateCheckResult, nowMs: Long) {
+    /** Сохранить итог проверки: живой результат (для кнопок) + персистентная запись (сводка+время+подробности). */
+    fun apply(context: Context, report: CheckReport, nowMs: Long) {
+        val result = report.result
         _live.value = result
         val rec = Record(
             checkedAtMs = nowMs,
             summary = summarize(result),
             updateAvailable = result is UpdateCheckResult.Available || result is UpdateCheckResult.AvailableUnverified,
+            details = report.details,
         )
         _record.value = rec
         val target = File(context.filesDir, FILE)
@@ -81,9 +84,11 @@ object UpdateStore {
 
     private fun summarize(result: UpdateCheckResult): String = when (result) {
         is UpdateCheckResult.NoReleases -> "Релизов пока нет"
-        is UpdateCheckResult.UpToDate -> "У вас последняя версия (${result.latestName})"
+        is UpdateCheckResult.UpToDate ->
+            "У вас последняя версия (${result.latestName})" + if (result.via.isNotBlank()) " · ${result.via}" else ""
         is UpdateCheckResult.Available ->
-            "Доступно обновление: ${result.versionName}" + if (result.usingUniversal) " (универсальная сборка)" else ""
+            "Доступно обновление: ${result.versionName}" + (if (result.usingUniversal) " (универсальная сборка)" else "") +
+                if (result.via.isNotBlank()) " · ${result.via}" else ""
         is UpdateCheckResult.AvailableUnverified ->
             "Есть версия новее по метке ${result.tag}, но без update.json — проверить нельзя"
         is UpdateCheckResult.Error -> result.kind.text + (if (result.detail.isNotBlank()) " — ${result.detail}" else "")

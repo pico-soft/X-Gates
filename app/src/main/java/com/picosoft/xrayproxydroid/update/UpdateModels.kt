@@ -54,7 +54,8 @@ data class UpdateManifest(
 
 /** Типы ошибок — «никаких общих ‘ошибка’». Текст — готовое сообщение пользователю. */
 enum class UpdateErrorKind(val text: String) {
-    API_UNAVAILABLE("GitHub недоступен — не удалось получить сведения о релизах"),
+    API_UNAVAILABLE("GitHub API недоступен — не удалось получить сведения о релизах"),
+    MANIFEST_DOWNLOAD_FAILED("сведения получены, но файл update.json не скачался (вложение недоступно)"),
     MANIFEST_MISSING("в релизе нет файла update.json"),
     MANIFEST_PARSE("файл update.json повреждён или в неизвестном формате"),
     NO_ARTIFACT("в update.json нет сборки под вашу архитектуру и нет универсальной"),
@@ -71,8 +72,8 @@ sealed interface UpdateCheckResult {
     /** Релизов ещё нет (API вернул 404) — это НЕ ошибка. */
     object NoReleases : UpdateCheckResult
 
-    /** Установлена последняя версия. */
-    data class UpToDate(val currentCode: Int, val latestName: String) : UpdateCheckResult
+    /** Установлена последняя версия. [via] — каким путём получены сведения (API / запасной). */
+    data class UpToDate(val currentCode: Int, val latestName: String, val via: String = "") : UpdateCheckResult
 
     /** Есть обновление с подтверждённым update.json — можно скачать и проверить. */
     data class Available(
@@ -83,6 +84,7 @@ sealed interface UpdateCheckResult {
         val downloadUrl: String,
         val sizeBytes: Long,
         val usingUniversal: Boolean,   // точной сборки под ABI нет → универсальная
+        val via: String = "",          // каким путём получены сведения (API / запасной)
     ) : UpdateCheckResult
 
     /**
@@ -93,3 +95,10 @@ sealed interface UpdateCheckResult {
 
     data class Error(val kind: UpdateErrorKind, val detail: String = "") : UpdateCheckResult
 }
+
+/**
+ * Итог проверки: результат + ПОЛНАЯ постадийная диагностика (по каждому адресу — какие ступени каскада
+ * выполнялись/пропущены и почему, код, размер, исключение, КОНЕЧНЫЙ host, цепочка редиректов). Показывается
+ * в UI под «Подробности» (Промпт 77.E), чтобы разбирательство занимало одно нажатие.
+ */
+data class CheckReport(val result: UpdateCheckResult, val details: String)
