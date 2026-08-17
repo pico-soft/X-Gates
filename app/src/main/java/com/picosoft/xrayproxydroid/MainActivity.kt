@@ -120,6 +120,7 @@ import com.picosoft.xrayproxydroid.settings.AppSettings
 import com.picosoft.xrayproxydroid.settings.Blocklist
 import com.picosoft.xrayproxydroid.settings.BlocklistStore
 import com.picosoft.xrayproxydroid.settings.SettingsStore
+import com.picosoft.xrayproxydroid.subscription.SourceOutcome
 import com.picosoft.xrayproxydroid.subscription.SubSource
 import com.picosoft.xrayproxydroid.subscription.SubscriptionManager
 import com.picosoft.xrayproxydroid.traffic.DayBucket
@@ -854,7 +855,9 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     // Полный адаптивный тест: ping → speed по живым → early-connect первого рабочего → апгрейд.
     fun onFullTest() {
         if (fullTesting) return
-        val all = servers
+        // Свежий список из реестра (не застаревший снимок): учитывает вкл/выкл источников, сделанные на
+        // вкладке «Подписки» (Промпт 82). Сервер входит, если он в ЛЮБОМ включённом источнике.
+        val all = SubscriptionManager.allServers(context).also { servers = it }
         if (all.isEmpty()) { subStatus = "нет серверов"; return }
         fullTesting = true
         MonitorCoordinator.fullTestRunning = true   // монитор молчит, пока идёт ручной тест
@@ -2205,26 +2208,36 @@ private fun SubscriptionsSection(
     var newUrl by remember { mutableStateOf("") }
     var newName by remember { mutableStateOf("") }
     var paste by remember { mutableStateOf("") }
-    var shownDetailId by remember { mutableStateOf<String?>(null) }   // тап по точке разворачивает подробности
+    var shownDetailId by remember { mutableStateOf<String?>(null) }   // тап по точке разворачивает ПОДРОБНОСТИ
+    var expandedErrId by remember { mutableStateOf<String?>(null) }   // тап по ошибке разворачивает её ЦЕЛИКОМ
     val red = Color(0xFFD32F2F)
+    val green = Color(0xFF2E7D32)
+    val amber = Color(0xFFF9A825)
+    val clipboard = LocalClipboardManager.current
+    val ctx = LocalContext.current
 
     Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (sources.isEmpty()) {
             Text("Нет источников.", style = MaterialTheme.typography.bodyMedium, color = TABLE_GRAY)
         }
         sources.forEach { s ->
+            val hasData = s.serverCount > 0
+            val lastFailed = s.lastOutcome != null && s.lastOutcome != SourceOutcome.OK
+            // Промпт 81.C: КРАСНАЯ только если последняя попытка неудачна И данных нет; данные есть, а попытка
+            // не удалась → ЖЁЛТАЯ (показаны прежние серверы); успех → зелёная; ни разу/выключена → серая.
             val dotColor = when {
-                !s.enabled -> TABLE_GRAY                 // выключена — серая
-                s.lastOk == true -> Color(0xFF2E7D32)    // ок — зелёная
-                s.lastOk == false -> red                 // ошибка — красная
-                else -> TABLE_GRAY                       // ни разу — серая
+                !s.enabled -> TABLE_GRAY
+                s.lastOutcome == SourceOutcome.OK -> green
+                s.lastOutcome == null -> TABLE_GRAY
+                hasData -> amber
+                else -> red
             }
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                // Тап по точке = свернуть/развернуть ПОДРОБНОСТИ (суть ошибки видна и без тапа).
+                // Тап по точке = свернуть/развернуть ПОДРОБНОСТИ (постадийная диагностика).
                 Text(
                     "●",
                     color = dotColor,
@@ -2244,15 +2257,38 @@ private fun SubscriptionsSection(
                 ) {
                     Text(s.name, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Text(
-                        "${s.serverCount} серв · ${s.lastRefreshTs ?: "не обновлялась"}" +
-                            (if (s.url.isBlank()) " · локальная" else ""),
+                        "${s.serverCount} серв" + (if (s.url.isBlank()) " · локальная" else ""),
                         style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
                     )
-                    // Суть ошибки — ВСЕГДА видна, красным, с переносом (без тапа).
-                    if (s.lastError != null) {
-                        Text(s.lastError, style = MaterialTheme.typography.bodySmall, color = red)
+                    // Промпт 81.C: время последней УДАЧИ и последней ПОПЫТКИ — РАЗДЕЛЬНО (раньше одно на двоих).
+                    Text(
+                        "удача: ${s.lastOkTs ?: "—"} · попытка: ${s.lastRefreshTs ?: "не обновлялась"}",
+                        style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+                    )
+                    // Ошибка последней НЕУДАЧНОЙ попытки. Свёрнута в одну строку, тап — развернуть (81.C).
+                    // Цвет: красный, если данных нет; янтарный, если показаны прежние серверы / это лимит частоты.
+                    if (lastFailed && s.lastError != null) {
+                        val errColor = if (hasData || s.lastOutcome == SourceOutcome.RATE_LIMITED) amber else red
+                        val errExpanded = expandedErrId == s.id
+                        Text(
+                            (if (errExpanded) "▾ " else "▸ ") + s.lastError,
+                            style = MaterialTheme.typography.bodySmall, color = errColor,
+                            maxLines = if (errExpanded) Int.MAX_VALUE else 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(4.dp))
+                                .clickable { expandedErrId = if (errExpanded) null else s.id }
+                                .padding(vertical = 1.dp),
+                        )
+                        // Время, когда случилась ошибка (= время последней попытки), + пояснение про прежние серверы.
+                        Text(
+                            "когда: ${s.lastRefreshTs ?: "—"}" +
+                                (if (hasData) " · показаны прежние серверы (${s.serverCount})" else ""),
+                            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+                        )
                     }
-                    // Подробности — по тапу на точку.
+                    // Подробности (постадийно) — по тапу на точку.
                     if (shownDetailId == s.id && s.lastDetail != null) {
                         Text(
                             s.lastDetail,
@@ -2262,8 +2298,18 @@ private fun SubscriptionsSection(
                         )
                     }
                 }
+                // Копировать URL источника (Промпт 82) — только для подписок с адресом (локальные без URL).
+                if (s.url.isNotBlank()) {
+                    TextButton(
+                        onClick = {
+                            clipboard.setText(androidx.compose.ui.text.AnnotatedString(s.url))
+                            android.widget.Toast.makeText(ctx, "URL скопирован", android.widget.Toast.LENGTH_SHORT).show()
+                        },
+                        contentPadding = PaddingValues(horizontal = 6.dp),
+                    ) { Text("⧉") }
+                }
                 Switch(checked = s.enabled, onCheckedChange = { onToggle(s.id, it) })
-                TextButton(onClick = { onDeleteRequest(s) }) { Text("✗") }
+                TextButton(onClick = { onDeleteRequest(s) }, contentPadding = PaddingValues(horizontal = 6.dp)) { Text("✗") }
             }
         }
 
