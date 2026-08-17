@@ -18,19 +18,15 @@ import kotlin.math.roundToInt
  *   Этап 2: speed ПОСЛЕДОВАТЕЛЬНО по кандидатам. Первый живой (≥MIN_USABLE) → СРАЗУ подключиться
  *           (early-connect). Дальше ПРОГРЕССИВНЫЙ апгрейд ПО ХОДУ: >10% ([marginRatio]) сверх текущего.
  *
- * СТУПЕНЧАТЫЙ ЗАМЕР (Промпт 77) — экономия трафика (замер = скачивание, до 13 МБ на сервер):
- *   • РЕЖИМ ЭКОНОМИИ ([trafficSaveMode]): кандидаты = лучшие по ПИНГУ; меряем батчами по
- *     [trafficSaveBatch]; как только набрано [trafficSaveMinAlive] живых — СТОП (следующие батчи не трогаем).
- *   • ОБЫЧНЫЙ, но ПОСЛЕ первого полного топа ([fullTopBuilt]): меряем только top-[normalTopBatch] по
- *     известной скорости, с той же ранней остановкой.
- *   • ОБЫЧНЫЙ первый прогон: меряем ВСЕХ живых (строим топ), без ранней остановки.
+ * РУЧНОЙ ЗАПУСК = мерим ВСЕХ живых по очереди (Промпт 82: пользователь ждёт полной картины), но не дольше
+ * общего БЮДЖЕТА времени [fullTestBudgetSec] (защита от зависания на медленных). Ступенчатый top-N по
+ * скорости — НЕ здесь: это забота монитора «держать самый быстрый» (NetworkMonitor). Единственное сокращение
+ * ручного теста — РЕЖИМ ЭКОНОМИИ ([trafficSaveMode], явный опт-ин): кандидаты по ПИНГУ, батчами по
+ * [trafficSaveBatch], стоп по [trafficSaveMinAlive] живых.
  *
  * proxy-check НЕ нужен — real-ping уже проходит весь протокол до бэкенда и тянет URL через туннель.
  */
 object FullTestRunner {
-
-    /** Построен ли уже полный топ по скорости (за процесс). Первый тест меряет всех; далее — top-N. */
-    @Volatile var fullTopBuilt = false
 
     data class Result(
         val connected: ServerProfile?,   // к чему подключены в итоге
@@ -78,35 +74,28 @@ object FullTestRunner {
                 return
             }
             val s = SettingsStore.current()
-            // План: какие кандидаты, батч, минимум-живых-для-стопа, помечать ли «топ построен».
+            // План кандидатов. Ручной тест (Промпт 82): мерим ВСЕХ живых (без ранней остановки), но с общим
+            // бюджетом времени. Экономия — единственное сокращение (явный опт-ин): батчами, стоп по живым.
             val candidates: List<ServerProfile>
             val batch: Int
             val minAlive: Int
-            val markBuilt: Boolean
             val modeStr: String
-            when {
-                s.trafficSaveMode -> {
-                    candidates = aliveByPing                                   // лучшие по пингу
-                    batch = s.trafficSaveBatch.coerceAtLeast(1)
-                    minAlive = s.trafficSaveMinAlive.coerceAtLeast(1)
-                    markBuilt = false; modeStr = "экономия ${batch}×, до ${minAlive} живых"
-                }
-                fullTopBuilt && s.normalTopBatch > 0 -> {
-                    candidates = aliveByPing.sortedByDescending { it.speedMbps ?: 0.0 }.take(s.normalTopBatch)
-                    batch = s.trafficSaveBatch.coerceAtLeast(1)
-                    minAlive = s.trafficSaveMinAlive.coerceAtLeast(1)
-                    markBuilt = false; modeStr = "top-${s.normalTopBatch} по скорости"
-                }
-                else -> {
-                    candidates = aliveByPing                                   // ПЕРВЫЙ топ — меряем всех
-                    batch = Int.MAX_VALUE; minAlive = 0                        // без ранней остановки
-                    markBuilt = true; modeStr = "полный (${aliveByPing.size})"
-                }
+            val budgetMs = s.fullTestBudgetSec.coerceAtLeast(30) * 1000L
+            if (s.trafficSaveMode) {
+                candidates = aliveByPing                                   // лучшие по пингу
+                batch = s.trafficSaveBatch.coerceAtLeast(1)
+                minAlive = s.trafficSaveMinAlive.coerceAtLeast(1)
+                modeStr = "экономия ${batch}×, до ${minAlive} живых"
+            } else {
+                candidates = aliveByPing                                   // ВСЕ живые
+                batch = Int.MAX_VALUE; minAlive = 0                        // без ранней остановки
+                modeStr = "все живые (${aliveByPing.size}), бюджет ${s.fullTestBudgetSec / 60} мин"
             }
             onPhase("Этап 2: скорость — $modeStr…")
             emitProgress(0, candidates.size)
 
             Thread {
+                val phaseStart = System.nanoTime()
                 var connected: ServerProfile? = null
                 var connectedSpeed = 0.0
                 var best: ServerProfile? = null
@@ -115,6 +104,11 @@ object FullTestRunner {
                 var measured = 0
                 for (p in candidates) {
                     if (cancelled.get()) break
+                    // Общий бюджет времени (Промпт 82): не мерим ВСЕХ бесконечно — стоп по лимиту.
+                    if ((System.nanoTime() - phaseStart) / 1_000_000 > budgetMs) {
+                        onPhase("Бюджет теста (${s.fullTestBudgetSec / 60} мин) исчерпан на $measured/${candidates.size} — стоп")
+                        break
+                    }
                     val mbps = ServerSpeedTester.measureSpeed(appCtx, p)
                     measured++
                     onSpeedResult(p, mbps)   // результат сохраняем всегда
@@ -141,7 +135,6 @@ object FullTestRunner {
                     // Батч-остановка: набрали минимум живых на границе батча — дальше не мерим (экономия трафика).
                     if (minAlive > 0 && selectable >= minAlive && measured % batch == 0) break
                 }
-                if (markBuilt && !cancelled.get()) fullTopBuilt = true
                 onDone(Result(connected ?: best, best, bestSpeed, candidates.size, cancelled.get()))
             }.start()
         }

@@ -65,6 +65,7 @@ object NetworkMonitor {
         var lastSwitchMs = 0L
         var backoffMs = 0L          // текущая пауза «нет интернета/нет замены» (0 = нет)
         var cycles = 0
+        var lastOptimizeMs = now()  // Промпт 82: «держать самый быстрый» — первый перемер через monitorOptimizeSec
         Log.i(TAG, "monitor loop started")
 
         while (true) {
@@ -72,9 +73,12 @@ object NetworkMonitor {
             if (!s.monitorEnabled) return                 // выключили — корутина завершается (сервис пересоздаст при включении)
             if (!XrayController.isRunning || !ProxyState.state.value.running) return
 
-            // Обычный интервал (прерываемый — чтобы wake() поднял досрочно).
+            // Интервал: в ЗДОРОВОМ состоянии — обычный; при ПАДЕНИИ (phase=="problem") — чаще (раз в минуту),
+            // чтобы быстрее переключиться на рабочий (Промпт 82). Прерываемый (wake() поднимает досрочно).
+            val waitSec = if (phase == "problem") s.monitorProblemIntervalSec.coerceAtLeast(30)
+                          else s.monitorIntervalSec.coerceAtLeast(60)
             MonitorCoordinator.drainWakeups()
-            MonitorCoordinator.awaitWake(s.monitorIntervalSec.coerceAtLeast(60) * 1000L)
+            MonitorCoordinator.awaitWake(waitSec * 1000L)
 
             val cur = SettingsStore.current()
             if (!cur.monitorEnabled) return
@@ -82,6 +86,15 @@ object NetworkMonitor {
             if (MonitorCoordinator.fullTestRunning) continue   // ручной тест сам переключает — молчим
 
             cycles++
+
+            // ── Оптимизация «держать самый быстрый» (Промпт 82) — ТОЛЬКО в здоровом состоянии, раз в
+            //    monitorOptimizeSec: перемер top-N по скорости и переход на быстрейший (>margin). ──
+            if (phase == "ok" && cur.monitorOptimizeSec > 0 && now() - lastOptimizeMs >= cur.monitorOptimizeSec * 1000L) {
+                lastOptimizeMs = now()
+                runCatching { optimizeToFastest(app, cur) }
+                    .onFailure { MonitorLog.event(app, "error", "Ошибка оптимизации", it.message ?: "") }
+                if (!ProxyState.state.value.running) continue
+            }
 
             // ── Сигнал A: нет интернета → пауза с удвоением, ДО любого перебора ──
             if (!directAlive()) {
@@ -265,6 +278,54 @@ object NetworkMonitor {
         } else {
             MonitorLog.event(app, "monitor", "Нет живых серверов",
                 if (disabled.isEmpty()) "все источники включены" else "пользователь отказался включать")
+        }
+    }
+
+    /**
+     * «Держать самый быстрый» (Промпт 82): в здоровом состоянии перемерять top-[normalTopBatch] по известной
+     * скорости и переключиться на быстрейший, если он БЫСТРЕЕ текущего на >margin. Текущий меряем реальным
+     * туннелем (measureTunnelMbps), остальных — temp-инстансом (активный прокси не трогаем). Трафик заметный —
+     * потому раз в час по умолчанию. Уступаем ручному тесту и ручной смене сервера.
+     */
+    private suspend fun optimizeToFastest(app: Context, s: AppSettings) {
+        val curKey = ProxyState.state.value.serverKey ?: return
+        val bl = BlocklistStore.current()
+        val topN = SubscriptionManager.allServers(app)
+            .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl) }
+            .sortedByDescending { it.speedMbps ?: 0.0 }
+            .take(s.normalTopBatch.coerceAtLeast(1))
+        if (topN.size <= 1) return
+        MonitorLog.event(app, "monitor", "Оптимизация: перемер top-${topN.size} по скорости", "держим самый быстрый")
+        MonitorStatus.update(true, "оптимизация: перемер top-${topN.size}", now(), 0)
+        MonitorCoordinator.monitorSearchRunning = true
+        try {
+            val curMbps = measureTunnelMbps()
+            val results = HashMap<String, Double>()
+            results[curKey] = curMbps
+            var bestKey: String? = null; var bestMbps = 0.0
+            for (c in topN) {
+                if (MonitorCoordinator.fullTestRunning) return               // ручной тест — уступаем
+                if (ProxyState.state.value.serverKey != curKey) return       // пользователь сменил — уступаем
+                val key = SubscriptionManager.serverKey(c)
+                if (key == curKey) continue
+                val mbps = ServerSpeedTester.measureSpeed(app, c)            // temp-инстанс
+                results[key] = mbps
+                if (mbps > bestMbps) { bestMbps = mbps; bestKey = key }
+            }
+            SubscriptionManager.applySpeedResults(app, results)
+            if (bestKey != null && bestMbps > curMbps * (1 + s.marginRatio)) {
+                val target = topN.first { SubscriptionManager.serverKey(it) == bestKey }
+                val cfg = runCatching { XrayConfigBuilder.build(target) }.getOrNull() ?: return
+                val from = ServerLabels.displayForKey(app, curKey)
+                XrayProxyService.start(app, cfg, ServerLabels.full(target), bestKey!!)
+                MonitorLog.switch(app, from, ServerLabels.display(target), "монитор: оптимизация",
+                    "было ${fmt(curMbps)} → стало ${fmt(bestMbps)}")
+            } else {
+                MonitorLog.event(app, "monitor", "Оптимизация: смены нет",
+                    "текущий ${fmt(curMbps)}, лучший из top ${fmt(bestMbps)}")
+            }
+        } finally {
+            MonitorCoordinator.monitorSearchRunning = false
         }
     }
 
