@@ -1,27 +1,27 @@
 {
   "_comment": "ОБРАЗЕЦ манифеста обновления (Промпт 70). В КАЖДЫЙ релиз кладётся вложением с именем update.json. Публичный API GitHub versionCode не отдаёт — обновлялка сравнивает версии ТОЛЬКО по versionCode отсюда. Перед публикацией: (1) versionCode/versionName должны совпасть с app/build.gradle.kts; (2) в каждый sha256 подставить РЕАЛЬНУЮ SHA-256 собранного APK (shasum -a 256 <файл>); (3) имена в fileName — КОНТРАКТ с обновлялкой (…-arm64-v8a.apk и т.д.), совпадают с именами вложений релиза. Релиз публиковать ПОЛНЫМ (не draft, не prerelease) — иначе releases/latest его не отдаёт.",
-  "versionCode": 4,
-  "versionName": "0.13 beta",
-  "notes": "Исправлена проверка обновлений, работавшая только при доступном напрямую GitHub: теперь запросы идут через ваш прокси, добавлены запасной адрес и постадийная диагностика («Подробности»).",
+  "versionCode": 5,
+  "versionName": "0.14 beta",
+  "notes": "Устойчивость подписок и серверов: удаление/выключение источника больше не оставляет нерабочих серверов (реестр пересобирается из сырых данных). Ручной тест «Самый быстрый» снова меряет все серверы. Автомониторинг: при падении туннеля переключение раз в минуту, в норме раз в час держит самый быстрый сервер. Панель-ограничение (HTTP 429) больше не долбится повторно. Копирование URL подписки.",
   "artifacts": [
     {
       "abi": "arm64-v8a",
-      "fileName": "XrayProxyDroid-0.13-arm64-v8a.apk",
+      "fileName": "XrayProxyDroid-0.14-arm64-v8a.apk",
       "sha256": ""
     },
     {
       "abi": "armeabi-v7a",
-      "fileName": "XrayProxyDroid-0.13-armeabi-v7a.apk",
+      "fileName": "XrayProxyDroid-0.14-armeabi-v7a.apk",
       "sha256": ""
     },
     {
       "abi": "x86_64",
-      "fileName": "XrayProxyDroid-0.13-x86_64.apk",
+      "fileName": "XrayProxyDroid-0.14-x86_64.apk",
       "sha256": ""
     },
     {
       "abi": "universal",
-      "fileName": "XrayProxyDroid-0.13-universal.apk",
+      "fileName": "XrayProxyDroid-0.14-universal.apk",
       "sha256": ""
     }
   ]
