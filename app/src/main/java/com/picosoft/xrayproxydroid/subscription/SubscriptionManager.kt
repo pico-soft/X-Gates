@@ -61,7 +61,11 @@ object SubscriptionManager {
 
     // ─────────────────────────── миграция (однократно) ───────────────────────────
 
-    /** Однократная инициализация: миграция старого `subscriptions.json`, затем однократный посев дефолтной подписки. */
+    /**
+     * Однократная инициализация (СИНХРОННО, без сети). Миграция старого `subscriptions.json`; затем: если у
+     * юзера УЖЕ есть подписки — помечаем «посеяно», чтобы дефолт никогда не добавлялся авто. Сетевой посев
+     * ПУСТОГО списка — отдельно и по ФАКТУ фетча ([trySeedDefaultSource], из автозапуска, в фоне).
+     */
     fun init(context: Context) {
         val cur = SubscriptionStore.load(context)
         if (!cur.migratedLegacy) {
@@ -69,21 +73,44 @@ object SubscriptionManager {
             val migrated = if (legacy.isNotEmpty()) convertLegacy(legacy) else freshDefault()
             SubscriptionStore.save(context, recount(migrated))
         }
-        seedDefaultSourceOnce(context)
+        val f = SubscriptionStore.load(context)
+        if (!f.seededDefaultRuBypass && f.sources.isNotEmpty()) {
+            SubscriptionStore.save(context, f.copy(seededDefaultRuBypass = true))
+        }
     }
 
     /**
-     * ОДНОКРАТНО добавить дефолтную подписку «Обход ограничений в РФ» — и на СВЕЖИХ установках, и на уже
-     * существующих (без wipe данных, [[never-wipe-device-data]]). Идемпотентно: не дублируем, если источник
-     * с таким URL уже есть; флаг [SourcesFile.seededDefaultRuBypass] не даёт ей вернуться после удаления юзером.
+     * Промпт 74: дефолтную подписку «Обход ограничений в РФ» добавляем ТОЛЬКО если её URL реально
+     * ЗАФЕТЧИЛСЯ (первый запуск). Не зафетчился → список остаётся ПУСТЫМ (в UI «Добавьте вашу подписку»),
+     * флаг НЕ ставим → повторим на следующем холодном старте. Сеть → вызывать в ФОНЕ.
+     * Возвращает true, если только что добавила+импортировала (чтобы автозапуск не рефетчил повторно).
+     * Идемпотентно: не сеем, если уже посеяно ИЛИ у юзера уже есть подписки (флаг [seededDefaultRuBypass]
+     * не даёт дефолту вернуться после удаления пользователем).
      */
-    private fun seedDefaultSourceOnce(context: Context) {
+    fun trySeedDefaultSource(context: Context): Boolean {
         val file = SubscriptionStore.load(context)
-        if (file.seededDefaultRuBypass) return
-        val u = normalizeUrl(DEFAULT_SOURCE_URL)
-        val sources = if (file.sources.any { it.url == u }) file.sources
-        else file.sources + SubSource(id = newId(), name = DEFAULT_SOURCE_NAME, url = u, enabled = true)
-        SubscriptionStore.save(context, recount(file.copy(seededDefaultRuBypass = true, sources = sources)))
+        if (file.seededDefaultRuBypass) return false
+        if (file.sources.isNotEmpty()) {                       // у юзера уже есть свои → дефолт не навязываем
+            SubscriptionStore.save(context, file.copy(seededDefaultRuBypass = true))
+            return false
+        }
+        val settings = SettingsStore.current()
+        val url = normalizeUrl(DEFAULT_SOURCE_URL)
+        val directT = settings.subTimeoutSec * 1000
+        val proxyT = settings.subTimeoutSec * 1000 + 10_000
+        val totalT = directT + proxyT + 5_000
+        val cascade = CascadeFetch.fetch(context, url, settings.subUserAgent, directT, proxyT, totalT,
+            acceptBody = { it.ok && hasSupportedLinks(it.body) })
+        if (!cascade.ok) return false                          // не зафетчилось → пусто, флаг НЕ ставим (повтор позже)
+        val f2 = SubscriptionStore.load(context)               // перечитать (гонка) — вдруг юзер успел добавить
+        if (f2.seededDefaultRuBypass || f2.sources.isNotEmpty()) return false
+        val id = newId()
+        SubscriptionStore.save(context, f2.copy(
+            seededDefaultRuBypass = true,
+            sources = listOf(SubSource(id = id, name = DEFAULT_SOURCE_NAME, url = url, enabled = true)),
+        ))
+        importInto(context, id, cascade.result!!.body, "Дефолтная подписка (первый успешный фетч)")
+        return true
     }
 
     /** Старые вложенные подписки → источники + реестр (измерения серверов сохраняются). */
@@ -104,16 +131,15 @@ object SubscriptionManager {
     }
 
     /**
-     * Свежая установка: сразу с дефолтной подпиской «Обход ограничений в РФ» (Промпт 72 — возврат дефолта,
-     * теперь ЯВНЫЙ публичный список, а не чужой личный). migratedLegacy=true, чтобы init не пересевал;
-     * seededDefaultRuBypass=true, чтобы [seedDefaultSourceOnce] не добавил её повторно.
-     * (В Промпте 67 дефолт УБИРАЛИ — не хотели тащить чужой личный URL в релиз; теперь это осознанный
-     * общий дефолт по запросу; удаление юзером окончательно — флаг не даёт «воскреснуть».)
+     * Свежая установка: ПУСТО (Промпт 74). Дефолтную подписку добавит [trySeedDefaultSource] из автозапуска —
+     * но ТОЛЬКО если её URL реально зафетчится; иначе пусто + «Добавьте вашу подписку». seededDefaultRuBypass
+     * оставляем false, чтобы посев повторился на следующем старте, пока не удастся (или пока юзер не добавит своё).
+     * (Эволюция: П67 дефолт УБРАЛИ; П72 вернули безусловно; П74 — только по факту успешного фетча.)
      */
     private fun freshDefault(): SourcesFile = SourcesFile(
         migratedLegacy = true,
-        seededDefaultRuBypass = true,
-        sources = listOf(SubSource(id = newId(), name = DEFAULT_SOURCE_NAME, url = normalizeUrl(DEFAULT_SOURCE_URL), enabled = true)),
+        seededDefaultRuBypass = false,
+        sources = emptyList(),
         servers = emptyList(),
     )
 

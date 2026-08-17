@@ -15,19 +15,22 @@ import kotlin.math.roundToInt
 /**
  * Полный адаптивный тест (перенос Termux run_full_test_with_early_connect):
  *   Этап 1: ping всех (real-ping, пул 8) → отсев мёртвых (pingMs>=0), сорт по возр. пинга.
- *   Этап 2: speed ПОСЛЕДОВАТЕЛЬНО по ВСЕМ живым (в порядке пинга). Первый живой (≥MIN_USABLE) →
- *           СРАЗУ подключиться (early-connect). Дальше ПРОГРЕССИВНЫЙ апгрейд ПО ХОДУ: как только
- *           очередной замер даёт >10% ([marginRatio]) сверх текущего подключённого — переключиться.
+ *   Этап 2: speed ПОСЛЕДОВАТЕЛЬНО по кандидатам. Первый живой (≥MIN_USABLE) → СРАЗУ подключиться
+ *           (early-connect). Дальше ПРОГРЕССИВНЫЙ апгрейд ПО ХОДУ: >10% ([marginRatio]) сверх текущего.
+ *
+ * СТУПЕНЧАТЫЙ ЗАМЕР (Промпт 77) — экономия трафика (замер = скачивание, до 13 МБ на сервер):
+ *   • РЕЖИМ ЭКОНОМИИ ([trafficSaveMode]): кандидаты = лучшие по ПИНГУ; меряем батчами по
+ *     [trafficSaveBatch]; как только набрано [trafficSaveMinAlive] живых — СТОП (следующие батчи не трогаем).
+ *   • ОБЫЧНЫЙ, но ПОСЛЕ первого полного топа ([fullTopBuilt]): меряем только top-[normalTopBatch] по
+ *     известной скорости, с той же ранней остановкой.
+ *   • ОБЫЧНЫЙ первый прогон: меряем ВСЕХ живых (строим топ), без ранней остановки.
  *
  * proxy-check НЕ нужен — real-ping уже проходит весь протокол до бэкенда и тянет URL через туннель.
- * Монитора здесь НЕТ (следующий этап).
- *
- * Оркестратор: переиспользует [ServerTester] (ping) + [ServerSpeedTester] (speed) + [connect].
- * Колбэки — на фоновых потоках, UI-маршалинг на вызывающем.
  */
 object FullTestRunner {
 
-    // Пороги (margin, min-usable) больше НЕ живут здесь константами — единый источник [SettingsStore].
+    /** Построен ли уже полный топ по скорости (за процесс). Первый тест меряет всех; далее — top-N. */
+    @Volatile var fullTopBuilt = false
 
     data class Result(
         val connected: ServerProfile?,   // к чему подключены в итоге
@@ -55,12 +58,10 @@ object FullTestRunner {
         val appCtx = context.applicationContext
         val cancelled = AtomicBoolean(false)
         var pingHandle: ServerTester.TestHandle? = null
-        var speedHandle: ServerSpeedTester.Handle? = null
 
         val pingByKey = ConcurrentHashMap<String, Int>()
 
-        // Заблокированных НЕ мерим (в отличие от отключённых по протоколу): блокировка — «не нужен вовсе»,
-        // тратить трафик/время прогона на него незачем. Фильтр ДО ping/speed.
+        // Заблокированных НЕ мерим (в отличие от отключённых по протоколу): блокировка — «не нужен вовсе».
         val blocklist = BlocklistStore.current()
         val testable = allServers.filter { !ServerFilter.isBlocked(it, blocklist) }
 
@@ -68,40 +69,65 @@ object FullTestRunner {
         fun label(p: ServerProfile) = p.remarks.ifBlank { p.address }
         fun fmt(v: Double) = "${(v * 10).roundToInt() / 10.0}"
 
-        // --- Этап 2: speed + early-connect ---
-        fun startSpeedPhase(alive: List<ServerProfile>) {
-            if (cancelled.get()) { onDone(Result(null, null, 0.0, alive.size, true)); return }
-            if (alive.isEmpty()) {
+        // --- Этап 2: speed + early-connect, ПОСЛЕДОВАТЕЛЬНО с батч-остановкой ---
+        fun startSpeedPhase(aliveByPing: List<ServerProfile>) {
+            if (cancelled.get()) { onDone(Result(null, null, 0.0, aliveByPing.size, true)); return }
+            if (aliveByPing.isEmpty()) {
                 onPhase("Нет живых серверов — проверь интернет / все мёртвые")
                 onDone(Result(null, null, 0.0, 0, cancelled.get()))
                 return
             }
-            onPhase("Этап 2: скорость по ${alive.size} живым…")
-            emitProgress(0, alive.size)   // новая шкала фазы скорости — сброс в 0
+            val s = SettingsStore.current()
+            // План: какие кандидаты, батч, минимум-живых-для-стопа, помечать ли «топ построен».
+            val candidates: List<ServerProfile>
+            val batch: Int
+            val minAlive: Int
+            val markBuilt: Boolean
+            val modeStr: String
+            when {
+                s.trafficSaveMode -> {
+                    candidates = aliveByPing                                   // лучшие по пингу
+                    batch = s.trafficSaveBatch.coerceAtLeast(1)
+                    minAlive = s.trafficSaveMinAlive.coerceAtLeast(1)
+                    markBuilt = false; modeStr = "экономия ${batch}×, до ${minAlive} живых"
+                }
+                fullTopBuilt && s.normalTopBatch > 0 -> {
+                    candidates = aliveByPing.sortedByDescending { it.speedMbps ?: 0.0 }.take(s.normalTopBatch)
+                    batch = s.trafficSaveBatch.coerceAtLeast(1)
+                    minAlive = s.trafficSaveMinAlive.coerceAtLeast(1)
+                    markBuilt = false; modeStr = "top-${s.normalTopBatch} по скорости"
+                }
+                else -> {
+                    candidates = aliveByPing                                   // ПЕРВЫЙ топ — меряем всех
+                    batch = Int.MAX_VALUE; minAlive = 0                        // без ранней остановки
+                    markBuilt = true; modeStr = "полный (${aliveByPing.size})"
+                }
+            }
+            onPhase("Этап 2: скорость — $modeStr…")
+            emitProgress(0, candidates.size)
 
-            val settings = SettingsStore.current()   // снимок порога/протоколов на прогон
-            var connected: ServerProfile? = null
-            var connectedSpeed = 0.0
-            var best: ServerProfile? = null
-            var bestSpeed = 0.0
-
-            speedHandle = ServerSpeedTester.testAll(
-                context = appCtx,
-                servers = alive,
-                onResult = { p, mbps ->
-                    onSpeedResult(p, mbps)   // МЕРЯЕМ ВСЕХ; результат сохраняем всегда
-                    // ВЫБОР — через единый предикат (протокол + мин.скорость + стоп-лист). Замер не фильтруем.
-                    if (ServerFilter.isSelectable(p, mbps, settings, blocklist)) {
+            Thread {
+                var connected: ServerProfile? = null
+                var connectedSpeed = 0.0
+                var best: ServerProfile? = null
+                var bestSpeed = 0.0
+                var selectable = 0
+                var measured = 0
+                for (p in candidates) {
+                    if (cancelled.get()) break
+                    val mbps = ServerSpeedTester.measureSpeed(appCtx, p)
+                    measured++
+                    onSpeedResult(p, mbps)   // результат сохраняем всегда
+                    if (ServerFilter.isSelectable(p, mbps, s, blocklist)) {
+                        selectable++
                         if (mbps > bestSpeed) { bestSpeed = mbps; best = p }
                         if (connected == null) {
-                            // Сначала — к ПЕРВОМУ живому: связь сразу, любая полезная скорость.
                             connected = p; connectedSpeed = mbps
                             onPhase("Подключён ${label(p)} ($mbps Мбит/с), продолжаю…")
                             val from = ServerLabels.displayForKey(appCtx, ProxyState.state.value.serverKey)
                             MonitorLog.switch(appCtx, from, ServerLabels.display(p), "полный тест: первый рабочий", "${fmt(mbps)} Мбит/с")
                             connect(p)
                         } else if (p !== connected && mbps > connectedSpeed * (1 + marginRatio)) {
-                            // Прогрессивный апгрейд ПО ХОДУ: переключаемся на заметно (>10%) более быстрый.
                             val prev = connectedSpeed
                             onPhase("Быстрее на >10%: ${label(p)} ($mbps > $connectedSpeed) — переключаюсь")
                             val from = ServerLabels.displayForKey(appCtx, ProxyState.state.value.serverKey)
@@ -110,18 +136,19 @@ object FullTestRunner {
                             connect(p)
                         }
                     }
-                },
-                onProgress = { done, total ->
-                    onPhase("Этап 2: скорость $done / $total · подключён: ${connected?.let(::label) ?: "—"}")
-                    emitProgress(done, total)
-                },
-                onFinish = { onDone(Result(connected ?: best, best, bestSpeed, alive.size, cancelled.get())) },
-            )
+                    onPhase("Этап 2: скорость $measured / ${candidates.size} · подключён: ${connected?.let(::label) ?: "—"}")
+                    emitProgress(measured, candidates.size)
+                    // Батч-остановка: набрали минимум живых на границе батча — дальше не мерим (экономия трафика).
+                    if (minAlive > 0 && selectable >= minAlive && measured % batch == 0) break
+                }
+                if (markBuilt && !cancelled.get()) fullTopBuilt = true
+                onDone(Result(connected ?: best, best, bestSpeed, candidates.size, cancelled.get()))
+            }.start()
         }
 
-        // --- Этап 1: ping всех (кроме заблокированных) ---
+        // --- Этап 1: ping всех (кроме заблокированных) — нужен для ранжирования, дёшев ---
         onPhase("Этап 1: пинг ${testable.size}…")
-        emitProgress(0, testable.size)   // шкала фазы пинга
+        emitProgress(0, testable.size)
         pingHandle = ServerTester.testAll(
             context = appCtx,
             servers = testable,
@@ -151,7 +178,6 @@ object FullTestRunner {
             override fun cancel() {
                 cancelled.set(true)
                 pingHandle?.cancel()
-                speedHandle?.cancel()
             }
         }
     }
