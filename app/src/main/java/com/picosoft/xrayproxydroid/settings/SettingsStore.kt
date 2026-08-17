@@ -68,6 +68,17 @@ data class AppSettings(
     val monitorTunnelThreshold: Double = 1.0,   // порог туннеля, Мбит/с (эталон tunnel_speed_threshold)
     // Сколько неудач ПОДРЯД считать падением. В эталоне решение за 1 цикл (счётчика нет) — наш анти-дребезг.
     val monitorFailuresToVerdict: Int = 2,
+
+    // --- Экономия трафика (Промпт 77) ---
+    // ВЫКЛ по умолчанию. В режиме экономии замер идёт БАТЧАМИ по [trafficSaveBatch] лучших по ПИНГУ:
+    // как только набрано [trafficSaveMinAlive] живых (скорость ≥ порога) — стоп; иначе следующий батч.
+    // Авто-обновление подписок — раз в [trafficSaveRefreshSec] (по умолч. час).
+    val trafficSaveMode: Boolean = false,
+    val trafficSaveBatch: Int = 5,             // сколько мерить за шаг (top по пингу)
+    val trafficSaveMinAlive: Int = 2,          // стоп, когда столько живых найдено
+    val trafficSaveRefreshSec: Int = 3600,     // авто-обновление подписок в режиме экономии, с
+    // ОБЫЧНЫЙ режим: после ПЕРВОГО полного топа мерить только top-N по скорости (ступенчатый повтор).
+    val normalTopBatch: Int = 10,
 ) {
     // Производные (в единицах, которые нужны коду).
     val speedWarmupMs: Int get() = (speedWarmupSec * 1_000).roundToInt()

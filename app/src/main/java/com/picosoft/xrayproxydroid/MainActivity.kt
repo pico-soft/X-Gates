@@ -2,8 +2,10 @@ package com.picosoft.xrayproxydroid
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
@@ -80,11 +82,15 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import kotlin.math.cos
 import kotlin.math.sin
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
@@ -128,6 +134,8 @@ import com.picosoft.xrayproxydroid.xray.ExternalIpChecker
 import com.picosoft.xrayproxydroid.xray.FullTestRunner
 import com.picosoft.xrayproxydroid.xray.ServerFilter
 import com.picosoft.xrayproxydroid.xray.ServerSpeedTester
+import com.picosoft.xrayproxydroid.xray.BlocklistLog
+import com.picosoft.xrayproxydroid.xray.XrayConfig
 import com.picosoft.xrayproxydroid.xray.XrayConfigBuilder
 import com.picosoft.xrayproxydroid.xray.link.Protocol
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
@@ -143,9 +151,15 @@ class MainActivity : ComponentActivity() {
         UpdateStore.init(applicationContext)     // результат последней проверки обновления + время
         // Авто-проверка обновления при холодном старте, но не чаще раза в сутки (несколько КБ через каскад;
         // САМ APK без согласия не качаем). Метаданные — в поток «Тест». Ошибка не мешает запуску.
+        // Промпт 77: СНАЧАЛА ждём, пока поднимется наш SOCKS (автозапуск коннектится ~50с) — иначе проверка
+        // фиктивно уходит НАПРЯМУЮ до появления туннеля, а на сети с заблокированным CDN GitHub это провал.
         run {
             val app = applicationContext
             if (UpdateStore.dueForAutoCheck(System.currentTimeMillis())) Thread {
+                var waited = 0
+                while (waited < 60_000 && !com.picosoft.xrayproxydroid.net.CascadeFetch.isOwnProxyUp()) {
+                    Thread.sleep(2_000); waited += 2_000
+                }
                 val r = runCatching { UpdateChecker.check(app) }.getOrNull() ?: return@Thread
                 UpdateStore.apply(app, r, System.currentTimeMillis())
             }.start()
@@ -233,6 +247,8 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
     val vpnStatus by SystemVpnState.state.collectAsState()   // сообщение о системном VPN — здесь, на цветном поле
     // Состояние раскрытия — на уровне вкладки (стабильное позиционное scoping), все свёрнуты по умолчанию.
     var aboutExpanded by rememberSaveable { mutableStateOf(false) }
+    var proxyExpanded by rememberSaveable { mutableStateOf(false) }
+    var browserExpanded by rememberSaveable { mutableStateOf(false) }
     var settingsExpanded by rememberSaveable { mutableStateOf(false) }
     var blocklistExpanded by rememberSaveable { mutableStateOf(false) }
     var monitorExpanded by rememberSaveable { mutableStateOf(false) }
@@ -249,6 +265,16 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
         item {
             CollapsibleSection("О приложении", aboutExpanded, { aboutExpanded = !aboutExpanded }, icon = UiIcon.INFO) {
                 AboutSection()
+            }
+        }
+        item {
+            CollapsibleSection("Локальный прокси", proxyExpanded, { proxyExpanded = !proxyExpanded }, icon = UiIcon.LINK) {
+                LocalProxySection()
+            }
+        }
+        item {
+            CollapsibleSection("Настройте браузер и Telegram", browserExpanded, { browserExpanded = !browserExpanded }, icon = UiIcon.GLOBE) {
+                BrowserSetupSection()
             }
         }
         item {
@@ -288,6 +314,8 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
         }
         // Проверка обновления — на виду (не в подменю), ниже «Трафик».
         item { UpdateCheckSection() }
+        // Трафик замеров + режим экономии — в САМОМ НИЗУ (Промпт 77).
+        item { TrafficBlock() }
     }
 }
 
@@ -499,7 +527,7 @@ private fun NavIcon(index: Int, color: Color, size: androidx.compose.ui.unit.Dp)
  * (ℹ️⚙️🚫🛡️📄) и глифов-шрифта (▶■↻✎) — чтобы ВСЕ иконки были единообразны, как на нижней плашке.
  * Инлайновые статус-маркеры таблицы (●○✗) и каретки ▸▾ — это не «иконки», их не трогаем.
  */
-private enum class UiIcon { INFO, GEAR, BLOCK, SHIELD, TRAFFIC, DOC, REFRESH, PLAY, STOP, PENCIL, WARN }
+private enum class UiIcon { INFO, GEAR, BLOCK, SHIELD, TRAFFIC, DOC, REFRESH, PLAY, STOP, PENCIL, WARN, LINK, GLOBE, COPY }
 
 @Composable
 private fun FlatIcon(
@@ -583,6 +611,27 @@ private fun FlatIcon(
                 }, color, style = stroke)
                 drawLine(color, Offset(s * 0.5f, s * 0.42f), Offset(s * 0.5f, s * 0.62f), sw)
                 drawCircle(color, sw * 0.6f, Offset(s * 0.5f, s * 0.72f))
+            }
+            UiIcon.LINK -> {   // два узла, соединённые линией (локальный прокси/подключение)
+                val rN = s * 0.13f
+                drawCircle(color, rN, Offset(s * 0.28f, s * 0.34f), style = stroke)
+                drawCircle(color, rN, Offset(s * 0.72f, s * 0.66f), style = stroke)
+                drawLine(color, Offset(s * 0.38f, s * 0.44f), Offset(s * 0.62f, s * 0.56f), sw)
+            }
+            UiIcon.GLOBE -> {   // глобус: круг + меридиан + экватор
+                val r = s * 0.36f
+                drawCircle(color, r, c, style = stroke)
+                drawLine(color, Offset(c.x - r, c.y), Offset(c.x + r, c.y), sw)
+                drawArc(color, startAngle = 90f, sweepAngle = 180f, useCenter = false,
+                    topLeft = Offset(c.x - r * 0.5f, c.y - r), size = Size(r, 2 * r), style = stroke)
+                drawArc(color, startAngle = 270f, sweepAngle = 180f, useCenter = false,
+                    topLeft = Offset(c.x - r * 0.5f, c.y - r), size = Size(r, 2 * r), style = stroke)
+            }
+            UiIcon.COPY -> {   // две наложенные страницы
+                drawRoundRect(color, topLeft = Offset(s * 0.34f, s * 0.20f), size = Size(s * 0.40f, s * 0.48f),
+                    cornerRadius = CornerRadius(s * 0.06f, s * 0.06f), style = stroke)
+                drawRoundRect(color, topLeft = Offset(s * 0.22f, s * 0.32f), size = Size(s * 0.40f, s * 0.48f),
+                    cornerRadius = CornerRadius(s * 0.06f, s * 0.06f), style = stroke)
             }
         }
     }
@@ -912,12 +961,30 @@ private fun BootScreen(modifier: Modifier = Modifier) {
             val last = lastKey?.let { k -> servers.firstOrNull { SubscriptionManager.serverKey(it) == k } }
             if (last != null) connectServer(last, "автозапуск (последний сервер)")
         }
-        val hasSubs = sources.any { it.enabled && it.url.isNotBlank() }
-        if (hasSubs) onRefreshAll(onComplete = { onFullTest() }) else onFullTest()
+        Thread {
+            // Промпт 74: дефолтную подписку сеем ТОЛЬКО если её URL зафетчился (иначе пусто + «Добавьте вашу
+            // подписку»). Фетч блокирующий → в фоне. justSeeded=true → тело уже импортировано, рефетч не нужен.
+            val justSeeded = SubscriptionManager.trySeedDefaultSource(context)
+            val hasSubs = SubscriptionManager.sources(context).any { it.enabled && it.url.isNotBlank() }
+            activity.runOnUiThread {
+                reloadSources(); reloadServers()
+                when {
+                    justSeeded -> onFullTest()
+                    hasSubs -> onRefreshAll(onComplete = { onFullTest() })
+                    else -> onFullTest()
+                }
+            }
+        }.start()
     }
 
     // Основной вид = ЖИВЫЕ — через единый предикат [ServerFilter.isVisible] (стоп-лист+протокол+пинг+мин.скорость).
     val alive = shown.filter { ServerFilter.isVisible(it, effPing(it), effSpeed(it), settings, blocklist) }
+
+    // ПРИБОРЫ по стоп-листу (Промпт 73.C): на КАЖДЫЙ пересчёт фильтра — подробный дамп (гейт «Подробные логи»,
+    // тег Blocklist). Ключи эффекта = все входы фильтра, чтобы лог был на каждое реальное изменение.
+    LaunchedEffect(servers, blocklist, settings, pingResults, speedResults) {
+        BlocklistLog.dump(context, servers, settings, blocklist, { effPing(it) }, { effSpeed(it) }, cause = "recompose")
+    }
 
     // Активный сервер скрыт настройками (протокол выключен)? Соединение НЕ рвём — только пометка в статусе.
     val activeHidden = activeServer != null && !ServerFilter.protocolAllowed(activeServer, settings)
@@ -942,6 +1009,21 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         item {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.padding(bottom = 12.dp)) {
                 AppHeader()
+                // Промпт 74: подписок нет (дефолт не зафетчился при первом запуске или юзер их не добавил) —
+                // зовём добавить свою. Показываем ТОЛЬКО когда список источников пуст.
+                if (sources.isEmpty()) {
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(
+                            "Добавьте вашу подписку",
+                            style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                        Text(
+                            "Вкладка «Подписки» → вставьте ссылку или URL. Без подписки список серверов пуст.",
+                            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+                        )
+                    }
+                }
                 StatusBox(
                     running = proxy.running, verified = ipVerified, ipText = externalIp,
                     onRefreshIp = { refreshIp() },
@@ -1195,7 +1277,7 @@ private fun StatusBox(
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.Top) {
                     FlatIcon(UiIcon.BLOCK, size = 14.dp, color = fg)
                     Text(
-                        "активный сервер в стоп-листе — нажмите «Самый быстрый»",
+                        "Активный сервер в стоп-листе. Живое соединение НЕ разрываем — переключиться: кнопка «Самый быстрый».",
                         style = MaterialTheme.typography.bodySmall, color = fg, fontWeight = FontWeight.Bold,
                     )
                 }
@@ -1227,6 +1309,53 @@ private fun StatusBox(
         }
         if (message.isNotEmpty() && message != "idle") {
             Text(message, style = MaterialTheme.typography.bodySmall, color = fg)
+        }
+    }
+}
+
+/**
+ * Блок «Трафик замеров» (Промпт 77) — в САМОМ НИЗУ «Настроек»: КРАТКОЕ предупреждение на зелёном поле +
+ * переключатель РЕЖИМА ЭКОНОМИИ и его редактируемые параметры (размер батча, минимум живых, авто-обновление).
+ * Замер = скачивание пробника (до 13 МБ/сервер), режим экономии мерит батчами до нескольких живых.
+ */
+@Composable
+private fun TrafficBlock() {
+    val context = LocalContext.current
+    val settings by SettingsStore.state.collectAsState()
+    val d = SettingsStore.DEFAULTS
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        val bg = Color(0xFF1B5E20); val fg = Color(0xFFA5D6A7)
+        Column(
+            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(bg).padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                FlatIcon(UiIcon.TRAFFIC, size = 16.dp, color = fg)
+                Text("Замер тратит трафик", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, color = fg)
+            }
+            Text(
+                "Замер скорости = скачивание пробника, до 13 МБ на сервер. Полный тест при старте, ~50 адресов ≈ 300–650 МБ (меряются все живые). Режим экономии ниже мерит батчами и останавливается на нескольких живых.",
+                style = MaterialTheme.typography.bodySmall, color = fg,
+            )
+        }
+        SettingsGroupLabel("Экономия трафика")
+        BoolSettingRow("Режим экономии трафика", settings.trafficSaveMode, d.trafficSaveMode) {
+            SettingsStore.update(context, settings.copy(trafficSaveMode = it))
+        }
+        if (settings.trafficSaveMode) {
+            Text(
+                "Мерим лучших по пингу батчами; набрали нужное число живых — стоп. Полный тест при старте больше не гоняет всех.",
+                style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+            )
+            IntSettingRow("Мерить за шаг (top по пингу)", "", settings.trafficSaveBatch, d.trafficSaveBatch, 1, 50) {
+                SettingsStore.update(context, settings.copy(trafficSaveBatch = it))
+            }
+            IntSettingRow("Достаточно живых — стоп", "", settings.trafficSaveMinAlive, d.trafficSaveMinAlive, 1, 20) {
+                SettingsStore.update(context, settings.copy(trafficSaveMinAlive = it))
+            }
+            IntSettingRow("Авто-обновление подписок", "ч", settings.trafficSaveRefreshSec / 3600, d.trafficSaveRefreshSec / 3600, 1, 24) {
+                SettingsStore.update(context, settings.copy(trafficSaveRefreshSec = it * 3600))
+            }
         }
     }
 }
@@ -1701,6 +1830,10 @@ private fun SettingsSection(
         IntSettingRow("Запас для апгрейда", "%", settings.upgradeMarginPercent, d.upgradeMarginPercent, 0, 100) {
             onChange(settings.copy(upgradeMarginPercent = it))
         }
+        // Ступенчатый повтор (Промпт 77): после ПЕРВОГО полного топа замеряем только top-N по скорости.
+        IntSettingRow("Повторный замер: top-N по скорости", "", settings.normalTopBatch, d.normalTopBatch, 1, 100) {
+            onChange(settings.copy(normalTopBatch = it))
+        }
 
         SettingsGroupLabel("Прочее")
         BoolSettingRow("Автозапуск при старте", settings.autoStartOnLaunch, d.autoStartOnLaunch) {
@@ -1740,6 +1873,20 @@ private fun BlocklistSection(
     onUnblockServer: (String) -> Unit,
 ) {
     var input by remember { mutableStateOf("") }
+    // Подтверждение, когда слово скрывает почти все серверы (провайдер мог назвать их все одинаково) —
+    // защита от неожиданного «скрылось всё». Хранит (слово, сколько скроет, всего).
+    var confirm by remember { mutableStateOf<Triple<String, Int, Int>?>(null) }
+    val total = serverNames.size
+
+    fun tryAdd() {
+        val w = input.trim()
+        if (w.isBlank()) return
+        val n = blocklist.countForWord(w, serverNames)
+        // «почти все» = ≥80% и больше одного; при малых списках (≤2) не мешаем.
+        if (total > 2 && n >= 2 && n >= (total * 4 + 4) / 5) confirm = Triple(w, n, total)
+        else { onAddWord(w); input = "" }
+    }
+
     Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SettingsGroupLabel("Правила-слова (по имени сервера)")
         Text(
@@ -1763,7 +1910,7 @@ private fun BlocklistSection(
                 placeholder = { Text("Слово") },
                 modifier = Modifier.weight(1f),
             )
-            Button(onClick = { onAddWord(input); input = "" }, enabled = input.isNotBlank()) { Text("+") }
+            Button(onClick = { tryAdd() }, enabled = input.isNotBlank()) { Text("+") }
         }
 
         Spacer(Modifier.height(4.dp))
@@ -1789,6 +1936,21 @@ private fun BlocklistSection(
                 }
             }
         }
+    }
+
+    confirm?.let { (w, n, m) ->
+        AlertDialog(
+            onDismissRequest = { confirm = null },
+            title = { Text("Скрыть почти все?") },
+            text = {
+                Text(
+                    "Слово «$w» скроет $n из $m серверов — почти все. Похоже, провайдер называет их все так. " +
+                        "Чтобы скрыть только часть, используйте более узкое слово или точечно (тап по строке → «В стоп-лист»).",
+                )
+            },
+            confirmButton = { TextButton(onClick = { onAddWord(w); input = ""; confirm = null }) { Text("Всё равно добавить") } },
+            dismissButton = { TextButton(onClick = { confirm = null }) { Text("Отмена") } },
+        )
     }
 }
 
@@ -2207,6 +2369,146 @@ private fun AboutSection() {
     }
 }
 
+private fun copyToast(ctx: Context, msg: String) =
+    android.widget.Toast.makeText(ctx, msg, android.widget.Toast.LENGTH_SHORT).show()
+
+/** Кликабельный текст: тап копирует [copy] в буфер + Toast. */
+@Composable
+private fun CopyText(text: String, copy: String = text, mono: Boolean = false, modifier: Modifier = Modifier) {
+    val clip = LocalClipboardManager.current
+    val ctx = LocalContext.current
+    Text(
+        text,
+        style = MaterialTheme.typography.bodyMedium,
+        fontFamily = if (mono) FontFamily.Monospace else null,
+        modifier = modifier
+            .clip(RoundedCornerShape(4.dp))
+            .clickable { clip.setText(AnnotatedString(copy)); copyToast(ctx, "Скопировано: $copy") }
+            .padding(vertical = 2.dp, horizontal = 2.dp),
+    )
+}
+
+/**
+ * Секция «Локальный прокси» — адрес нашего SOCKS/HTTP для приложений НА ЭТОМ ЖЕ телефоне (127.0.0.1).
+ * Заменяет отсутствующую «плашку про туннель»: она (VpnStatusCard) появляется только при ЧУЖОМ системном
+ * VPN, а этот блок в Настройках виден всегда и даёт адрес+порт (тап — скопировать).
+ */
+@Composable
+private fun LocalProxySection() {
+    val proxy by ProxyState.state.collectAsState()
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            if (proxy.running) "Прокси запущен — приложения на этом телефоне могут ходить через него."
+            else "Прокси сейчас не запущен (адрес заработает после запуска на «Главной»).",
+            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+        )
+        SettingsGroupLabel("Адрес прокси (тап — скопировать)")
+        ProxyAddrRow("SOCKS5 (рекомендуется)", "${XrayConfig.LISTEN}:${XrayConfig.SOCKS_PORT}")
+        ProxyAddrRow("HTTP", "${XrayConfig.LISTEN}:${XrayConfig.HTTP_PORT}")
+        Text(
+            "Хост 127.0.0.1 — это сам телефон. Для полного обхода включите DNS через прокси (см. «Настройте браузер»).",
+            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+        )
+    }
+}
+
+@Composable
+private fun ProxyAddrRow(label: String, value: String) {
+    val clip = LocalClipboardManager.current
+    val ctx = LocalContext.current
+    Row(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp))
+            .clickable { clip.setText(AnnotatedString(value)); copyToast(ctx, "Скопировано: $value") }
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(label, style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
+            Text(value, style = MaterialTheme.typography.bodyMedium, fontFamily = FontFamily.Monospace)
+        }
+        FlatIcon(UiIcon.COPY, size = 16.dp, color = MaterialTheme.colorScheme.primary)
+    }
+}
+
+/** Кликабельная ссылка (подчёркнута, primary): открывает URL во внешнем браузере/приложении. */
+@Composable
+private fun LinkText(text: String, url: String) {
+    val ctx = LocalContext.current
+    Text(
+        text,
+        style = MaterialTheme.typography.bodyMedium.copy(textDecoration = TextDecoration.Underline),
+        fontWeight = FontWeight.Bold,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier
+            .clip(RoundedCornerShape(4.dp))
+            .clickable {
+                try { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+                catch (_: Exception) {}
+            }
+            .padding(vertical = 2.dp, horizontal = 2.dp),
+    )
+}
+
+/**
+ * Секция «Настройте браузер и Telegram» — направить приложения в наш локальный SOCKS5-прокси. Максимум
+ * удобства (Промпт 75): ПЕРВОЙ строкой адрес+порт (копируется тапом), ссылки на авторитетные сборки
+ * браузеров/ТГ, about:config отдельной копируемой строкой, все значения копируются по тапу.
+ */
+@Composable
+private fun BrowserSetupSection() {
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        // ПЕРВАЯ строка — адрес+порт + краткая инструкция. Тип прокси везде SOCKS5.
+        ProxyAddrRow("Прокси (SOCKS5)", "${XrayConfig.LISTEN}:${XrayConfig.SOCKS_PORT}")
+        Text(
+            "Впишите этот адрес и порт (тип SOCKS5) в прокси-настройки приложения. ВСЕ значения ниже копируются по тапу.",
+            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+        )
+
+        SettingsGroupLabel("Браузер (движок Firefox)")
+        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+            LinkText("Iceraven ↗", "https://github.com/fork-maintainers/iceraven-browser/releases")
+            LinkText("Fennec ↗", "https://f-droid.org/packages/org.mozilla.fennec_fdroid/")
+        }
+        Text("1. Новая вкладка → вставьте в адресную строку и откройте:", style = MaterialTheme.typography.bodySmall)
+        CopyText("about:config", mono = true)
+        Text("Примите предупреждение. 2. Для каждой строки: скопируйте ключ, вставьте в поиск, задайте значение:",
+            style = MaterialTheme.typography.bodySmall)
+        ConfigRow("network.proxy.type", "1")
+        ConfigRow("network.proxy.socks", XrayConfig.LISTEN)
+        ConfigRow("network.proxy.socks_port", XrayConfig.SOCKS_PORT.toString())
+        ConfigRow("network.proxy.socks_version", "5")
+        ConfigRow("network.proxy.socks_remote_dns", "true")
+        ConfigRow("network.proxy.allow_hijacking_localhost", "true")
+        Text(
+            "Готово — перезапустите вкладку. Проверка: откройте 2ip.ru, адрес и страна должны быть зарубежными. Выключить обход — network.proxy.type = 0.",
+            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+        )
+
+        SettingsGroupLabel("Telegram")
+        LinkText("Telegram ↗", "https://telegram.org/dl/android")
+        Text(
+            "Настройки → Данные и память → Настройка прокси → Добавить прокси → SOCKS5, затем впишите Сервер и Порт (ниже — копируются тапом):",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        ProxyAddrRow("Сервер", XrayConfig.LISTEN)
+        ProxyAddrRow("Порт", XrayConfig.SOCKS_PORT.toString())
+        Text("Логин и пароль оставьте пустыми.", style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
+    }
+}
+
+@Composable
+private fun ConfigRow(key: String, value: String) {
+    Row(
+        Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        CopyText(key, mono = true, modifier = Modifier.weight(1f))
+        Text("→", style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
+        CopyText(value, mono = true)
+    }
+}
+
 /**
  * Проверка обновления (Промпт 70) — ВЕРХНЕУРОВНЕВЫЙ блок вкладки «Настройки», ниже «Трафик»: кнопка
  * «Проверить обновление», результат последней проверки с временем; при доступном обновлении — размер,
@@ -2228,14 +2530,17 @@ private fun UpdateCheckSection() {
     var readyFile by remember { mutableStateOf<File?>(null) }
     var message by remember { mutableStateOf<String?>(null) }
     var confirmMetered by remember { mutableStateOf(false) }
+    var detailsExpanded by remember { mutableStateOf(false) }
 
     fun startCheck() {
         if (checking || downloading) return
         checking = true; message = null; readyFile = null
         Thread {
-            val result = runCatching { UpdateChecker.check(context) }
-                .getOrElse { UpdateCheckResult.Error(com.picosoft.xrayproxydroid.update.UpdateErrorKind.API_UNAVAILABLE, it.message ?: "") }
-            UpdateStore.apply(context, result, System.currentTimeMillis())
+            val report = runCatching { UpdateChecker.check(context) }
+                .getOrElse { com.picosoft.xrayproxydroid.update.CheckReport(
+                    UpdateCheckResult.Error(com.picosoft.xrayproxydroid.update.UpdateErrorKind.API_UNAVAILABLE, it.message ?: ""),
+                    "исключение: ${it.javaClass.simpleName}: ${it.message}") }
+            UpdateStore.apply(context, report, System.currentTimeMillis())
             activity.runOnUiThread { checking = false }
         }.start()
     }
@@ -2288,6 +2593,18 @@ private fun UpdateCheckSection() {
             Text(record.summary, style = MaterialTheme.typography.bodyMedium)
             Text("Проверено: ${UPDATE_DATE_FMT.format(Date(record.checkedAtMs))}",
                 style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
+            // Полная постадийная диагностика по адресам обновления (77.E) — разбор в одно нажатие.
+            if (record.details.isNotBlank()) {
+                Text(
+                    if (detailsExpanded) "▾ Подробности (ступени, host, редиректы)" else "▸ Подробности (ступени, host, редиректы)",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.clip(RoundedCornerShape(4.dp)).clickable { detailsExpanded = !detailsExpanded }.padding(vertical = 2.dp),
+                )
+                if (detailsExpanded) {
+                    Text(record.details, style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace, color = TABLE_GRAY)
+                }
+            }
         } else {
             Text("Проверка ещё не выполнялась.", style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
         }

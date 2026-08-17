@@ -42,6 +42,10 @@ object SubscriptionManager {
 
     private const val TAG = "SubscriptionManager"
 
+    /** Дефолтная подписка «из коробки» (Промпт 72). Публичный список конфигов для обхода в РФ. */
+    const val DEFAULT_SOURCE_URL = "https://raw.githack.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS_mobile.txt"
+    const val DEFAULT_SOURCE_NAME = "Обход ограничений в РФ по-умолчанию"
+
     /**
      * Ключ ПОЛНОЙ идентичности соединения — дедуп внутри источника, склейка МЕЖДУ источниками,
      * привязка pingMs/speed, определение активного сервера. НЕ только addr+port+cred (иначе
@@ -57,13 +61,56 @@ object SubscriptionManager {
 
     // ─────────────────────────── миграция (однократно) ───────────────────────────
 
-    /** Однократная инициализация: миграция старого `subscriptions.json` или создание дефолтного источника. */
+    /**
+     * Однократная инициализация (СИНХРОННО, без сети). Миграция старого `subscriptions.json`; затем: если у
+     * юзера УЖЕ есть подписки — помечаем «посеяно», чтобы дефолт никогда не добавлялся авто. Сетевой посев
+     * ПУСТОГО списка — отдельно и по ФАКТУ фетча ([trySeedDefaultSource], из автозапуска, в фоне).
+     */
     fun init(context: Context) {
         val cur = SubscriptionStore.load(context)
-        if (cur.migratedLegacy) return
-        val legacy = SubscriptionStore.readLegacy(context)
-        val migrated = if (legacy.isNotEmpty()) convertLegacy(legacy) else freshDefault()
-        SubscriptionStore.save(context, recount(migrated))
+        if (!cur.migratedLegacy) {
+            val legacy = SubscriptionStore.readLegacy(context)
+            val migrated = if (legacy.isNotEmpty()) convertLegacy(legacy) else freshDefault()
+            SubscriptionStore.save(context, recount(migrated))
+        }
+        val f = SubscriptionStore.load(context)
+        if (!f.seededDefaultRuBypass && f.sources.isNotEmpty()) {
+            SubscriptionStore.save(context, f.copy(seededDefaultRuBypass = true))
+        }
+    }
+
+    /**
+     * Промпт 74: дефолтную подписку «Обход ограничений в РФ» добавляем ТОЛЬКО если её URL реально
+     * ЗАФЕТЧИЛСЯ (первый запуск). Не зафетчился → список остаётся ПУСТЫМ (в UI «Добавьте вашу подписку»),
+     * флаг НЕ ставим → повторим на следующем холодном старте. Сеть → вызывать в ФОНЕ.
+     * Возвращает true, если только что добавила+импортировала (чтобы автозапуск не рефетчил повторно).
+     * Идемпотентно: не сеем, если уже посеяно ИЛИ у юзера уже есть подписки (флаг [seededDefaultRuBypass]
+     * не даёт дефолту вернуться после удаления пользователем).
+     */
+    fun trySeedDefaultSource(context: Context): Boolean {
+        val file = SubscriptionStore.load(context)
+        if (file.seededDefaultRuBypass) return false
+        if (file.sources.isNotEmpty()) {                       // у юзера уже есть свои → дефолт не навязываем
+            SubscriptionStore.save(context, file.copy(seededDefaultRuBypass = true))
+            return false
+        }
+        val settings = SettingsStore.current()
+        val url = normalizeUrl(DEFAULT_SOURCE_URL)
+        val directT = settings.subTimeoutSec * 1000
+        val proxyT = settings.subTimeoutSec * 1000 + 10_000
+        val totalT = directT + proxyT + 5_000
+        val cascade = CascadeFetch.fetch(context, url, settings.subUserAgent, directT, proxyT, totalT,
+            acceptBody = { it.ok && hasSupportedLinks(it.body) })
+        if (!cascade.ok) return false                          // не зафетчилось → пусто, флаг НЕ ставим (повтор позже)
+        val f2 = SubscriptionStore.load(context)               // перечитать (гонка) — вдруг юзер успел добавить
+        if (f2.seededDefaultRuBypass || f2.sources.isNotEmpty()) return false
+        val id = newId()
+        SubscriptionStore.save(context, f2.copy(
+            seededDefaultRuBypass = true,
+            sources = listOf(SubSource(id = id, name = DEFAULT_SOURCE_NAME, url = url, enabled = true)),
+        ))
+        importInto(context, id, cascade.result!!.body, "Дефолтная подписка (первый успешный фетч)")
+        return true
     }
 
     /** Старые вложенные подписки → источники + реестр (измерения серверов сохраняются). */
@@ -84,12 +131,14 @@ object SubscriptionManager {
     }
 
     /**
-     * Свежая установка: БЕЗ зашитых подписок (Промпт 67) — пользователь добавляет свои сам. Раньше здесь
-     * сидел зашитый дефолтный URL; его убрали, чтобы чужой дефолт не попадал в релиз и не «воскресал»
-     * при очистке данных. Помечаем migratedLegacy=true, чтобы init больше не срабатывал.
+     * Свежая установка: ПУСТО (Промпт 74). Дефолтную подписку добавит [trySeedDefaultSource] из автозапуска —
+     * но ТОЛЬКО если её URL реально зафетчится; иначе пусто + «Добавьте вашу подписку». seededDefaultRuBypass
+     * оставляем false, чтобы посев повторился на следующем старте, пока не удастся (или пока юзер не добавит своё).
+     * (Эволюция: П67 дефолт УБРАЛИ; П72 вернули безусловно; П74 — только по факту успешного фетча.)
      */
     private fun freshDefault(): SourcesFile = SourcesFile(
         migratedLegacy = true,
+        seededDefaultRuBypass = false,
         sources = emptyList(),
         servers = emptyList(),
     )

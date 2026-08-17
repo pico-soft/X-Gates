@@ -15,6 +15,7 @@ data class FetchResult(
     val body: String,             // тело (UTF-8); при не-2xx — тело ошибки (для диагностики)
     val exceptionClass: String?,   // напр. UnknownHostException / SocketTimeoutException
     val errorMessage: String?,
+    val redirectChain: List<String> = emptyList(),   // все URL по цепочке редиректов (для диагностики)
 )
 
 /**
@@ -40,8 +41,10 @@ object SubscriptionFetcher {
     ): FetchResult {
         var current = url
         var redirects = 0
+        val hops = ArrayList<String>()
         try {
             while (true) {
+                hops.add(current)
                 val conn = (open(URL(current)) as HttpURLConnection).apply {
                     requestMethod = "GET"
                     connectTimeout = timeoutMs
@@ -57,7 +60,7 @@ object SubscriptionFetcher {
                     return FetchResult(
                         ok = false, finalUrl = current, httpCode = -1, contentType = null,
                         contentLength = -1, bodyBytes = 0, body = "",
-                        exceptionClass = e.javaClass.simpleName, errorMessage = e.message,
+                        exceptionClass = e.javaClass.simpleName, errorMessage = e.message, redirectChain = hops,
                     )
                 }
 
@@ -83,20 +86,20 @@ object SubscriptionFetcher {
                     ok = code in 200..299,
                     finalUrl = current, httpCode = code, contentType = contentType,
                     contentLength = contentLength, bodyBytes = body.toByteArray(Charsets.UTF_8).size,
-                    body = body, exceptionClass = null, errorMessage = null,
+                    body = body, exceptionClass = null, errorMessage = null, redirectChain = hops,
                 )
             }
             // вышли по исчерпанию редиректов без финального ответа
             return FetchResult(
                 ok = false, finalUrl = current, httpCode = -1, contentType = null,
                 contentLength = -1, bodyBytes = 0, body = "",
-                exceptionClass = "TooManyRedirects", errorMessage = "редиректов больше $MAX_REDIRECTS",
+                exceptionClass = "TooManyRedirects", errorMessage = "редиректов больше $MAX_REDIRECTS", redirectChain = hops,
             )
         } catch (e: Exception) {
             return FetchResult(
                 ok = false, finalUrl = current, httpCode = -1, contentType = null,
                 contentLength = -1, bodyBytes = 0, body = "",
-                exceptionClass = e.javaClass.simpleName, errorMessage = e.message,
+                exceptionClass = e.javaClass.simpleName, errorMessage = e.message, redirectChain = hops,
             )
         }
     }

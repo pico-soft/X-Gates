@@ -43,10 +43,13 @@ data class ServerRecord(
 /**
  * Файл источников (`sources.json` в filesDir). Единая точка хранения мультиподписок.
  * @param migratedLegacy true после однократной миграции старого `subscriptions.json`.
+ * @param seededDefaultRuBypass true после ОДНОКРАТНОГО посева дефолтной подписки «Обход ограничений в РФ»
+ *        (и на свежих, и на существующих установках). Флаг не даёт ей «воскреснуть» после удаления юзером.
  */
 @Serializable
 data class SourcesFile(
     val migratedLegacy: Boolean = false,
+    val seededDefaultRuBypass: Boolean = false,
     val sources: List<SubSource> = emptyList(),
     val servers: List<ServerRecord> = emptyList(),
 )
