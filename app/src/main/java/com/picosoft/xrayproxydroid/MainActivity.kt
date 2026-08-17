@@ -1777,6 +1777,20 @@ private fun BlocklistSection(
     onUnblockServer: (String) -> Unit,
 ) {
     var input by remember { mutableStateOf("") }
+    // Подтверждение, когда слово скрывает почти все серверы (провайдер мог назвать их все одинаково) —
+    // защита от неожиданного «скрылось всё». Хранит (слово, сколько скроет, всего).
+    var confirm by remember { mutableStateOf<Triple<String, Int, Int>?>(null) }
+    val total = serverNames.size
+
+    fun tryAdd() {
+        val w = input.trim()
+        if (w.isBlank()) return
+        val n = blocklist.countForWord(w, serverNames)
+        // «почти все» = ≥80% и больше одного; при малых списках (≤2) не мешаем.
+        if (total > 2 && n >= 2 && n >= (total * 4 + 4) / 5) confirm = Triple(w, n, total)
+        else { onAddWord(w); input = "" }
+    }
+
     Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SettingsGroupLabel("Правила-слова (по имени сервера)")
         Text(
@@ -1800,7 +1814,7 @@ private fun BlocklistSection(
                 placeholder = { Text("Слово") },
                 modifier = Modifier.weight(1f),
             )
-            Button(onClick = { onAddWord(input); input = "" }, enabled = input.isNotBlank()) { Text("+") }
+            Button(onClick = { tryAdd() }, enabled = input.isNotBlank()) { Text("+") }
         }
 
         Spacer(Modifier.height(4.dp))
@@ -1826,6 +1840,21 @@ private fun BlocklistSection(
                 }
             }
         }
+    }
+
+    confirm?.let { (w, n, m) ->
+        AlertDialog(
+            onDismissRequest = { confirm = null },
+            title = { Text("Скрыть почти все?") },
+            text = {
+                Text(
+                    "Слово «$w» скроет $n из $m серверов — почти все. Похоже, провайдер называет их все так. " +
+                        "Чтобы скрыть только часть, используйте более узкое слово или точечно (тап по строке → «В стоп-лист»).",
+                )
+            },
+            confirmButton = { TextButton(onClick = { onAddWord(w); input = ""; confirm = null }) { Text("Всё равно добавить") } },
+            dismissButton = { TextButton(onClick = { confirm = null }) { Text("Отмена") } },
+        )
     }
 }
 
