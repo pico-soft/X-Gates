@@ -42,6 +42,10 @@ object SubscriptionManager {
 
     private const val TAG = "SubscriptionManager"
 
+    /** Дефолтная подписка «из коробки» (Промпт 72). Публичный список конфигов для обхода в РФ. */
+    const val DEFAULT_SOURCE_URL = "https://raw.githack.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS_mobile.txt"
+    const val DEFAULT_SOURCE_NAME = "Обход ограничений в РФ по-умолчанию"
+
     /**
      * Ключ ПОЛНОЙ идентичности соединения — дедуп внутри источника, склейка МЕЖДУ источниками,
      * привязка pingMs/speed, определение активного сервера. НЕ только addr+port+cred (иначе
@@ -57,13 +61,29 @@ object SubscriptionManager {
 
     // ─────────────────────────── миграция (однократно) ───────────────────────────
 
-    /** Однократная инициализация: миграция старого `subscriptions.json` или создание дефолтного источника. */
+    /** Однократная инициализация: миграция старого `subscriptions.json`, затем однократный посев дефолтной подписки. */
     fun init(context: Context) {
         val cur = SubscriptionStore.load(context)
-        if (cur.migratedLegacy) return
-        val legacy = SubscriptionStore.readLegacy(context)
-        val migrated = if (legacy.isNotEmpty()) convertLegacy(legacy) else freshDefault()
-        SubscriptionStore.save(context, recount(migrated))
+        if (!cur.migratedLegacy) {
+            val legacy = SubscriptionStore.readLegacy(context)
+            val migrated = if (legacy.isNotEmpty()) convertLegacy(legacy) else freshDefault()
+            SubscriptionStore.save(context, recount(migrated))
+        }
+        seedDefaultSourceOnce(context)
+    }
+
+    /**
+     * ОДНОКРАТНО добавить дефолтную подписку «Обход ограничений в РФ» — и на СВЕЖИХ установках, и на уже
+     * существующих (без wipe данных, [[never-wipe-device-data]]). Идемпотентно: не дублируем, если источник
+     * с таким URL уже есть; флаг [SourcesFile.seededDefaultRuBypass] не даёт ей вернуться после удаления юзером.
+     */
+    private fun seedDefaultSourceOnce(context: Context) {
+        val file = SubscriptionStore.load(context)
+        if (file.seededDefaultRuBypass) return
+        val u = normalizeUrl(DEFAULT_SOURCE_URL)
+        val sources = if (file.sources.any { it.url == u }) file.sources
+        else file.sources + SubSource(id = newId(), name = DEFAULT_SOURCE_NAME, url = u, enabled = true)
+        SubscriptionStore.save(context, recount(file.copy(seededDefaultRuBypass = true, sources = sources)))
     }
 
     /** Старые вложенные подписки → источники + реестр (измерения серверов сохраняются). */
@@ -84,13 +104,16 @@ object SubscriptionManager {
     }
 
     /**
-     * Свежая установка: БЕЗ зашитых подписок (Промпт 67) — пользователь добавляет свои сам. Раньше здесь
-     * сидел зашитый дефолтный URL; его убрали, чтобы чужой дефолт не попадал в релиз и не «воскресал»
-     * при очистке данных. Помечаем migratedLegacy=true, чтобы init больше не срабатывал.
+     * Свежая установка: сразу с дефолтной подпиской «Обход ограничений в РФ» (Промпт 72 — возврат дефолта,
+     * теперь ЯВНЫЙ публичный список, а не чужой личный). migratedLegacy=true, чтобы init не пересевал;
+     * seededDefaultRuBypass=true, чтобы [seedDefaultSourceOnce] не добавил её повторно.
+     * (В Промпте 67 дефолт УБИРАЛИ — не хотели тащить чужой личный URL в релиз; теперь это осознанный
+     * общий дефолт по запросу; удаление юзером окончательно — флаг не даёт «воскреснуть».)
      */
     private fun freshDefault(): SourcesFile = SourcesFile(
         migratedLegacy = true,
-        sources = emptyList(),
+        seededDefaultRuBypass = true,
+        sources = listOf(SubSource(id = newId(), name = DEFAULT_SOURCE_NAME, url = normalizeUrl(DEFAULT_SOURCE_URL), enabled = true)),
         servers = emptyList(),
     )
 
