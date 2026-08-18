@@ -534,7 +534,7 @@ private fun NavIcon(index: Int, color: Color, size: androidx.compose.ui.unit.Dp)
  * (ℹ️⚙️🚫🛡️📄) и глифов-шрифта (▶■↻✎) — чтобы ВСЕ иконки были единообразны, как на нижней плашке.
  * Инлайновые статус-маркеры таблицы (●○✗) и каретки ▸▾ — это не «иконки», их не трогаем.
  */
-private enum class UiIcon { INFO, GEAR, BLOCK, SHIELD, TRAFFIC, DOC, REFRESH, PLAY, STOP, PENCIL, WARN, LINK, GLOBE, COPY }
+private enum class UiIcon { INFO, GEAR, BLOCK, SHIELD, TRAFFIC, DOC, REFRESH, PLAY, STOP, PENCIL, WARN, LINK, GLOBE, COPY, EYE, EYE_OFF }
 
 @Composable
 private fun FlatIcon(
@@ -640,6 +640,25 @@ private fun FlatIcon(
                 drawRoundRect(color, topLeft = Offset(s * 0.22f, s * 0.32f), size = Size(s * 0.40f, s * 0.48f),
                     cornerRadius = CornerRadius(s * 0.06f, s * 0.06f), style = stroke)
             }
+            UiIcon.EYE -> {   // глаз (миндалевидный контур + зрачок) = используется/виден
+                drawPath(Path().apply {
+                    moveTo(s * 0.12f, s * 0.5f)
+                    quadraticTo(s * 0.5f, s * 0.20f, s * 0.88f, s * 0.5f)
+                    quadraticTo(s * 0.5f, s * 0.80f, s * 0.12f, s * 0.5f)
+                    close()
+                }, color, style = stroke)
+                drawCircle(color, s * 0.12f, c, style = stroke)
+            }
+            UiIcon.EYE_OFF -> {   // тот же глаз + диагональная черта = НЕ используется/скрыт
+                drawPath(Path().apply {
+                    moveTo(s * 0.12f, s * 0.5f)
+                    quadraticTo(s * 0.5f, s * 0.20f, s * 0.88f, s * 0.5f)
+                    quadraticTo(s * 0.5f, s * 0.80f, s * 0.12f, s * 0.5f)
+                    close()
+                }, color, style = stroke)
+                drawCircle(color, s * 0.12f, c, style = stroke)
+                drawLine(color, Offset(s * 0.16f, s * 0.84f), Offset(s * 0.84f, s * 0.16f), sw)
+            }
         }
     }
 }
@@ -742,6 +761,8 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     var checking by remember { mutableStateOf(false) }
     var checkCancel by remember { mutableStateOf(false) }
     var checkStatus by remember { mutableStateOf("") }
+    // Промпт 90: отдача АКТИВНОГО соединения (Мбит/с) — показываем в статус-боксе и деталях. null = не мерена.
+    var activeUploadMbps by remember { mutableStateOf<Double?>(null) }
 
     // Внешний IP через активный туннель. "" = не запрашивался, "…" = идёт запрос, ip, "нет ответа".
     var externalIp by remember { mutableStateOf("") }
@@ -907,6 +928,15 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         )
     }
 
+    // Кнопка «Самый быстрый» (Промпт 91.D): ПЕРЕД тестом обновляем все включённые источники, затем полный
+    // тест по свежему списку. Нет источников с URL — просто тест. onFullTest (ядро) остаётся без обновления —
+    // его зовут автозапуск и эскалация «Проверить», которые уже обновились сами (без двойного рефреша).
+    fun onFastest() {
+        if (fullTesting || refreshingSubs) return
+        val hasUrl = sources.any { it.enabled && it.url.isNotBlank() }
+        if (hasUrl) onRefreshAll(onComplete = { onFullTest() }) else onFullTest()
+    }
+
     fun onCancelFull() {
         fullHandle?.cancel(); fullHandle = null
         fullTesting = false
@@ -920,90 +950,132 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         }.start()
     }
 
-    // Кнопка «Проверить» (Промпт 88) — ручная проверка текущего соединения + восстановление по списку Живых.
-    // Порядок: интернет-гейт → замер АКТИВНОГО туннеля (сразу в зелёный блок) → при падении ниже порога
-    // подключиться к быстрейшему из уже померянных → фоном перебор списка Живых СВЕРХУ ВНИЗ (от быстрых к
-    // медленным — начинаем с лучшего кандидата, как монитор) до первого ≥ порога → если никто не дотянул, полный тест с обновлением
-    // подписок (как «Самый быстрый»). Порог = monitorTunnelThreshold (единый с автомониторингом). Замер
-    // активного туннеля и интернет-гейт переиспользуют NetworkMonitor; проба живости — ServerSpeedTester.probeAlive.
-    // Монитор молчит (fullTestRunning=true), чтобы не мешать перебору; отмена — checkCancel по границам шагов.
-    fun onCheck(liveList: List<ServerProfile>) {
+    // Кнопка «Проверить» (Промпт 88/90, ПЕРЕРАБОТАНО Промпт 92 — устойчивость к массовому провалу замеров).
+    // ПРИНЦИП: НИКОГДА не бросаем рабочий сервер ради недостижимого. Порядок:
+    //  1) замер активного туннеля; если ≥ порога («в норме») — кандидатов ищем НЕ ОТКЛЮЧАЯСЬ (temp-замер),
+    //     и переключаемся ТОЛЬКО если лучший ПОДТВЕРЖДЁН кратно быстрее («держать лучший»); иначе остаёмся;
+    //  2) если текущий ниже порога/не запущен/forceSwitch — ищем рабочий: кандидаты меряем temp-инстансом
+    //     СВЕРХУ ВНИЗ (probeAlive→measureSpeed), к ПЕРВОМУ подтверждённому ≥ порога подключаемся ОДИН раз;
+    //  3) не нашли — ВОЗВРАЩАЕМСЯ к исходному рабочему серверу (реконнект), а не виснем; если исходного нет
+    //     (или он исключён) — полный тест с обновлением подписок.
+    // ОТДАЧА (90.B) — только показывается, НЕ триггер переключения (приёмник не верифицирован; низкая/провальная
+    // отдача НЕ должна ронять рабочий сервер). Замеры сопоставимы (90.A). Монитор молчит (fullTestRunning).
+    fun onCheck(liveList: List<ServerProfile>, forceSwitch: Boolean = false) {
         if (checking) return
         if (fullTesting || refreshingSubs) { checkStatus = "идёт другой тест — подождите"; return }
         checking = true; checkCancel = false; checkStatus = "Проверка…"
-        MonitorCoordinator.fullTestRunning = true   // монитор молчит, не мешает перебору
-        MonitorCoordinator.wake()                   // прервать возможный перебор/паузу монитора
-        val threshold = SettingsStore.current().monitorTunnelThreshold
+        MonitorCoordinator.fullTestRunning = true
+        MonitorCoordinator.wake()
+        val s = SettingsStore.current()
+        val threshold = s.monitorTunnelThreshold
+        val multiplier = s.keepBestMultiplier
         fun key(p: ServerProfile) = SubscriptionManager.serverKey(p)
-        fun fmt(v: Double) = (v * 10).roundToInt() / 10.0
+        fun nm(p: ServerProfile) = displayName(p, blocklist)
+        fun fmt(v: Double) = if (v < 0) "—" else "${(v * 10).roundToInt() / 10.0}"
         fun ui(block: () -> Unit) = activity.runOnUiThread(block)
-        val collected = HashMap<String, Double>()   // измерения этого прогона → персист в конце
-        var escalated = false                        // управление передано полному тесту → finally не сбрасывает флаги
+        val collected = HashMap<String, Double>()
+        var escalated = false
         Thread {
             try {
-                // 1. Интернет вообще есть? (TCP к DNS — как в мониторе). Нет → серверы не мучаем.
                 if (!NetworkMonitor.directAlive()) { ui { checkStatus = "Нет интернета — проверка невозможна" }; return@Thread }
 
-                // Подключение + замер АКТИВНОГО туннеля (ждём готовности — как measureAfterConnect монитора).
-                fun connectAndMeasure(p: ServerProfile): Double {
+                // Подключиться к p и замерить активный туннель (↓ для решения, ↑ только для показа). Возврат ↓.
+                fun connectAndMeasure(p: ServerProfile, cause: String): Double {
                     val k = key(p)
                     ui {
                         val from = ServerLabels.displayForKey(context, ProxyState.state.value.serverKey)
-                        MonitorLog.switch(context, from, displayName(p, blocklist), "проверка: перебор")
+                        MonitorLog.switch(context, from, nm(p), cause)
                         startServer(p)
                     }
                     var waited = 0
                     while (waited < 8000 && (!ProxyState.state.value.running || ProxyState.state.value.serverKey != k)) {
                         Thread.sleep(500); waited += 500
                     }
-                    Thread.sleep(1000)   // дать туннелю осесть
-                    val mbps = NetworkMonitor.measureTunnelMbps()
-                    if (mbps > 0) { collected[k] = mbps; ui { speedResults = speedResults + (k to mbps) } }
-                    return mbps
+                    Thread.sleep(1000)
+                    val down = ServerSpeedTester.measureActiveDownloadMbps(context)
+                    val up = ServerSpeedTester.measureActiveUploadMbps(context)
+                    if (down > 0) { collected[k] = down; ui { speedResults = speedResults + (k to down) } }
+                    ui { activeUploadMbps = if (up > 0) up else null }
+                    return down
                 }
 
-                // 2. Замер ТЕКУЩЕГО соединения (если запущено). Результат — сразу в зелёный блок.
                 val curKey = ProxyState.state.value.serverKey
-                if (ProxyState.state.value.running && curKey != null) {
+                val running = ProxyState.state.value.running
+                val originalProfile = if (running && curKey != null) servers.firstOrNull { key(it) == curKey } else null
+
+                // Кандидаты сверху вниз по известной скорости, кроме текущего, живые/непровальные.
+                fun candidatesTopDown() = liveList
+                    .filter { key(it) != curKey }
+                    .sortedByDescending { effSpeed(it) ?: 0.0 }
+
+                // Найти рабочего кандидата НЕ ОТКЛЮЧАЯ активный: temp-замер сверху вниз, вернуть первого ≥ порога.
+                // (probeAlive дёшев — быстро пропускает недостижимых при массовом провале, не тратя по 10 МБ.)
+                fun findWorkingCandidate(minMbps: Double): Pair<ServerProfile, Double>? {
+                    val cands = candidatesTopDown()
+                    for ((i, c) in cands.withIndex()) {
+                        if (checkCancel) return null
+                        ui { checkStatus = "Проверяю кандидатов ${i + 1}/${cands.size}: ${nm(c)}…" }
+                        if (!ServerSpeedTester.probeAlive(context, c)) continue
+                        val m = ServerSpeedTester.measureSpeed(context, c)   // temp-инстанс, активный не трогаем
+                        if (m > 0) { collected[key(c)] = m; ui { speedResults = speedResults + (key(c) to m) } }
+                        if (m >= minMbps) return c to m
+                    }
+                    return null
+                }
+
+                // ── 1. Текущий рабочий и НЕ forceSwitch: остаёмся, если он «в норме» и лучший не подтверждён ──
+                if (!forceSwitch && originalProfile != null) {
                     ui { checkStatus = "Замер текущего соединения…" }
-                    val cur = NetworkMonitor.measureTunnelMbps()
-                    if (cur > 0) { collected[curKey] = cur; ui { speedResults = speedResults + (curKey to cur) } }
-                    if (cur >= threshold) { ui { checkStatus = "Соединение в норме: ${fmt(cur)} Мбит/с" }; return@Thread }
-                    ui { checkStatus = "Текущее ${fmt(cur)} < ${fmt(threshold)} Мбит/с — ищу быстрее…" }
-                }
-                if (checkCancel) { ui { checkStatus = "Проверка прервана" }; return@Thread }
+                    val curDown = ServerSpeedTester.measureActiveDownloadMbps(context)
+                    val curUp = ServerSpeedTester.measureActiveUploadMbps(context)
+                    if (curDown > 0) { collected[curKey!!] = curDown; ui { speedResults = speedResults + (curKey to curDown) } }
+                    ui { activeUploadMbps = if (curUp > 0) curUp else null }
 
-                // 3. Подключиться к БЫСТРЕЙШЕМУ из уже померянных (верх списка Живых, скорость>0), не к текущему.
-                val fastest = liveList.firstOrNull { (effSpeed(it) ?: 0.0) > 0 && key(it) != curKey }
-                val tried = HashSet<String>()
-                curKey?.let { tried.add(it) }
-                if (fastest != null) {
-                    ui { checkStatus = "Подключаюсь к быстрейшему: ${displayName(fastest, blocklist)}…" }
-                    val m = connectAndMeasure(fastest)
-                    tried.add(key(fastest))
-                    if (m >= threshold) { ui { checkStatus = "Готово: ${displayName(fastest, blocklist)} ${fmt(m)} Мбит/с" }; return@Thread }
-                    ui { checkStatus = "${displayName(fastest, blocklist)} ${fmt(m)} < ${fmt(threshold)} — перебираю список…" }
-                }
-
-                // 4. Перебор списка Живых СВЕРХУ ВНИЗ (от быстрых к медленным — начинаем с лучшего, как монитор) до первого ≥ порога.
-                val walk = liveList
-                for ((i, c) in walk.withIndex()) {
+                    if (curDown >= threshold) {
+                        // «В норме». «Держать лучший»: только если ПОДТВЕРЖДЁННЫЙ (temp-замер) лучший кратно быстрее.
+                        val bestKnown = candidatesTopDown().firstOrNull { (effSpeed(it) ?: 0.0) >= curDown * multiplier }
+                        if (bestKnown == null) {
+                            ui { checkStatus = "Соединение в норме: ↓${fmt(curDown)} / ↑${fmt(curUp)} Мбит/с" }; return@Thread
+                        }
+                        ui { checkStatus = "Проверяю более быстрый: ${nm(bestKnown)}…" }
+                        val m = ServerSpeedTester.measureSpeed(context, bestKnown)   // temp — активный не трогаем
+                        if (m > 0) { collected[key(bestKnown)] = m; ui { speedResults = speedResults + (key(bestKnown) to m) } }
+                        if (m >= threshold && m >= curDown * multiplier) {
+                            val d = connectAndMeasure(bestKnown, "проверка: держать лучший (${fmt(m)}>${fmt(curDown)})")
+                            if (d >= threshold) { ui { checkStatus = "Переключён на ${nm(bestKnown)}: ↓${fmt(d)} Мбит/с" }; return@Thread }
+                            // не подтвердился на активном → назад к рабочему
+                            connectAndMeasure(originalProfile, "проверка: возврат (лучший не подтвердился)")
+                            ui { checkStatus = "Оставил ${nm(originalProfile)}: быстрее не подтвердилось" }; return@Thread
+                        }
+                        ui { checkStatus = "Соединение в норме: ↓${fmt(curDown)} / ↑${fmt(curUp)} (быстрее не подтвердилось)" }; return@Thread
+                    }
+                    // Текущий ниже порога → ищем рабочий, НЕ отключаясь.
+                    ui { checkStatus = "Текущий ↓${fmt(curDown)} < ${fmt(threshold)} — ищу рабочий…" }
+                    val win = findWorkingCandidate(threshold)
                     if (checkCancel) { ui { checkStatus = "Проверка прервана" }; return@Thread }
-                    val k = key(c)
-                    if (k in tried) continue
-                    tried.add(k)
-                    ui { checkStatus = "Перебор ${i + 1}/${walk.size}: ${displayName(c, blocklist)}…" }
-                    if (!ServerSpeedTester.probeAlive(context, c)) continue   // мёртв — пропуск (зря не переключаемся)
-                    val m = connectAndMeasure(c)
-                    if (m >= threshold) { ui { checkStatus = "Готово: ${displayName(c, blocklist)} ${fmt(m)} Мбит/с" }; return@Thread }
+                    if (win != null) {
+                        val d = connectAndMeasure(win.first, "проверка: замена (${fmt(win.second)})")
+                        if (d >= threshold) { ui { checkStatus = "Переключён на ${nm(win.first)}: ↓${fmt(d)} Мбит/с" }; return@Thread }
+                    }
+                    // Не нашли лучше — ОСТАЁМСЯ на текущем (он хоть и ниже порога, но рабочий), не виснем.
+                    ui { checkStatus = "Рабочей замены не нашёл — оставил ${nm(originalProfile)} (↓${fmt(curDown)})" }
+                    return@Thread
                 }
 
-                // 5. Никто не дотянул → полный тест с обновлением подписок (как «Самый быстрый» + «Подписки»).
+                // ── 2. forceSwitch («Не использовать») ИЛИ прокси не запущен: ищем рабочий (не отключаясь) ──
+                ui { checkStatus = "Ищу рабочий сервер…" }
+                val win = findWorkingCandidate(threshold)
+                if (checkCancel) { ui { checkStatus = "Проверка прервана" }; return@Thread }
+                if (win != null) {
+                    val d = connectAndMeasure(win.first, "проверка: подбор (${fmt(win.second)})")
+                    if (d >= threshold) { ui { checkStatus = "Подключён ${nm(win.first)}: ↓${fmt(d)} Мбит/с" }; return@Thread }
+                }
+                // ── 3. Рабочего не нашли (и рабочего исходного нет) → полный тест с обновлением подписок ──
                 escalated = true
                 ui {
                     checking = false
-                    MonitorCoordinator.fullTestRunning = false   // onFullTest выставит заново
-                    checkStatus = "Никто не дотянул до порога — полный тест с обновлением подписок…"
+                    MonitorCoordinator.fullTestRunning = false
+                    checkStatus = "Рабочий не найден — полный тест с обновлением подписок…"
                     onRefreshAll(onComplete = { onFullTest() })
                 }
             } catch (e: Exception) {
@@ -1020,12 +1092,35 @@ private fun BootScreen(modifier: Modifier = Modifier) {
 
     fun onCancelCheck() { checkCancel = true }
 
+    // Промпт 91: «Убрать» — отложить ТЕКУЩИЙ сервер («на паузе») и сразу переключиться на быстрейшего живого
+    // (правило Промпта 90, сверху вниз; отложенный в кандидаты не попадает). onCheck сам берёт список без него.
+    fun onRemoveCurrent(liveList: List<ServerProfile>) {
+        val curKey = ProxyState.state.value.serverKey ?: return
+        val cur = servers.firstOrNull { SubscriptionManager.serverKey(it) == curKey }
+        val name = cur?.let { displayName(it, blocklist) } ?: (proxy.label ?: curKey)
+        BlocklistStore.pauseServer(context, curKey, name, System.currentTimeMillis())
+        MonitorLog.event(context, "switch", "Сервер исключён («Не использовать»)", name)
+        // Список Живых без исключённого (curKey теперь «не используется» — исключаем явно на случай устаревания).
+        // forceSwitch=true: не задерживаемся на «текущий в норме», сразу переключаемся на быстрейшего живого.
+        onCheck(liveList.filter { SubscriptionManager.serverKey(it) != curKey }, forceSwitch = true)
+    }
+
+    // Промпт 91: переключить «использовать ↔ не использовать» сервер (глаз-переключатель в списках).
+    fun toggleUse(p: ServerProfile) {
+        val k = SubscriptionManager.serverKey(p)
+        if (BlocklistStore.current().isPaused(k)) BlocklistStore.resumeServer(context, k)
+        else BlocklistStore.pauseServer(context, k, displayName(p, blocklist), System.currentTimeMillis())
+    }
+
+
     // Отсевы (единый предикат [ServerFilter]) — скрывают из ВИДИМОЙ части (Живые и Все).
     // Замер идёт по всем НЕзаблокированным; скрытые считаем, чтобы показать «скрыто настройками: N».
     // Заблокированных убираем ПЕРВЫМИ — они не в списках, не в выборе, не мерятся.
     val notBlocked = servers.filter { !ServerFilter.isBlocked(it, blocklist) }
     val allowedServers = notBlocked.filter { ServerFilter.protocolAllowed(it, settings) }
-    val hiddenCount = servers.size - allowedServers.size   // скрыто протоколом + стоп-листом
+    // Отложенные («на паузе») остаются в «Все серверы», но скрыты из «Живых» → тоже в счётчик «скрыто».
+    val pausedShownCount = allowedServers.count { ServerFilter.isPaused(it, blocklist) }
+    val hiddenCount = servers.size - allowedServers.size + pausedShownCount   // протокол + стоп-лист + пауза
 
     // Сортировка как Termux sort_servers_by_speed: скорость>0 (убыв.) → живые по пингу (возр.) → остальные.
     val shown = allowedServers.sortedWith(Comparator { a, b ->
@@ -1059,6 +1154,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
             refreshIp()
         } else {
             externalIp = ""
+            activeUploadMbps = null         // прокси стоит → отдачи нет
         }
     }
     val ipVerified = externalIp.isNotEmpty() && externalIp != "…" && externalIp != "нет ответа"
@@ -1093,7 +1189,13 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     }
 
     // Основной вид = ЖИВЫЕ — через единый предикат [ServerFilter.isVisible] (стоп-лист+протокол+пинг+мин.скорость).
-    val alive = shown.filter { ServerFilter.isVisible(it, effPing(it), effSpeed(it), settings, blocklist) }
+    // «Живые» = реально доступные сейчас (пинг жив). ИСКЛЮЧЕНИЕ: активный подключённый сервер ВСЕГДА в «Живых»
+    // (его живость доказана самим туннелем, даже если temp-пинг подписки массово падает) — иначе рабочий сервер
+    // выпадал бы из списка при недоступной подписке. Мёртвые/непингующиеся серверы НЕ держим по старым скоростям.
+    val alive = shown.filter { p ->
+        ServerFilter.isVisible(p, effPing(p), effSpeed(p), settings, blocklist) ||
+            (proxy.running && proxy.serverKey == SubscriptionManager.serverKey(p))
+    }
 
     // ПРИБОРЫ по стоп-листу (Промпт 73.C): на КАЖДЫЙ пересчёт фильтра — подробный дамп (гейт «Подробные логи»,
     // тег Blocklist). Ключи эффекта = все входы фильтра, чтобы лог был на каждое реальное изменение.
@@ -1145,15 +1247,18 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                     serverName = activeServer?.let { displayName(it, blocklist) } ?: proxy.label,
                     subtitle = activeServer?.let { protoNetSec(it) },
                     speedMbps = activeServer?.let { effSpeed(it) },
+                    uploadMbps = activeUploadMbps,
                     hidden = activeHidden, blocked = activeBlocked,
                     message = proxy.message,
                     checking = checking, checkStatus = checkStatus,
                     onCheck = { onCheck(alive) }, onCancelCheck = { onCancelCheck() },
+                    onExclude = { onRemoveCurrent(alive) },
                 )
                 ActionsBar(
                     fullTesting = fullTesting, running = proxy.running, refreshingSubs = refreshingSubs,
-                    onFullTest = { onFullTest() }, onCancelFull = { onCancelFull() }, onStop = { onStop() },
-                    onRefreshSubs = { onRefreshAll() }, onCancelRefreshSubs = { subRefreshCancel = true },
+                    onFullTest = { onFastest() },
+                    onCancelFull = { if (refreshingSubs) subRefreshCancel = true else onCancelFull() },
+                    onStop = { onStop() },
                 )
                 FullTestProgressBar()
                 if (subStatus.isNotEmpty()) Text(subStatus, style = MaterialTheme.typography.bodySmall)
@@ -1184,6 +1289,9 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                     speedMbps = effSpeed(p), caption = discriminators[SubscriptionManager.serverKey(p)] ?: "",
                     onConnect = { connectServer(p, "ручной выбор") },
                     onDetails = { detailProfile = p; remeasureStatus = "" },
+                    showUseToggle = true,
+                    paused = ServerFilter.isPaused(p, blocklist),
+                    onToggleUse = { toggleUse(p) },
                 )
             }
         }
@@ -1215,6 +1323,9 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                         speedMbps = effSpeed(p), caption = discriminators[SubscriptionManager.serverKey(p)] ?: "",
                         onConnect = { connectServer(p, "ручной выбор") },
                         onDetails = { detailProfile = p; remeasureStatus = "" },
+                        showUseToggle = true,
+                        paused = ServerFilter.isPaused(p, blocklist),
+                        onToggleUse = { toggleUse(p) },
                     )
                 }
             }
@@ -1238,6 +1349,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     // Диалог деталей сервера (долгое нажатие) + отладочный «Перемерить» + блокировка + переименование.
     detailProfile?.let { p ->
         val pKey = SubscriptionManager.serverKey(p)
+        val pActive = proxy.running && proxy.serverKey == pKey
         ServerDetailDialog(
             profile = p,
             name = displayName(p, blocklist),
@@ -1247,6 +1359,13 @@ private fun BootScreen(modifier: Modifier = Modifier) {
             remeasuring = remeasuring,
             blockedByKey = blocklist.isServerBlocked(pKey),
             blockedByWord = blocklist.matchesWord(providerName(p), blocklist.customName(pKey)),
+            paused = blocklist.isPaused(pKey),
+            uploadMbps = if (pActive) activeUploadMbps else null,   // отдача — только у активного соединения
+            onTogglePause = {
+                if (blocklist.isPaused(pKey)) BlocklistStore.resumeServer(context, pKey)
+                else BlocklistStore.pauseServer(context, pKey, displayName(p, blocklist), System.currentTimeMillis())
+                detailProfile = null; remeasureStatus = ""
+            },
             onToggleBlock = {
                 if (blocklist.isServerBlocked(pKey)) BlocklistStore.unblockServer(context, pKey)
                 else BlocklistStore.blockServer(context, pKey, displayName(p, blocklist), System.currentTimeMillis())
@@ -1349,6 +1468,7 @@ private fun FullTestProgressBar() {
  * ВАЖНО про цвет: зелёный — ТОЛЬКО когда IP получен (туннель реально гоняет трафик). Пока IP нет —
  * янтарный (подключаемся/не подтверждено). Тап по строке IP — ручное обновление.
  */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun StatusBox(
     running: Boolean,
@@ -1358,6 +1478,7 @@ private fun StatusBox(
     serverName: String?,
     subtitle: String?,
     speedMbps: Double?,
+    uploadMbps: Double?,
     hidden: Boolean,
     blocked: Boolean,
     message: String,
@@ -1365,6 +1486,7 @@ private fun StatusBox(
     checkStatus: String,
     onCheck: () -> Unit,
     onCancelCheck: () -> Unit,
+    onExclude: () -> Unit,
 ) {
     val bg = when {
         running && verified -> Color(0xFF1B5E20)  // зелёный — туннель подтверждён (есть IP)
@@ -1384,8 +1506,15 @@ private fun StatusBox(
             .padding(horizontal = 14.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(3.dp),
     ) {
-        val speedSuffix = if (running && speedMbps != null && speedMbps > 0)
-            "  (${(speedMbps * 10).roundToInt() / 10.0} Мб/с)" else ""
+        // Скачивание и ОТДАЧА (Промпт 90.B) рядом: «↓X / ↑Y Мб/с». Отдача мерится кнопкой «Проверить»/монитором.
+        fun r1(v: Double) = (v * 10).roundToInt() / 10.0
+        val downStr = if (running && speedMbps != null && speedMbps > 0) "${r1(speedMbps)}" else null
+        val upStr = if (running && uploadMbps != null && uploadMbps > 0) "${r1(uploadMbps)}" else null
+        val speedSuffix = when {
+            downStr != null && upStr != null -> "  (↓$downStr / ↑$upStr Мб/с)"
+            downStr != null -> "  (↓$downStr Мб/с)"
+            else -> ""
+        }
         Text(
             if (running) "● ${serverName ?: "Активен"}$speedSuffix" else "○ Не запущен",
             style = MaterialTheme.typography.titleMedium,
@@ -1431,15 +1560,22 @@ private fun StatusBox(
         if (message.isNotEmpty() && message != "idle") {
             Text(message, style = MaterialTheme.typography.bodySmall, color = fg)
         }
-        // Кнопка «Проверить» (Промпт 88): замер текущего туннеля → перебор Живых до ≥ порога → полный тест.
-        // Светлая на тёмном блоке — явно нажимаемая; во время работы становится «Прервать».
+        // Кнопки блока (Промпт 88/90/91): «Проверить» (оценка+подбор) и «Не использовать» (исключить текущий
+        // сервер из автовыбора/поиска/«Живых» + сразу переключиться). FlowRow переносит их в две строки при
+        // крупных системных шрифтах, подписи НЕ сокращаем. Светлые на тёмном блоке — явно нажимаемые.
         Spacer(Modifier.height(4.dp))
-        Button(
-            onClick = { if (checking) onCancelCheck() else onCheck() },
-            colors = ButtonDefaults.buttonColors(containerColor = fg, contentColor = bg),
-            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
-        ) {
-            ButtonLabel(if (checking) UiIcon.STOP else UiIcon.REFRESH, if (checking) "Прервать проверку" else "Проверить")
+        val solid = ButtonDefaults.buttonColors(containerColor = fg, contentColor = bg)
+        val subtle = ButtonDefaults.buttonColors(containerColor = fg.copy(alpha = 0.22f), contentColor = fg)
+        val pad = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = { if (checking) onCancelCheck() else onCheck() }, colors = solid, contentPadding = pad) {
+                ButtonLabel(if (checking) UiIcon.STOP else UiIcon.REFRESH, if (checking) "Прервать проверку" else "Проверить")
+            }
+            if (running && !checking) {
+                Button(onClick = onExclude, colors = subtle, contentPadding = pad) {
+                    ButtonLabel(UiIcon.EYE_OFF, "Не использовать")
+                }
+            }
         }
         if (checkStatus.isNotEmpty()) {
             Text(checkStatus, style = MaterialTheme.typography.bodySmall, color = fg, fontWeight = FontWeight.Bold)
@@ -1541,7 +1677,11 @@ private fun VpnStatusCard(vpn: VpnStatus, onRetry: () -> Unit) {
     }
 }
 
-/** Панель действий. Кнопки крупные; FlowRow переносит их при крупных системных шрифтах. */
+/**
+ * Панель действий. Кнопки крупные; FlowRow переносит их при крупных системных шрифтах.
+ * Промпт 91.D: кнопка «Подписки» убрана — «Самый быстрый» сам обновляет источники перед тестом;
+ * ручное обновление осталось во вкладке «Настройки» → секция подписок.
+ */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ActionsBar(
@@ -1551,25 +1691,18 @@ private fun ActionsBar(
     onFullTest: () -> Unit,
     onCancelFull: () -> Unit,
     onStop: () -> Unit,
-    onRefreshSubs: () -> Unit,
-    onCancelRefreshSubs: () -> Unit,
 ) {
     FlowRow(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        if (fullTesting) {
-            Button(onClick = onCancelFull) { Text("Прервать") }
+        if (fullTesting || refreshingSubs) {
+            Button(onClick = onCancelFull) { Text(if (refreshingSubs) "Обновление…" else "Прервать") }
         } else {
             Button(onClick = onFullTest) { ButtonLabel(UiIcon.PLAY, "Самый быстрый") }
         }
         OutlinedButton(onClick = onStop, enabled = running) { ButtonLabel(UiIcon.STOP, "Стоп") }
-        if (refreshingSubs) {
-            OutlinedButton(onClick = onCancelRefreshSubs) { ButtonLabel(UiIcon.STOP, "Обновление") }
-        } else {
-            OutlinedButton(onClick = onRefreshSubs) { ButtonLabel(UiIcon.REFRESH, "Подписки") }
-        }
     }
 }
 
@@ -1668,6 +1801,9 @@ private fun ServerRow(
     caption: String,
     onConnect: () -> Unit,
     onDetails: () -> Unit,
+    paused: Boolean = false,           // Промпт 91: исключён из использования («Не использовать»)
+    onToggleUse: () -> Unit = {},      // тап по глазу: используется ↔ не используется
+    showUseToggle: Boolean = false,    // показывать глаз-переключатель перед скоростью (в листингах)
 ) {
     CompositionLocalProvider(LocalDensity provides cappedDensity()) {
         Row(
@@ -1683,15 +1819,33 @@ private fun ServerRow(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            // Имя полностью (перенос при длинном) + мелко caption под ним.
+            // Имя полностью (перенос при длинном) + мелко caption под ним. Исключённый — приглушён (без подписей).
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     (if (isActive) "● " else "") + name,
                     fontSize = TABLE_FONT,
                     fontWeight = if (isActive) FontWeight.Bold else FontWeight.Normal,
+                    color = if (paused) TABLE_GRAY else Color.Unspecified,
                 )
                 if (caption.isNotEmpty()) {
                     Text(caption, fontSize = TABLE_FONT_SUB, color = TABLE_GRAY)
+                }
+            }
+            // Глаз-переключатель ДЕЙСТВИЯ (Промпт 91, как кнопка «Не использовать»): иконка = ЧТО СДЕЛАЕТ тап.
+            // Включённый сервер → ПЕРЕЧЁРКНУТЫЙ глаз (тап = «Выключить, не использовать»), ЯРКИЙ (primary).
+            // Исключённый сервер → ОТКРЫТЫЙ глаз (тап = «Включить обратно»), светло-серый (приглушён).
+            if (showUseToggle) {
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .clickable { onToggleUse() }
+                        .padding(horizontal = 6.dp, vertical = 4.dp),
+                ) {
+                    FlatIcon(
+                        if (paused) UiIcon.EYE else UiIcon.EYE_OFF,
+                        size = 18.dp,
+                        color = if (paused) TABLE_GRAY.copy(alpha = 0.55f) else MaterialTheme.colorScheme.primary,
+                    )
                 }
             }
             Text(
@@ -1779,6 +1933,9 @@ private fun ServerDetailDialog(
     remeasuring: Boolean,
     blockedByKey: Boolean,
     blockedByWord: Boolean,
+    paused: Boolean,
+    uploadMbps: Double?,
+    onTogglePause: () -> Unit,
     onToggleBlock: () -> Unit,
     onRename: () -> Unit,
     onResetName: () -> Unit,
@@ -1800,6 +1957,10 @@ private fun ServerDetailDialog(
                 DetailRow("SNI", v(profile.sni))
                 DetailRow("Fingerprint", v(profile.fingerprint))
                 DetailRow("Flow", v(profile.flow))
+                // Отдача активного соединения (Промпт 90.B) — только когда это активный сервер и она измерена.
+                if (uploadMbps != null && uploadMbps > 0) {
+                    DetailRow("Отдача", "${(uploadMbps * 10).roundToInt() / 10.0} Мбит/с")
+                }
                 if (remeasureStatus.isNotEmpty()) {
                     Spacer(Modifier.height(6.dp))
                     Text(
@@ -1810,6 +1971,11 @@ private fun ServerDetailDialog(
                     )
                 }
                 Spacer(Modifier.height(8.dp))
+                // «Не использовать» (Промпт 91) — ОТДЕЛЬНО от стоп-листа: исключить из «Живых»/автовыбора/поиска,
+                // возврат на месте (глаз-переключатель, как в списках).
+                OutlinedButton(onClick = onTogglePause, modifier = Modifier.fillMaxWidth()) {
+                    if (paused) ButtonLabel(UiIcon.EYE, "Использовать снова") else ButtonLabel(UiIcon.EYE_OFF, "Не использовать")
+                }
                 // Переименование (оверрайд по serverKey; remarks провайдера не трогаем).
                 OutlinedButton(onClick = onRename, modifier = Modifier.fillMaxWidth()) {
                     ButtonLabel(UiIcon.PENCIL, "Переименовать")
@@ -1967,6 +2133,24 @@ private fun SettingsSection(
         // Ступенчатый повтор (Промпт 77): после ПЕРВОГО полного топа замеряем только top-N по скорости.
         IntSettingRow("Повторный замер: top-N по скорости", "", settings.normalTopBatch, d.normalTopBatch, 1, 100) {
             onChange(settings.copy(normalTopBatch = it))
+        }
+        // Правило «держать лучший» (Промпт 90): переключаться, если лучший быстрее текущего КРАТНО (в разы).
+        DoubleSettingRow("Держать лучший: во сколько раз быстрее", "×", settings.keepBestMultiplier, d.keepBestMultiplier, 1.0, 100.0) {
+            onChange(settings.copy(keepBestMultiplier = it))
+        }
+
+        SettingsGroupLabel("Соединение и отдача")
+        IntSettingRow("Интервал проверки соединения", "с", settings.connectionCheckIntervalSec, d.connectionCheckIntervalSec, 30, 3600) {
+            onChange(settings.copy(connectionCheckIntervalSec = it))
+        }
+        DoubleSettingRow("Минимальная отдача", "Мбит/с", settings.minUploadMbps, d.minUploadMbps, 0.0, 1000.0) {
+            onChange(settings.copy(minUploadMbps = it))
+        }
+        IntSettingRow("Объём замера отдачи", "МБ", settings.uploadMeasureMb, d.uploadMeasureMb, 1, 100) {
+            onChange(settings.copy(uploadMeasureMb = it))
+        }
+        UrlSettingRow("URL приёма отдачи", settings.uploadProbeUrl, d.uploadProbeUrl) {
+            onChange(settings.copy(uploadProbeUrl = it))
         }
 
         SettingsGroupLabel("Прочее")
@@ -2706,7 +2890,6 @@ private fun UpdateCheckSection() {
     var cancelFlag by remember { mutableStateOf(false) }
     var readyFile by remember { mutableStateOf<File?>(null) }
     var message by remember { mutableStateOf<String?>(null) }
-    var confirmMetered by remember { mutableStateOf(false) }
     var detailsExpanded by remember { mutableStateOf(false) }
 
     fun startCheck() {
@@ -2808,6 +2991,17 @@ private fun UpdateCheckSection() {
                     (if (avail.usingUniversal) " · универсальная сборка (нет точной под вашу архитектуру)" else ""),
                 style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
             )
+            // Тип сети — ЗАРАНЕЕ, до нажатия (Промпт 91.G): решение принимается один раз и осознанно. Мобильная
+            // сеть — не диалог, а ЗАМЕТНАЯ пометка рядом с размером. Нажатие «Скачать» = согласие, без переспроса.
+            if (isMeteredNetwork(context)) {
+                Text(
+                    "⚠ Мобильная сеть — скачивание израсходует мобильный трафик" +
+                        (if (avail.sizeBytes > 0) " (~${fmtBytes(avail.sizeBytes)})" else ""),
+                    style = MaterialTheme.typography.bodySmall, color = Color(0xFFFFB300), fontWeight = FontWeight.Bold,
+                )
+            } else {
+                Text("Сеть: Wi-Fi / без учёта трафика", style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
+            }
             if (avail.notes.isNotBlank()) Text(avail.notes, style = MaterialTheme.typography.bodySmall)
 
             when {
@@ -2826,9 +3020,8 @@ private fun UpdateCheckSection() {
                     Button(onClick = { install(readyFile!!) }, modifier = Modifier.fillMaxWidth()) { Text("Установить") }
                 }
                 else -> {
-                    Button(onClick = {
-                        if (isMeteredNetwork(context)) confirmMetered = true else startDownload(avail)
-                    }, modifier = Modifier.fillMaxWidth()) {
+                    // Промпт 91.G: нажатие = согласие → скачивание начинается СРАЗУ, без диалога-переспроса.
+                    Button(onClick = { startDownload(avail) }, modifier = Modifier.fillMaxWidth()) {
                         Text("Скачать" + if (avail.sizeBytes > 0) " (${fmtBytes(avail.sizeBytes)})" else "")
                     }
                     Text(
@@ -2850,18 +3043,6 @@ private fun UpdateCheckSection() {
         message?.let {
             Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
         }
-    }
-
-    if (confirmMetered) {
-        val a = live as? UpdateCheckResult.Available
-        val sizeSuffix = a?.let { if (it.sizeBytes > 0) " (${fmtBytes(it.sizeBytes)})" else "" } ?: ""
-        AlertDialog(
-            onDismissRequest = { confirmMetered = false },
-            title = { Text("Мобильная сеть") },
-            text = { Text("Сейчас активна мобильная сеть. Скачать обновление$sizeSuffix по ней?") },
-            confirmButton = { TextButton(onClick = { confirmMetered = false; a?.let { startDownload(it) } }) { Text("Скачать") } },
-            dismissButton = { TextButton(onClick = { confirmMetered = false }) { Text("Отмена") } },
-        )
     }
 }
 

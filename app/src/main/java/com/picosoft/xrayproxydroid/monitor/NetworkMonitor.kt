@@ -46,7 +46,6 @@ object NetworkMonitor {
 
     private val directDnsProbes = listOf("77.88.8.8" to 53, "8.8.8.8" to 53, "1.1.1.1" to 53)
     private val directSpeedProbes = listOf("https://ya.ru/", "https://mc.yandex.ru/", "https://vk.ru/")
-    private const val TUNNEL_SPEED_PROBE = "https://speed.cloudflare.com/__down?bytes=2000000"
 
     private const val SWITCH_THROTTLE_MS = 60_000L        // в фоне переключаться не чаще раза в 60с
     private const val BACKOFF_START_MS = 10 * 60_000L     // первая пауза при отсутствии сети — 10 минут
@@ -75,8 +74,10 @@ object NetworkMonitor {
 
             // Интервал: в ЗДОРОВОМ состоянии — обычный; при ПАДЕНИИ (phase=="problem") — чаще (раз в минуту),
             // чтобы быстрее переключиться на рабочий (Промпт 82). Прерываемый (wake() поднимает досрочно).
+            // Дешёвая проверка соединения (Промпт 90): в здоровом состоянии раз в connectionCheckIntervalSec
+            // (жив ли туннель — сигналы A/B ниже, ДЁШЕВО). Тяжёлый замер скачивания/отдачи — только по подозрению.
             val waitSec = if (phase == "problem") s.monitorProblemIntervalSec.coerceAtLeast(30)
-                          else s.monitorIntervalSec.coerceAtLeast(60)
+                          else s.connectionCheckIntervalSec.coerceAtLeast(30)
             MonitorCoordinator.drainWakeups()
             MonitorCoordinator.awaitWake(waitSec * 1000L)
 
@@ -91,9 +92,13 @@ object NetworkMonitor {
             //    monitorOptimizeSec: перемер top-N по скорости и переход на быстрейший (>margin). ──
             if (phase == "ok" && cur.monitorOptimizeSec > 0 && now() - lastOptimizeMs >= cur.monitorOptimizeSec * 1000L) {
                 lastOptimizeMs = now()
-                runCatching { optimizeToFastest(app, cur) }
-                    .onFailure { MonitorLog.event(app, "error", "Ошибка оптимизации", it.message ?: "") }
-                if (!ProxyState.state.value.running) continue
+                if (userTrafficActive()) {   // идёт живой трафик — не мешаем (Промпт 90.D)
+                    MonitorLog.event(app, "monitor", "Оптимизация пропущена", "идёт активный трафик")
+                } else {
+                    runCatching { optimizeToFastest(app, cur) }
+                        .onFailure { MonitorLog.event(app, "error", "Ошибка оптимизации", it.message ?: "") }
+                    if (!ProxyState.state.value.running) continue
+                }
             }
 
             // ── Сигнал A: нет интернета → пауза с удвоением, ДО любого перебора ──
@@ -124,7 +129,16 @@ object NetworkMonitor {
                 continue
             }
 
-            // ── Тяжёлый замер (лёгкая указала на проблему) ──
+            // Идёт активный трафик пользователя → туннель работает (сигнал B мог мигнуть). Тяжёлый замер НЕ
+            // гоняем — испортили бы и замер, и его загрузку (Промпт 90.D). Считаем здоровым.
+            if (userTrafficActive()) {
+                onHealthy(app, phase, problemSince, "трафик идёт")
+                phase = "ok"; failures = 0; verdictActed = false; backoffMs = 0
+                MonitorStatus.update(true, "ок (активный трафик)", now(), cycles)
+                continue
+            }
+
+            // ── Тяжёлый замер (лёгкая указала на проблему, живого трафика нет) ──
             val directMbps = measureDirectMbps(app)
             if (directMbps == null) {   // канал не тянет — считаем как нет интернета
                 backoffMs = if (backoffMs == 0L) BACKOFF_START_MS else minOf(backoffMs * 2, BACKOFF_MAX_MS)
@@ -134,21 +148,25 @@ object NetworkMonitor {
                 MonitorCoordinator.drainWakeups(); MonitorCoordinator.awaitWake(backoffMs)
                 continue
             }
-            val tunnelMbps = measureTunnelMbps()
+            // Сопоставимый замер активного туннеля (тот же метод, что кандидаты). ОТДАЧА — только для лога, НЕ
+            // триггер переключения (Промпт 92: приёмник отдачи не верифицирован; низкая/провальная отдача НЕ
+            // должна ронять рабочий сервер и устраивать churn в фоне). Решение о падении — по СКАЧИВАНИЮ.
+            val tunnelMbps = ServerSpeedTester.measureActiveDownloadMbps(app)
+            val upMbps = ServerSpeedTester.measureActiveUploadMbps(app)
             val weak = directMbps < cur.monitorDirectThreshold
             val effThr = if (weak) maxOf(directMbps / 2, 0.05) else cur.monitorTunnelThreshold
             if (tunnelMbps >= effThr) {
-                onHealthy(app, phase, problemSince, fmt(tunnelMbps))
+                onHealthy(app, phase, problemSince, "↓${fmt(tunnelMbps)}/↑${fmt(upMbps)}")
                 phase = "ok"; failures = 0; verdictActed = false; backoffMs = 0
                 MonitorStatus.update(true, "ок", now(), cycles)
                 continue
             }
 
-            // ── ПАДЕНИЕ ──
+            // ── ПАДЕНИЕ (скачивание ниже порога) ──
             failures++
             if (phase != "problem") { problemSince = now(); phase = "problem" }
-            val reason = "туннель ${fmt(tunnelMbps)} < порог ${fmt(effThr)}" +
-                if (weak) " (слабый интернет, 50% от ${fmt(directMbps)})" else " (прямой ${fmt(directMbps)})"
+            val reason = "скачивание ${fmt(tunnelMbps)} < ${fmt(effThr)} (отдача ${fmt(upMbps)})" +
+                if (weak) " (слабый интернет, прямой ${fmt(directMbps)})" else " (прямой ${fmt(directMbps)})"
             MonitorStatus.update(true, "падение ($failures)", now(), cycles)
             if (failures == 1) MonitorLog.event(app, "monitor", "Туннель: первая неудача", reason)
 
@@ -231,7 +249,7 @@ object NetworkMonitor {
         val bl = BlocklistStore.current()
         val candidates = SubscriptionManager.allServers(app)
             .filter { SubscriptionManager.serverKey(it) != startKey }
-            .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl) }
+            .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl) && !ServerFilter.isPaused(it, bl) }
             .sortedByDescending { it.speedMbps ?: 0.0 }
         val total = candidates.size
 
@@ -260,7 +278,7 @@ object NetworkMonitor {
             delay(500); waited += 500
         }
         delay(1000)   // дать туннелю осесть
-        val mbps = measureTunnelMbps()
+        val mbps = ServerSpeedTester.measureActiveDownloadMbps(app)   // сопоставимо с кандидатами (Промпт 90.A)
         if (mbps > 0) {
             SubscriptionManager.applySpeedResults(app, mapOf(key to mbps))
             MonitorLog.event(app, "monitor", "Скорость нового сервера", "${fmt(mbps)}")
@@ -291,17 +309,17 @@ object NetworkMonitor {
         val curKey = ProxyState.state.value.serverKey ?: return
         val bl = BlocklistStore.current()
         val topN = SubscriptionManager.allServers(app)
-            .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl) }
+            .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl) && !ServerFilter.isPaused(it, bl) }
             .sortedByDescending { it.speedMbps ?: 0.0 }
             .take(s.normalTopBatch.coerceAtLeast(1))
         if (topN.size <= 1) return
-        MonitorLog.event(app, "monitor", "Оптимизация: перемер top-${topN.size} по скорости", "держим самый быстрый")
+        MonitorLog.event(app, "monitor", "Оптимизация: перемер top-${topN.size} по скорости", "правило «держать лучший» ×${s.keepBestMultiplier}")
         MonitorStatus.update(true, "оптимизация: перемер top-${topN.size}", now(), 0)
         MonitorCoordinator.monitorSearchRunning = true
         try {
-            val curMbps = measureTunnelMbps()
+            val curMbps = ServerSpeedTester.measureActiveDownloadMbps(app)   // сопоставимо с кандидатами (90.A)
             val results = HashMap<String, Double>()
-            results[curKey] = curMbps
+            if (curMbps > 0) results[curKey] = curMbps
             var bestKey: String? = null; var bestMbps = 0.0
             for (c in topN) {
                 if (MonitorCoordinator.fullTestRunning) return               // ручной тест — уступаем
@@ -313,16 +331,18 @@ object NetworkMonitor {
                 if (mbps > bestMbps) { bestMbps = mbps; bestKey = key }
             }
             SubscriptionManager.applySpeedResults(app, results)
-            if (bestKey != null && bestMbps > curMbps * (1 + s.marginRatio)) {
+            // ПРАВИЛО «ДЕРЖАТЬ ЛУЧШИЙ» (Промпт 90.A): переключаемся, если лучший быстрее текущего КРАТНО
+            // (в keepBestMultiplier раз), даже когда текущий выше порога. Кратно — чтобы шум не дёргал.
+            if (bestKey != null && curMbps > 0 && bestMbps >= curMbps * s.keepBestMultiplier) {
                 val target = topN.first { SubscriptionManager.serverKey(it) == bestKey }
                 val cfg = runCatching { XrayConfigBuilder.build(target) }.getOrNull() ?: return
                 val from = ServerLabels.displayForKey(app, curKey)
                 XrayProxyService.start(app, cfg, ServerLabels.full(target), bestKey!!)
-                MonitorLog.switch(app, from, ServerLabels.display(target), "монитор: оптимизация",
-                    "было ${fmt(curMbps)} → стало ${fmt(bestMbps)}")
+                MonitorLog.switch(app, from, ServerLabels.display(target), "монитор: держать лучший",
+                    "было ${fmt(curMbps)} → стало ${fmt(bestMbps)} (×${s.keepBestMultiplier})")
             } else {
                 MonitorLog.event(app, "monitor", "Оптимизация: смены нет",
-                    "текущий ${fmt(curMbps)}, лучший из top ${fmt(bestMbps)}")
+                    "текущий ${fmt(curMbps)}, лучший из top ${fmt(bestMbps)} (нужно ×${s.keepBestMultiplier})")
             }
         } finally {
             MonitorCoordinator.monitorSearchRunning = false
@@ -383,28 +403,16 @@ object NetworkMonitor {
         return null
     }
 
-    // internal (не private): переиспользуется кнопкой «Проверить» — замер текущего активного туннеля.
-    internal fun measureTunnelMbps(): Double {
-        return try {
-            val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", XrayConfig.SOCKS_PORT))
-            val start = System.nanoTime()
-            val conn = (URL(TUNNEL_SPEED_PROBE).openConnection(proxy) as HttpURLConnection).apply {
-                connectTimeout = 5000; readTimeout = 6000
-                setRequestProperty("User-Agent", "curl/8.0")
-            }
-            if (conn.responseCode !in 200..299) { conn.disconnect(); return 0.0 }
-            var totalBytes = 0L
-            conn.inputStream.use { ins ->
-                val buf = ByteArray(32 * 1024)
-                while (true) {
-                    val n = ins.read(buf); if (n < 0) break
-                    totalBytes += n
-                    if (totalBytes >= 2_000_000L || (System.nanoTime() - start) / 1e9 > 6.0) break
-                }
-            }
-            conn.disconnect()
-            val secs = (System.nanoTime() - start) / 1e9
-            if (totalBytes > 0 && secs > 0) totalBytes * 8 / 1e6 / secs else 0.0
-        } catch (e: Exception) { 0.0 }
+    /**
+     * Идёт ли ЖИВОЙ трафик пользователя через туннель (Промпт 90.D): дельта принятых+отданных байт за ~1.2с.
+     * Порог 128 КБ отсекает служебные keepalive, но ловит реальную загрузку. Если идёт — тяжёлый замер
+     * пропускаем (испортили бы и замер, и его загрузку). Байты — накопленные из TrafficTracker (поллер
+     * сервиса их обновляет; queryTunnelDelta НЕ трогаем — её потребляет поллер).
+     */
+    internal suspend fun userTrafficActive(): Boolean {
+        val before = TrafficTracker.state.value.let { it.sessionRx + it.sessionTx }
+        delay(1200)
+        val after = TrafficTracker.state.value.let { it.sessionRx + it.sessionTx }
+        return after - before > 128 * 1024
     }
 }

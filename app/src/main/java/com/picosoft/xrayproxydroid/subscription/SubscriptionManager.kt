@@ -216,7 +216,13 @@ object SubscriptionManager {
         val file = SubscriptionStore.load(context)
         val servers = file.servers.map { rec ->
             val mbps = speedByKey[serverKey(rec.profile)]
-            if (mbps != null) rec.copy(profile = rec.profile.copy(speedMbps = mbps, speedTestedTs = ts)) else rec
+            when {
+                mbps == null -> rec
+                // Провал замера (-1) НЕ затирает прежнюю ВАЛИДНУЮ скорость (Пр.88: не терять данные при массовом
+                // провале temp-инстансов). Обновляем измерение только валидным результатом (≥0) или если раньше данных не было.
+                mbps < 0 && (rec.profile.speedMbps ?: -1.0) >= 0.0 -> rec
+                else -> rec.copy(profile = rec.profile.copy(speedMbps = mbps, speedTestedTs = ts))
+            }
         }
         SubscriptionStore.save(context, file.copy(servers = servers))
     }

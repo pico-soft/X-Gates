@@ -89,12 +89,30 @@ data class AppSettings(
     // Промпт 82: общий БЮДЖЕТ ВРЕМЕНИ ручного полного теста, с. Мерим всех живых по очереди, но не дольше
     // этого (на ~100 серверах ×2с ≈ 3–4 мин; лимит защищает от зависания на медленных). Дефолт 10 мин.
     val fullTestBudgetSec: Int = 600,
+
+    // --- Промпт 90: «держать лучший» + отдача + периодичность дешёвой проверки ---
+    // ВТОРОЕ правило выбора (независимо от порога): если известный лучший живой сервер быстрее текущего
+    // В [keepBestMultiplier] РАЗ (не на проценты — кратно), переключаемся, даже когда текущий выше порога.
+    // ПОЧЕМУ кратно, а не 10%: небольшая разница шумит (±джиттер замера), кратная — реальный выигрыш.
+    val keepBestMultiplier: Double = 3.0,
+    // Дешёвая проверка соединения раз в [connectionCheckIntervalSec] (жив ли туннель/идёт ли трафик). Полный
+    // замер (скачивание+отдача) — ТОЛЬКО по подозрению/кнопке/часовому перемеру: замер отдачи раз в минуту
+    // круглосуточно ≈ 3 ГБ/сут при 8 Мбит — так нельзя. Новое поле (дефолт применится и на старых устройствах).
+    val connectionCheckIntervalSec: Int = 60,
+    // ОТДАЧА (Промпт 90.B): измеряется у АКТИВНОГО соединения (выгрузка через туннель на приёмник).
+    // Приёмник редактируемый (как для скачивания). НЕ Cloudflare (403 на прокси-адреса) и НЕ Hetzner (рвёт TLS).
+    val uploadProbeUrl: String = "http://speedtest.tele2.net/upload.php",
+    // Минимальная отдача, Мбит/с. Дефолт = порогу скачивания (monitorTunnelThreshold=1.0). Недобор → искать замену.
+    val minUploadMbps: Double = 1.0,
+    // Бюджет ПО ОБЪЁМУ на один замер отдачи, МБ (отдельный от скачивания). Дефолт скромный — отдача дороже.
+    val uploadMeasureMb: Int = 2,
 ) {
     // Производные (в единицах, которые нужны коду).
     val speedWarmupMs: Int get() = (speedWarmupSec * 1_000).roundToInt()
     val speedWindowMs: Int get() = (speedWindowSec * 1_000).roundToInt()
     val speedWarmupBudgetBytes: Long get() = speedWarmupMb * 1_048_576L
     val speedMeasureBudgetBytes: Long get() = speedMeasureMb * 1_048_576L
+    val uploadMeasureBudgetBytes: Long get() = uploadMeasureMb * 1_048_576L
     val marginRatio: Double get() = upgradeMarginPercent / 100.0
 }
 

@@ -463,6 +463,104 @@ object ServerSpeedTester {
         return Measurement(rounded, true, "ok/$measureEndReason", bytes = totalBytes)
     }
 
+    // ══════════════ Промпт 90: замеры АКТИВНОГО туннеля (сопоставимо с кандидатами) + ОТДАЧА ══════════════
+    // ВАЖНО (90.A): активный туннель мерим ТЕМ ЖЕ downloadMbps с ОДНИМИ warmup/окном/пробниками, что и
+    // measureSpeed кандидатов → числа сравнимы напрямую. Прежний NetworkMonitor.measureTunnelMbps (без
+    // прогрева, кэп 2МБ, cloudflare, таймер со старта соединения) СИСТЕМАТИЧЕСКИ занижал → сравнивать было
+    // нельзя (сидели на 8, видя 143). Идёт через активный SOCKS (XrayConfig.SOCKS_PORT), не temp-инстанс.
+
+    /** Скорость СКАЧИВАНИЯ активного туннеля, Mbps (>0 валидно, -1 провал). Трафик → «Тест». */
+    fun measureActiveDownloadMbps(context: Context): Double {
+        XrayController.ensureEnv(context)
+        val s = SettingsStore.current()
+        val probes = (listOf(s.speedProbeUrl) + fallbackProbes).distinct()
+        var testBytes = 0L
+        for (probe in probes) {
+            val m = downloadMbps(probe, XrayConfig.SOCKS_PORT, s.speedWarmupMs, s.speedWindowMs,
+                s.speedWarmupBudgetBytes, s.speedMeasureBudgetBytes, "активный↓", s.verboseLogs)
+            testBytes += m.bytes
+            if (m.ok) { TrafficTracker.addTest(testBytes); return m.mbps }
+        }
+        TrafficTracker.addTest(testBytes)
+        return -1.0
+    }
+
+    /** Скорость ОТДАЧИ активного туннеля, Mbps (>0 валидно, -1 провал). Трафик → «Тест». */
+    fun measureActiveUploadMbps(context: Context): Double {
+        XrayController.ensureEnv(context)
+        val s = SettingsStore.current()
+        val m = uploadMbps(s.uploadProbeUrl, XrayConfig.SOCKS_PORT, s.speedWarmupMs, s.speedWindowMs,
+            s.uploadMeasureBudgetBytes, "активный↑", s.verboseLogs)
+        return if (m.ok) m.mbps else -1.0
+    }
+
+    /**
+     * Замер ОТДАЧИ (Промпт 90.B): POST-выгрузка через socks на приёмник. Прогрев ПО ВРЕМЕНИ (skip TCP
+     * slow-start), затем окно до [measureBudget] байт ИЛИ [measureMs]. Пишем в поток — блокировка записи
+     * при насыщении канала = реальная скорость отдачи. Формула та же: байты×8/окно/1e6. Трафик → «Тест».
+     */
+    private fun uploadMbps(
+        url: String, socksPort: Int, warmupMs: Int, measureMs: Int, measureBudget: Long, name: String, verbose: Boolean,
+    ): Measurement {
+        fun log(msg: String) { if (verbose) Log.i(TAG, msg) }
+        val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", socksPort))
+        val conn = try {
+            (URL(url).openConnection(proxy) as HttpURLConnection).apply {
+                requestMethod = "POST"; doOutput = true
+                connectTimeout = CONNECT_TIMEOUT_MS
+                readTimeout = warmupMs + measureMs + 3_000
+                setRequestProperty("User-Agent", "v2rayNG/1.8.0")
+                setRequestProperty("Content-Type", "application/octet-stream")
+                setChunkedStreamingMode(64 * 1024)   // стримим без Content-Length → запись идёт в сокет
+            }
+        } catch (e: Exception) { return Measurement(-1.0, false, "upload connect-fail: ${e.javaClass.simpleName}") }
+
+        val buf = ByteArray(64 * 1024)
+        var total = 0L; var warmupBytes = 0L; var measuredBytes = 0L
+        var firstNanos = 0L; var warmupTimeEnd = 0L; var warmupDoneNanos = 0L
+        var measureTimeEnd = 0L; var lastMeasuredNanos = 0L
+        var inWarmup = true; var writeErr: String? = null
+        try {
+            conn.outputStream.use { out ->
+                loop@ while (true) {
+                    try { out.write(buf) } catch (e: Exception) { writeErr = "${e.javaClass.simpleName}: ${e.message}"; break@loop }
+                    val now = System.nanoTime()
+                    if (firstNanos == 0L) { firstNanos = now; warmupTimeEnd = now + warmupMs * 1_000_000L }
+                    total += buf.size
+                    if (inWarmup) {
+                        warmupBytes += buf.size
+                        if (now >= warmupTimeEnd) { inWarmup = false; warmupDoneNanos = now; measureTimeEnd = now + measureMs * 1_000_000L }
+                    } else {
+                        measuredBytes += buf.size; lastMeasuredNanos = now
+                        if (now >= measureTimeEnd || measuredBytes >= measureBudget) break@loop
+                    }
+                }
+                out.flush()
+            }
+            val code = try { conn.responseCode } catch (e: Exception) { -1 }
+            log("«$name» upload=$url http=$code всего=${total}Б измер=${measuredBytes}Б")
+        } catch (e: Exception) {
+            writeErr = writeErr ?: "${e.javaClass.simpleName}: ${e.message}"
+        } finally {
+            conn.disconnect()
+        }
+        if (total > 0) TrafficTracker.addTest(total)
+
+        val windowMs = if (warmupDoneNanos != 0L && lastMeasuredNanos > warmupDoneNanos)
+            (lastMeasuredNanos - warmupDoneNanos) / 1_000_000 else 0L
+        val failReason = when {
+            writeErr != null -> "ошибка отдачи: $writeErr"
+            measuredBytes == 0L -> "0 отданных байт"
+            windowMs <= 0L -> "нулевое окно отдачи"
+            else -> null
+        }
+        if (failReason != null) { log("«$name» upload ПРОВАЛ [$failReason]"); return Measurement(-1.0, false, failReason, bytes = total) }
+        val mbps = measuredBytes * 8.0 / (windowMs / 1000.0) / 1_000_000.0
+        val rounded = (mbps * 100).roundToInt() / 100.0
+        log("«$name» upload → $rounded Mbps (окно ${windowMs}мс, ${measuredBytes}Б)")
+        return Measurement(rounded, true, "ok-upload", bytes = total)
+    }
+
     private class NoopCallback : CoreCallbackHandler {
         override fun startup(): Long = 0
         override fun shutdown(): Long = 0

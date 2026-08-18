@@ -46,16 +46,34 @@ data class ServerRename(
     val renamedAt: Long = 0L,
 )
 
+/**
+ * Отложенный сервер («на паузе», Промпт 91) — оверрайд по serverKey, ОТДЕЛЬНЫЙ от стоп-листа:
+ * стоп-лист прячет отовсюду и снимается через настройки; отложенный скрыт из «Живых» и автовыбора,
+ * но ВИДЕН в «Все серверы» с кнопкой возврата на месте. [name] — как у [BlockedServer], для читаемости
+ * записи, когда сервер пропал из подписки.
+ */
+@Serializable
+data class PausedServer(
+    val serverKey: String,
+    val name: String,
+    val pausedAt: Long = 0L,
+)
+
 @Serializable
 data class Blocklist(
     val words: List<String> = emptyList(),
     val servers: List<BlockedServer> = emptyList(),
     val renames: List<ServerRename> = emptyList(),   // добавлено в Промпт 44 (старый JSON читается — default)
+    val paused: List<PausedServer> = emptyList(),     // Промпт 91: «на паузе» (старый JSON читается — default)
 ) {
     private val blockedKeys: Set<String> get() = servers.mapTo(HashSet()) { it.serverKey }
     private val nameByKey: Map<String, String> get() = renames.associate { it.serverKey to it.customName }
+    private val pausedKeys: Set<String> get() = paused.mapTo(HashSet()) { it.serverKey }
 
     fun isServerBlocked(serverKey: String): Boolean = serverKey in blockedKeys
+
+    /** Отложен ли сервер («на паузе»). Отдельная причина от стоп-листа — не смешивать. */
+    fun isPaused(serverKey: String): Boolean = serverKey in pausedKeys
 
     /** Пользовательское имя для [serverKey] или null, если не переименован. */
     fun customName(serverKey: String): String? = nameByKey[serverKey]
@@ -188,5 +206,16 @@ object BlocklistStore {
     /** Сброс пользовательского имени одного сервера («Вернуть имя от сервера»). */
     fun clearName(context: Context, serverKey: String) {
         save(context, current().let { it.copy(renames = it.renames.filterNot { r -> r.serverKey == serverKey }) })
+    }
+
+    /** Отложить сервер («На паузе»). Идемпотентно. [nowMs] передаёт вызывающий (стор без часов — тестируемость). */
+    fun pauseServer(context: Context, serverKey: String, name: String, nowMs: Long) {
+        if (current().isPaused(serverKey)) return
+        save(context, current().let { it.copy(paused = it.paused + PausedServer(serverKey, name, nowMs)) })
+    }
+
+    /** Вернуть сервер из паузы. */
+    fun resumeServer(context: Context, serverKey: String) {
+        save(context, current().let { it.copy(paused = it.paused.filterNot { p -> p.serverKey == serverKey }) })
     }
 }

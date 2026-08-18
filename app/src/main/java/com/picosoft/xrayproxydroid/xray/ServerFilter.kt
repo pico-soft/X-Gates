@@ -30,12 +30,21 @@ object ServerFilter {
         return b.isBlocked(p.remarks.ifBlank { p.address }, b.customName(key), key)
     }
 
-    /** Виден в «Живые»: не заблокирован + протокол разрешён + пинг жив + скорость пригодна ИЛИ ещё не мерена. */
+    /** ПЯТЫЙ отсев — «на паузе» (Промпт 91): отдельная причина от стоп-листа. Скрыт из «Живых» и автовыбора. */
+    fun isPaused(p: ServerProfile, b: Blocklist): Boolean = b.isPaused(SubscriptionManager.serverKey(p))
+
+    /**
+     * Виден в «Живые» = РЕАЛЬНО доступен СЕЙЧАС: не заблокирован + не на паузе + протокол разрешён + ЖИВОЙ ПИНГ
+     * (pingMs>=0) + скорость пригодна ИЛИ ещё не мерена. Пинг — свежий сигнал доступности: если подписка не
+     * пингуется (серверы недоступны), они НЕ «Живые», даже если в кэше остались старые хорошие скорости, и
+     * провал скорости (-1) тоже прячет (✗ не в «Живых»). ИСКЛЮЧЕНИЕ — АКТИВНЫЙ подключённый сервер: его живость
+     * доказана самим туннелем (см. `alive` в MainActivity: активный добавляется отдельно, минуя этот предикат).
+     */
     fun isVisible(p: ServerProfile, pingMs: Int?, speedMbps: Double?, s: AppSettings, b: Blocklist): Boolean =
-        !isBlocked(p, b) && protocolAllowed(p, s) && pingMs != null && pingMs >= 0 &&
+        !isBlocked(p, b) && !isPaused(p, b) && protocolAllowed(p, s) && pingMs != null && pingMs >= 0 &&
             (speedMbps == null || speedMbps >= s.minUsableMbps)
 
-    /** Пригоден для автоподключения/апгрейда: не заблокирован + протокол разрешён + скорость ≥ порога. */
+    /** Пригоден для автоподключения/апгрейда: не заблокирован + не на паузе + протокол разрешён + скорость ≥ порога. */
     fun isSelectable(p: ServerProfile, speedMbps: Double?, s: AppSettings, b: Blocklist): Boolean =
-        !isBlocked(p, b) && protocolAllowed(p, s) && speedMbps != null && speedMbps >= s.minUsableMbps
+        !isBlocked(p, b) && !isPaused(p, b) && protocolAllowed(p, s) && speedMbps != null && speedMbps >= s.minUsableMbps
 }
