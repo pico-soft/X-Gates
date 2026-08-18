@@ -46,6 +46,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -113,6 +114,7 @@ import com.picosoft.xrayproxydroid.monitor.MonitorHeartbeat
 import com.picosoft.xrayproxydroid.monitor.MonitorLog
 import com.picosoft.xrayproxydroid.monitor.MonitorPrompt
 import com.picosoft.xrayproxydroid.monitor.MonitorStatus
+import com.picosoft.xrayproxydroid.monitor.NetworkMonitor
 import com.picosoft.xrayproxydroid.monitor.ServerLabels
 import com.picosoft.xrayproxydroid.net.VpnRelation
 import com.picosoft.xrayproxydroid.service.NotificationHelper
@@ -735,6 +737,12 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     var fullTesting by remember { mutableStateOf(false) }  // меняется только на старт/стоп (не на тик)
     var fullHandle by remember { mutableStateOf<FullTestRunner.Handle?>(null) }
 
+    // Кнопка «Проверить» (зелёный блок): замер текущего туннеля → при падении ниже порога перебор списка
+    // Живых до первого ≥ порога → иначе полный тест с обновлением подписок. Статус — строкой в StatusBox.
+    var checking by remember { mutableStateOf(false) }
+    var checkCancel by remember { mutableStateOf(false) }
+    var checkStatus by remember { mutableStateOf("") }
+
     // Внешний IP через активный туннель. "" = не запрашивался, "…" = идёт запрос, ip, "нет ответа".
     var externalIp by remember { mutableStateOf("") }
 
@@ -912,6 +920,106 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         }.start()
     }
 
+    // Кнопка «Проверить» (Промпт 88) — ручная проверка текущего соединения + восстановление по списку Живых.
+    // Порядок: интернет-гейт → замер АКТИВНОГО туннеля (сразу в зелёный блок) → при падении ниже порога
+    // подключиться к быстрейшему из уже померянных → фоном перебор списка Живых СВЕРХУ ВНИЗ (от быстрых к
+    // медленным — начинаем с лучшего кандидата, как монитор) до первого ≥ порога → если никто не дотянул, полный тест с обновлением
+    // подписок (как «Самый быстрый»). Порог = monitorTunnelThreshold (единый с автомониторингом). Замер
+    // активного туннеля и интернет-гейт переиспользуют NetworkMonitor; проба живости — ServerSpeedTester.probeAlive.
+    // Монитор молчит (fullTestRunning=true), чтобы не мешать перебору; отмена — checkCancel по границам шагов.
+    fun onCheck(liveList: List<ServerProfile>) {
+        if (checking) return
+        if (fullTesting || refreshingSubs) { checkStatus = "идёт другой тест — подождите"; return }
+        checking = true; checkCancel = false; checkStatus = "Проверка…"
+        MonitorCoordinator.fullTestRunning = true   // монитор молчит, не мешает перебору
+        MonitorCoordinator.wake()                   // прервать возможный перебор/паузу монитора
+        val threshold = SettingsStore.current().monitorTunnelThreshold
+        fun key(p: ServerProfile) = SubscriptionManager.serverKey(p)
+        fun fmt(v: Double) = (v * 10).roundToInt() / 10.0
+        fun ui(block: () -> Unit) = activity.runOnUiThread(block)
+        val collected = HashMap<String, Double>()   // измерения этого прогона → персист в конце
+        var escalated = false                        // управление передано полному тесту → finally не сбрасывает флаги
+        Thread {
+            try {
+                // 1. Интернет вообще есть? (TCP к DNS — как в мониторе). Нет → серверы не мучаем.
+                if (!NetworkMonitor.directAlive()) { ui { checkStatus = "Нет интернета — проверка невозможна" }; return@Thread }
+
+                // Подключение + замер АКТИВНОГО туннеля (ждём готовности — как measureAfterConnect монитора).
+                fun connectAndMeasure(p: ServerProfile): Double {
+                    val k = key(p)
+                    ui {
+                        val from = ServerLabels.displayForKey(context, ProxyState.state.value.serverKey)
+                        MonitorLog.switch(context, from, displayName(p, blocklist), "проверка: перебор")
+                        startServer(p)
+                    }
+                    var waited = 0
+                    while (waited < 8000 && (!ProxyState.state.value.running || ProxyState.state.value.serverKey != k)) {
+                        Thread.sleep(500); waited += 500
+                    }
+                    Thread.sleep(1000)   // дать туннелю осесть
+                    val mbps = NetworkMonitor.measureTunnelMbps()
+                    if (mbps > 0) { collected[k] = mbps; ui { speedResults = speedResults + (k to mbps) } }
+                    return mbps
+                }
+
+                // 2. Замер ТЕКУЩЕГО соединения (если запущено). Результат — сразу в зелёный блок.
+                val curKey = ProxyState.state.value.serverKey
+                if (ProxyState.state.value.running && curKey != null) {
+                    ui { checkStatus = "Замер текущего соединения…" }
+                    val cur = NetworkMonitor.measureTunnelMbps()
+                    if (cur > 0) { collected[curKey] = cur; ui { speedResults = speedResults + (curKey to cur) } }
+                    if (cur >= threshold) { ui { checkStatus = "Соединение в норме: ${fmt(cur)} Мбит/с" }; return@Thread }
+                    ui { checkStatus = "Текущее ${fmt(cur)} < ${fmt(threshold)} Мбит/с — ищу быстрее…" }
+                }
+                if (checkCancel) { ui { checkStatus = "Проверка прервана" }; return@Thread }
+
+                // 3. Подключиться к БЫСТРЕЙШЕМУ из уже померянных (верх списка Живых, скорость>0), не к текущему.
+                val fastest = liveList.firstOrNull { (effSpeed(it) ?: 0.0) > 0 && key(it) != curKey }
+                val tried = HashSet<String>()
+                curKey?.let { tried.add(it) }
+                if (fastest != null) {
+                    ui { checkStatus = "Подключаюсь к быстрейшему: ${displayName(fastest, blocklist)}…" }
+                    val m = connectAndMeasure(fastest)
+                    tried.add(key(fastest))
+                    if (m >= threshold) { ui { checkStatus = "Готово: ${displayName(fastest, blocklist)} ${fmt(m)} Мбит/с" }; return@Thread }
+                    ui { checkStatus = "${displayName(fastest, blocklist)} ${fmt(m)} < ${fmt(threshold)} — перебираю список…" }
+                }
+
+                // 4. Перебор списка Живых СВЕРХУ ВНИЗ (от быстрых к медленным — начинаем с лучшего, как монитор) до первого ≥ порога.
+                val walk = liveList
+                for ((i, c) in walk.withIndex()) {
+                    if (checkCancel) { ui { checkStatus = "Проверка прервана" }; return@Thread }
+                    val k = key(c)
+                    if (k in tried) continue
+                    tried.add(k)
+                    ui { checkStatus = "Перебор ${i + 1}/${walk.size}: ${displayName(c, blocklist)}…" }
+                    if (!ServerSpeedTester.probeAlive(context, c)) continue   // мёртв — пропуск (зря не переключаемся)
+                    val m = connectAndMeasure(c)
+                    if (m >= threshold) { ui { checkStatus = "Готово: ${displayName(c, blocklist)} ${fmt(m)} Мбит/с" }; return@Thread }
+                }
+
+                // 5. Никто не дотянул → полный тест с обновлением подписок (как «Самый быстрый» + «Подписки»).
+                escalated = true
+                ui {
+                    checking = false
+                    MonitorCoordinator.fullTestRunning = false   // onFullTest выставит заново
+                    checkStatus = "Никто не дотянул до порога — полный тест с обновлением подписок…"
+                    onRefreshAll(onComplete = { onFullTest() })
+                }
+            } catch (e: Exception) {
+                ui { checkStatus = "Ошибка проверки: ${e.message}" }
+            } finally {
+                if (collected.isNotEmpty()) SubscriptionManager.applySpeedResults(context, collected)
+                ui {
+                    if (!escalated) { checking = false; MonitorCoordinator.fullTestRunning = false }
+                    reloadServers()
+                }
+            }
+        }.start()
+    }
+
+    fun onCancelCheck() { checkCancel = true }
+
     // Отсевы (единый предикат [ServerFilter]) — скрывают из ВИДИМОЙ части (Живые и Все).
     // Замер идёт по всем НЕзаблокированным; скрытые считаем, чтобы показать «скрыто настройками: N».
     // Заблокированных убираем ПЕРВЫМИ — они не в списках, не в выборе, не мерятся.
@@ -1039,6 +1147,8 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                     speedMbps = activeServer?.let { effSpeed(it) },
                     hidden = activeHidden, blocked = activeBlocked,
                     message = proxy.message,
+                    checking = checking, checkStatus = checkStatus,
+                    onCheck = { onCheck(alive) }, onCancelCheck = { onCancelCheck() },
                 )
                 ActionsBar(
                     fullTesting = fullTesting, running = proxy.running, refreshingSubs = refreshingSubs,
@@ -1251,6 +1361,10 @@ private fun StatusBox(
     hidden: Boolean,
     blocked: Boolean,
     message: String,
+    checking: Boolean,
+    checkStatus: String,
+    onCheck: () -> Unit,
+    onCancelCheck: () -> Unit,
 ) {
     val bg = when {
         running && verified -> Color(0xFF1B5E20)  // зелёный — туннель подтверждён (есть IP)
@@ -1316,6 +1430,19 @@ private fun StatusBox(
         }
         if (message.isNotEmpty() && message != "idle") {
             Text(message, style = MaterialTheme.typography.bodySmall, color = fg)
+        }
+        // Кнопка «Проверить» (Промпт 88): замер текущего туннеля → перебор Живых до ≥ порога → полный тест.
+        // Светлая на тёмном блоке — явно нажимаемая; во время работы становится «Прервать».
+        Spacer(Modifier.height(4.dp))
+        Button(
+            onClick = { if (checking) onCancelCheck() else onCheck() },
+            colors = ButtonDefaults.buttonColors(containerColor = fg, contentColor = bg),
+            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
+        ) {
+            ButtonLabel(if (checking) UiIcon.STOP else UiIcon.REFRESH, if (checking) "Прервать проверку" else "Проверить")
+        }
+        if (checkStatus.isNotEmpty()) {
+            Text(checkStatus, style = MaterialTheme.typography.bodySmall, color = fg, fontWeight = FontWeight.Bold)
         }
     }
 }

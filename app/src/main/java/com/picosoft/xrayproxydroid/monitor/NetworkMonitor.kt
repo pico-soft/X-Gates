@@ -344,7 +344,8 @@ object NetworkMonitor {
         }
     }
 
-    private fun directAlive(): Boolean {
+    // internal (не private): переиспользуется кнопкой «Проверить» на главной как интернет-гейт.
+    internal fun directAlive(): Boolean {
         for ((host, port) in directDnsProbes) {
             try {
                 Socket().use { it.connect(InetSocketAddress(host, port), 3000); return true }
@@ -382,7 +383,8 @@ object NetworkMonitor {
         return null
     }
 
-    private fun measureTunnelMbps(): Double {
+    // internal (не private): переиспользуется кнопкой «Проверить» — замер текущего активного туннеля.
+    internal fun measureTunnelMbps(): Double {
         return try {
             val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", XrayConfig.SOCKS_PORT))
             val start = System.nanoTime()
