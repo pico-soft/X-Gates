@@ -1,28 +1,28 @@
 {
   "_comment": "ОБРАЗЕЦ манифеста обновления (Промпт 70). В КАЖДЫЙ релиз кладётся вложением с именем update.json. Публичный API GitHub versionCode не отдаёт — обновлялка сравнивает версии ТОЛЬКО по versionCode отсюда. Перед публикацией: (1) versionCode/versionName должны совпасть с app/build.gradle.kts; (2) в каждый sha256 подставить РЕАЛЬНУЮ SHA-256 собранного APK (shasum -a 256 <файл>); (3) имена в fileName — КОНТРАКТ с обновлялкой (…-arm64-v8a.apk и т.д.), совпадают с именами вложений релиза. Релиз публиковать ПОЛНЫМ (не draft, не prerelease) — иначе releases/latest его не отдаёт.",
-  "versionCode": 8,
-  "versionName": "0.17 beta",
-  "notes": "Непрерывность связи: приложение либо держит рабочий туннель, либо прямо говорит, что рабочих серверов нет — статус «зелёный» теперь только при реально прошедшем запросе, и связь восстанавливается сама (перезапуск, перебор серверов, обновление подписок). Уведомление о новой версии. Сбор отчётов о сбоях для пересылки (без адресов и паролей). Диалог сервера: вернулись «Переименовать» и «В стоп-лист», убрана пустая кнопка.",
+  "versionCode": 9,
+  "versionName": "0.18 beta",
+  "notes": "Цвет плашки рабочего сервера теперь по скорости: зелёный — быстро (выше 5 Мбит/с), сине-серый и коричневый — медленнее, красно-коричневый — очень медленно, тёмно-красный — связь оборвана. Отчёт о сбое можно отправить разработчику одним нажатием — только по вашему решению, без адресов и паролей; если почты нет, адрес показан для копирования, остаётся и «Поделиться».",
   "artifacts": [
     {
       "abi": "arm64-v8a",
-      "fileName": "XrayProxyDroid-0.17-arm64-v8a.apk",
-      "sha256": "da166457ed7aa6441f3f307489ecf8e154c4fd1a30a539a93fc45839e9ac1168"
+      "fileName": "XrayProxyDroid-0.18-arm64-v8a.apk",
+      "sha256": "a97c3eed33edd4aaf75bbdeba164d8731ac3e9977a87b4dd93a72ca5ebff85ae"
     },
     {
       "abi": "armeabi-v7a",
-      "fileName": "XrayProxyDroid-0.17-armeabi-v7a.apk",
-      "sha256": "8613add905d0f6791ab5f9f2d89d3588dc55810ff7227f8d89f39b7e59cd953f"
+      "fileName": "XrayProxyDroid-0.18-armeabi-v7a.apk",
+      "sha256": "acc2478593c1c220be3cd730380b57f52115f707dea5bb8f461ee8c630a9e2ad"
     },
     {
       "abi": "x86_64",
-      "fileName": "XrayProxyDroid-0.17-x86_64.apk",
-      "sha256": "fc604f63f348fa597b1d8ebfcabb994d3c5f585a25c530d0dc58ab1c5e5c9c73"
+      "fileName": "XrayProxyDroid-0.18-x86_64.apk",
+      "sha256": "475b4487c7f628a86bf280fe644c7fa6c8534803bd509451af2a6dd5e6d453a8"
     },
     {
       "abi": "universal",
-      "fileName": "XrayProxyDroid-0.17-universal.apk",
-      "sha256": "df26895d501d44ef64da933634587b24d3b05841bc23f3170a1c4d837d79c563"
+      "fileName": "XrayProxyDroid-0.18-universal.apk",
+      "sha256": "9029e39fb4ce58aeded57d76662c97716fa293a5ae7b337567d5a578014273ba"
     }
   ]
 }
