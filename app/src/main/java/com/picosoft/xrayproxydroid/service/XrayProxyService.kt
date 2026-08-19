@@ -99,7 +99,7 @@ class XrayProxyService : Service() {
 
     private fun registerScreenReceiver() {
         val r = object : android.content.BroadcastReceiver() {
-            override fun onReceive(c: Context?, i: Intent?) { MonitorCoordinator.wake() }   // немедленная проверка связи
+            override fun onReceive(c: Context?, i: Intent?) { MonitorCoordinator.wake(force = true) }   // экран/разблокировка → полная проверка связи
         }
         val f = android.content.IntentFilter().apply {
             addAction(Intent.ACTION_SCREEN_ON)
@@ -113,7 +113,7 @@ class XrayProxyService : Service() {
         val cb = object : ConnectivityManager.NetworkCallback() {
             // Любое сетевое событие СБРАСЫВАЕТ троттлинг отката (Промпт 62.C): выключил пользователь
             // lockdown — обход должен вернуться сразу, а не по 5-минутному таймеру.
-            override fun onAvailable(network: Network) { bypassRetryAfterMs = 0L; MonitorCoordinator.wake(); scheduleVpnBypass() }
+            override fun onAvailable(network: Network) { bypassRetryAfterMs = 0L; MonitorCoordinator.wake(force = true); scheduleVpnBypass() }
             override fun onLost(network: Network) { bypassRetryAfterMs = 0L; scheduleVpnBypass() }
             override fun onCapabilitiesChanged(network: Network, caps: android.net.NetworkCapabilities) { bypassRetryAfterMs = 0L; scheduleVpnBypass() }
         }

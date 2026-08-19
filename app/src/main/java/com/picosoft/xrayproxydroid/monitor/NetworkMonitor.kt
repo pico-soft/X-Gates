@@ -47,6 +47,10 @@ object NetworkMonitor {
     private val directDnsProbes = listOf("77.88.8.8" to 53, "8.8.8.8" to 53, "1.1.1.1" to 53)
     private val directSpeedProbes = listOf("https://ya.ru/", "https://mc.yandex.ru/", "https://vk.ru/")
 
+    // Промпт 98.C: неподтверждённый провал перепроверяем БЫСТРО (не ждём полный интервал 60с — это и давало «минуту»).
+    private const val RECHECK_MS = 4_000L
+    // Промпт 98.B: событие (передний план) вскоре после подтверждённого ОК — не гоняем внешний запрос заново.
+    private const val RECENT_OK_SKIP_MS = 45_000L
     private const val SWITCH_THROTTLE_MS = 60_000L        // в фоне переключаться не чаще раза в 60с
     private const val BACKOFF_START_MS = 10 * 60_000L     // первая пауза при отсутствии сети — 10 минут
     // Верхний предел паузы — 4 часа: дальше удваивать бессмысленно (это уже «редкая фоновая проверка»),
@@ -73,15 +77,20 @@ object NetworkMonitor {
         while (true) {
             if (!XrayController.isRunning || !ProxyState.state.value.running) { TunnelHealth.reset(); return }
 
-            // Интервал: при восстановлении/нет-серверов — чаще (быстрее вернуть связь); в норме — обычный.
-            // Прерываемый wake() — событийные триггеры (сеть/экран/передний план) поднимают ДОСРОЧНО.
+            // Интервал: неподтверждённый провал → перепроверяем БЫСТРО (Промпт 98.C); восстановление/нет-серверов →
+            // чаще обычного; в норме — обычный. Прерываемый wake() — событийные триггеры поднимают ДОСРОЧНО.
             val s = SettingsStore.current()
             val ph = TunnelHealth.snapshot().phase
             val recovering = ph == TunnelHealth.Phase.RECOVERING || ph == TunnelHealth.Phase.NO_SERVERS
-            val waitSec = if (recovering) s.monitorProblemIntervalSec.coerceAtLeast(15)
-                          else s.connectionCheckIntervalSec.coerceAtLeast(15)
+            val confirming = failures in 1 until s.monitorFailuresToVerdict
+            val waitMs = when {
+                confirming -> RECHECK_MS
+                recovering -> s.monitorProblemIntervalSec.coerceAtLeast(15) * 1000L
+                else -> s.connectionCheckIntervalSec.coerceAtLeast(15) * 1000L
+            }
             MonitorCoordinator.drainWakeups()
-            MonitorCoordinator.awaitWake(waitSec * 1000L)
+            val wokenEarly = MonitorCoordinator.awaitWake(waitMs)
+            val forced = MonitorCoordinator.consumeForceRecheck()
 
             val cur = SettingsStore.current()
             if (!XrayController.isRunning || !ProxyState.state.value.running) { TunnelHealth.reset(); return }
@@ -89,6 +98,19 @@ object NetworkMonitor {
                 // Тест сам управляет переключением — лестницу НЕ запускаем. Но статус держим ЧЕСТНЫМ:
                 // нет интернета → сказать; иначе не трогаем (факт подтвердит UI-проверка/следующий цикл).
                 if (!directAlive()) TunnelHealth.setPhase(TunnelHealth.Phase.NO_INTERNET, now(), "нет интернета")
+                continue
+            }
+
+            // ── Промпт 98.B: возврат на передний план (частое переключение приложений) ВСКОРЕ после подтверждённого
+            // ОК — НЕ повторяем внешний запрос. Достаточно, что прямой интернет на месте. Сеть/экран (forced) и
+            // истёкший интервал (не wokenEarly) — полная проверка. Реальную смерть в окне пропуска ловит след. цикл.
+            val snap = TunnelHealth.snapshot()
+            if (wokenEarly && !forced && failures == 0 && snap.phase == TunnelHealth.Phase.OK &&
+                now() - snap.lastOkMs < RECENT_OK_SKIP_MS) {
+                if (!directAlive()) {
+                    TunnelHealth.setPhase(TunnelHealth.Phase.NO_INTERNET, now(), "нет интернета")
+                    MonitorStatus.update(true, "нет интернета", now(), cycles)
+                }
                 continue
             }
             cycles++
@@ -104,7 +126,9 @@ object NetworkMonitor {
             }
 
             // ── СИГНАЛ B (ФАКТ): реальный запрос через SOCKS вернул внешний IP = связь РАБОТАЕТ ──
-            val ip = ExternalIpChecker.fetch()
+            // Промпт 98.A: при первом провале (failures==0) — ПОВТОР с прогревом (холодный сокет после простоя),
+            // чтобы не объявлять живой туннель мёртвым. На перепроверках повтор не нужен.
+            val ip = probeExternalIp(app, warmRetry = (failures == 0))
             if (ip != null) {
                 onRecovered(app)
                 TunnelHealth.ok(ip, now())
@@ -127,12 +151,20 @@ object NetworkMonitor {
                 continue
             }
 
-            // ── СВЯЗИ НЕТ (факт: запрос не прошёл) → ЛЕСТНИЦА ВОССТАНОВЛЕНИЯ (сама, без пользователя) ──
+            // ── ЗАПРОС НЕ ПРОШЁЛ (даже с повтором) → ПОДТВЕРЖДЕНИЕ, потом восстановление ──
             failures++
+            if (failures < cur.monitorFailuresToVerdict) {
+                // Промпт 98.D: провал НЕ подтверждён (одиночная миганка / холодный сокет) — НЕ пугаем «туннель упал».
+                // Статус «проверяю связь…» (не восстановление), быстрая перепроверка (RECHECK_MS), не минута.
+                TunnelHealth.setPhase(TunnelHealth.Phase.VERIFYING, now(), "проверяю связь…")
+                MonitorStatus.update(true, "проверяю ($failures)", now(), cycles)
+                MonitorLog.event(app, "monitor", "Связь не подтвердилась — перепроверяю", "попытка $failures из ${cur.monitorFailuresToVerdict}")
+                continue
+            }
+            // Отказ ПОДТВЕРЖДЁН (несколько неудач подряд) → лестница восстановления (сама, без пользователя).
             TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "восстановление…")
-            MonitorStatus.update(true, "восстановление ($failures)", now(), cycles)
-            if (failures == 1) MonitorLog.event(app, "monitor", "Связь не подтверждена — восстанавливаю", "внешний IP не получен")
-            if (failures < cur.monitorFailuresToVerdict) continue   // короткий анти-дребезг (одиночная миганка)
+            MonitorStatus.update(true, "восстановление", now(), cycles)
+            MonitorLog.event(app, "monitor", "Связь не подтверждена — восстанавливаю", "внешний IP не получен ($failures×)")
 
             when (runRecoveryLadder(app, cur)) {
                 SwitchResult.SWITCHED -> {
@@ -153,6 +185,25 @@ object NetworkMonitor {
                 }
             }
         }
+    }
+
+    /**
+     * Промпт 98.A: живость туннеля фактом (внешний IP), с ПОВТОРОМ при первом провале. Холодный сокет после
+     * простоя (возврат из фона/Doze) может не ответить на первый запрос — это ещё не смерть. Логирует
+     * длительность и исход (для разбора «из чего минута» и ложных падений). warmRetry=false на перепроверках.
+     */
+    private suspend fun probeExternalIp(app: Context, warmRetry: Boolean): String? {
+        val t0 = now()
+        ExternalIpChecker.fetch()?.let { return it }
+        if (!warmRetry) {
+            Log.i(TAG, "внешний IP не получен за ${now() - t0} мс (без прогрева)")
+            return null
+        }
+        delay(1500)   // дать холодному туннелю ожить, затем повторить
+        val ip = ExternalIpChecker.fetch()
+        if (ip != null) MonitorLog.event(app, "monitor", "Связь подтвердилась со 2-й попытки", "холодный туннель ожил за ${now() - t0} мс")
+        else Log.i(TAG, "внешний IP не получен даже с повтором за ${now() - t0} мс")
+        return ip
     }
 
     /** Связь подтверждена — снять предложения/уведомления «нет серверов»/«включить источники». */
@@ -180,11 +231,13 @@ object NetworkMonitor {
                     MonitorLog.event(app, "monitor", "Восстановление 1: перезапуск ядра", ServerLabels.display(curSrv))
                     TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "перезапуск ядра…")
                     XrayProxyService.start(app, cfg, ServerLabels.full(curSrv), startKey)
+                    // Промпт 98.C: перезапуск на том же сервере должен занимать секунды. Ждём готовности ядра
+                    // короче (до 5с), даём осесть 800мс, подтверждаем фактом с повтором (холодный сокет).
                     var waited = 0
-                    while (waited < 8000 && (!ProxyState.state.value.running || ProxyState.state.value.serverKey != startKey)) { delay(500); waited += 500 }
-                    delay(1500)
+                    while (waited < 5000 && (!ProxyState.state.value.running || ProxyState.state.value.serverKey != startKey)) { delay(250); waited += 250 }
+                    delay(800)
                     if (aborted(startKey)) return SwitchResult.ABORTED
-                    if (ExternalIpChecker.fetch() != null) { MonitorLog.event(app, "monitor", "Восстановление: перезапуск ядра помог", ""); return SwitchResult.SWITCHED }
+                    if (probeExternalIp(app, warmRetry = true) != null) { MonitorLog.event(app, "monitor", "Восстановление: перезапуск ядра помог", ""); return SwitchResult.SWITCHED }
                 }
             }
             // Ступени 2–5.
