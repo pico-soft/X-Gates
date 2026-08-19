@@ -986,6 +986,9 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
     // Полный адаптивный тест: ping → speed по живым → early-connect первого рабочего → апгрейд.
     fun onFullTest() {
         if (fullTesting) return
+        // Промпт 101.B: идёт ручная проверка текущего соединения — двух прогонов одновременно быть не должно.
+        // Не запускаем поверх неё (эскалация внутри onCheck сама снимает checking перед вызовом сюда).
+        if (checking) { checkStatus = "идёт проверка — сначала прервите её"; return }
         // Свежий список из реестра (не застаревший снимок): учитывает вкл/выкл источников, сделанные на
         // вкладке «Подписки» (Промпт 82). Сервер входит, если он в ЛЮБОМ включённом источнике.
         val all = SubscriptionManager.allServers(context).also { servers = it }
@@ -1039,6 +1042,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
     // его зовут автозапуск и эскалация «Проверить», которые уже обновились сами (без двойного рефреша).
     fun onFastest() {
         if (fullTesting || refreshingSubs) return
+        if (checking) { checkStatus = "идёт проверка — сначала прервите её"; return }   // Промпт 101.B: не поверх ручной проверки
         val hasUrl = sources.any { it.enabled && it.url.isNotBlank() }
         if (hasUrl) onRefreshAll(onComplete = { onFullTest() }) else onFullTest()
     }
@@ -1071,6 +1075,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
         if (checking) return
         if (fullTesting || refreshingSubs) { checkStatus = "идёт другой тест — подождите"; return }
         checking = true; checkCancel = false; checkStatus = "Проверка…"
+        ServerSpeedTester.resetMeasureAbort()   // Промпт 101.B: снять флаг отмены прошлой проверки
         MonitorCoordinator.fullTestRunning = true
         MonitorCoordinator.wake()
         val s = SettingsStore.current()
@@ -1134,7 +1139,9 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                 if (!forceSwitch && originalProfile != null) {
                     ui { checkStatus = "Замер текущего соединения…" }
                     val curDown = ServerSpeedTester.measureActiveDownloadMbps(context)
+                    if (checkCancel) { ui { checkStatus = "Проверка прервана" }; return@Thread }   // Промпт 101.B: отмена во время замера
                     val curUp = ServerSpeedTester.measureActiveUploadMbps(context)
+                    if (checkCancel) { ui { checkStatus = "Проверка прервана" }; return@Thread }
                     if (curDown > 0) { collected[curKey!!] = curDown; ui { speedResults = speedResults + (curKey to curDown) } }
                     ui { activeUploadMbps = if (curUp > 0) curUp else null }
 
@@ -1197,7 +1204,9 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
         }.start()
     }
 
-    fun onCancelCheck() { checkCancel = true }
+    // Промпт 101.B: отмена обязана срабатывать НЕМЕДЛЕННО — не только флаг, но и закрыть идущий замер
+    // (иначе «Прервать» ждёт таймаута блокирующего чтения). abortCurrentMeasure рвёт соединение замера.
+    fun onCancelCheck() { checkCancel = true; ServerSpeedTester.abortCurrentMeasure() }
 
     // Промпт 91: «Убрать» — отложить ТЕКУЩИЙ сервер («на паузе») и сразу переключиться на быстрейшего живого
     // (правило Промпта 90, сверху вниз; отложенный в кандидаты не попадает). onCheck сам берёт список без него.

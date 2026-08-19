@@ -25,8 +25,59 @@ object ExternalIpChecker {
         "https://ipinfo.io/ip",
     )
 
-    /** Блокирующий вызов — запускать на фоновом потоке. */
+    // Промпт 101.A — ОДИН запрос внешнего адреса за раз, из ЕДИНОЙ точки. РАНЬШЕ петля интерфейса и монитор
+    // запрашивали независимо, не зная друг о друге; пока запрос был коротким — наложений не было, но стоило
+    // ему затянуться (мёртвый канал) — запросы шли внахлёст и ДУШИЛИ туннель (вечное «проверяется связь»).
+    // Теперь: пока запрос выполняется, новые НЕ создаются — пришедшие ЖДУТ его результат (coalesce) и свой
+    // запрос НЕ делают. Никаких новых потоков здесь не создаём (потоки — на стороне вызывающих).
+    // НЕ ТРОГАЕМ (Промпт 101.D): таймаут, цепочку фолбэков, логику вердикта — только сериализация.
+    private val lock = Any()
+    @Volatile private var inFlight = false
+    @Volatile private var lastResult: String? = null
+    private var generation = 0L
+
+    // Тестовый шов + счётчики (Промпт 101.C): подменяемая «одна работа» и наблюдаемая параллельность/число
+    // фактических запросов — чтобы ЧИСЛАМИ показать «один запрос за раз». В проде onceOverrideForTest=null.
+    internal var onceOverrideForTest: ((Int) -> String?)? = null
+    private val concurrentNow = java.util.concurrent.atomic.AtomicInteger(0)
+    @Volatile internal var maxConcurrentSeen = 0
+    @Volatile internal var onceCount = 0
+    internal fun resetTestCounters() { maxConcurrentSeen = 0; onceCount = 0 }
+
+    /** Единая точка запроса внешнего адреса. Блокирующий — запускать на фоновом потоке (как и раньше). */
     fun fetch(socksPort: Int = XrayConfig.SOCKS_PORT): String? {
+        synchronized(lock) {
+            if (inFlight) {
+                // Запрос уже идёт — дождаться ЕГО результата, свой НЕ запускать (не плодим параллельные).
+                val gen = generation
+                while (inFlight && generation == gen) {
+                    try { (lock as Object).wait() } catch (_: InterruptedException) { return lastResult }
+                }
+                Log.i(TAG, "запрос внешнего адреса уже шёл — отдан его результат (без нового)")
+                return lastResult
+            }
+            inFlight = true
+        }
+        var result: String? = null
+        try {
+            val n = concurrentNow.incrementAndGet()
+            if (n > maxConcurrentSeen) maxConcurrentSeen = n
+            onceCount++
+            result = onceOverrideForTest?.invoke(socksPort) ?: fetchOnce(socksPort)
+        } finally {
+            concurrentNow.decrementAndGet()
+            synchronized(lock) {
+                lastResult = result
+                inFlight = false
+                generation++
+                (lock as Object).notifyAll()
+            }
+        }
+        return result
+    }
+
+    /** Один фактический сетевой запрос (цепочка фолбэков). Вызывается ТОЛЬКО из [fetch] под флагом inFlight. */
+    private fun fetchOnce(socksPort: Int): String? {
         val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", socksPort))
         for (url in endpoints) {
             try {

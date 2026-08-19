@@ -359,6 +359,7 @@ object ServerSpeedTester {
             readTimeout = warmupMs + measureMs + 2_000
             setRequestProperty("User-Agent", "v2rayNG/1.8.0")
         }
+        currentMeasureConn = conn   // Промпт 101.B: чтобы «Прервать проверку» закрыл это соединение немедленно
         val reqStart = System.nanoTime()
         val code = try {
             conn.responseCode
@@ -434,6 +435,7 @@ object ServerSpeedTester {
             readErr = "${e.javaClass.simpleName}: ${e.message}"
         } finally {
             conn.disconnect()
+            if (currentMeasureConn === conn) currentMeasureConn = null
         }
 
         val ttfbMs = if (firstNanos != 0L) (firstNanos - reqStart) / 1_000_000 else -1
@@ -469,6 +471,17 @@ object ServerSpeedTester {
     // прогрева, кэп 2МБ, cloudflare, таймер со старта соединения) СИСТЕМАТИЧЕСКИ занижал → сравнивать было
     // нельзя (сидели на 8, видя 143). Идёт через активный SOCKS (XrayConfig.SOCKS_PORT), не temp-инстанс.
 
+    // Промпт 101.B: НЕМЕДЛЕННО прервать идущий замер (кнопка «Прервать проверку»), НЕ дожидаясь таймаута —
+    // закрываем текущее соединение замера, блокирующее чтение/коннект падает с ошибкой → замер вернёт провал,
+    // а поток проверки увидит checkCancel и выйдет. Во время ручной проверки замеры идут ПОСЛЕДОВАТЕЛЬНО в
+    // одном потоке, а монитор молчит (fullTestRunning) — гонок за этот ref нет. Таймауты/логику НЕ трогаем.
+    @Volatile private var currentMeasureConn: HttpURLConnection? = null
+    @Volatile private var measureAborted = false
+    // Закрыть текущее соединение И поднять флаг, чтобы цикл фолбэк-пробников замера активного туннеля СРАЗУ
+    // прекратился, а не перебирал оставшиеся адреса (иначе отмена ждёт весь перебор). Reset — в начале проверки.
+    fun abortCurrentMeasure() { measureAborted = true; runCatching { currentMeasureConn?.disconnect() } }
+    fun resetMeasureAbort() { measureAborted = false }
+
     /** Скорость СКАЧИВАНИЯ активного туннеля, Mbps (>0 валидно, -1 провал). Трафик → «Тест». */
     fun measureActiveDownloadMbps(context: Context): Double {
         XrayController.ensureEnv(context)
@@ -476,6 +489,7 @@ object ServerSpeedTester {
         val probes = (listOf(s.speedProbeUrl) + fallbackProbes).distinct()
         var testBytes = 0L
         for (probe in probes) {
+            if (measureAborted) break   // Промпт 101.B: отмена — не перебираем оставшиеся пробники
             val m = downloadMbps(probe, XrayConfig.SOCKS_PORT, s.speedWarmupMs, s.speedWindowMs,
                 s.speedWarmupBudgetBytes, s.speedMeasureBudgetBytes, "активный↓", s.verboseLogs)
             testBytes += m.bytes
@@ -514,6 +528,7 @@ object ServerSpeedTester {
                 setChunkedStreamingMode(64 * 1024)   // стримим без Content-Length → запись идёт в сокет
             }
         } catch (e: Exception) { return Measurement(-1.0, false, "upload connect-fail: ${e.javaClass.simpleName}") }
+        currentMeasureConn = conn   // Промпт 101.B: «Прервать проверку» закрывает и идущую отдачу
 
         val buf = ByteArray(64 * 1024)
         var total = 0L; var warmupBytes = 0L; var measuredBytes = 0L
@@ -543,6 +558,7 @@ object ServerSpeedTester {
             writeErr = writeErr ?: "${e.javaClass.simpleName}: ${e.message}"
         } finally {
             conn.disconnect()
+            if (currentMeasureConn === conn) currentMeasureConn = null
         }
         if (total > 0) TrafficTracker.addTest(total)
 
