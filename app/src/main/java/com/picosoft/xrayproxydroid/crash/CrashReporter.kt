@@ -29,6 +29,36 @@ object CrashReporter {
     private const val PREF = "crash_prefs"
     private const val KEY_SEEN = "last_seen"        // имя последнего ПОКАЗАННОГО отчёта (чтобы не нудеть)
 
+    /**
+     * Промпт 97: адрес получателя отчётов о сбоях — ОДНО место (константа). Отправка ТОЛЬКО по явному
+     * действию человека (открыть письмо и нажать «отправить»); автоматической отправки НЕТ и быть не должно
+     * (приложение для обхода блокировок не может тихо слать данные разработчику).
+     */
+    const val DEVELOPER_EMAIL = "pico.soft.github@gmail.com"
+    private const val APP_NAME = "XrayProxyDroid"
+
+    /** Тема письма: название, версия, versionCode, модель устройства, версия Android (Промпт 97.D). */
+    fun emailSubject(): String =
+        "$APP_NAME ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) — " +
+            "${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE} — отчёт о сбое"
+
+    /**
+     * Тело письма (Промпт 97.D/E): необязательное описание пользователя «что делал перед сбоем» отдельным
+     * блоком СВЕРХУ, затем очищенный отчёт как есть. Описание тоже прогоняем через [Sanitizer] — человек мог
+     * вписать адрес/учётку, а письмо уходит постороннему.
+     */
+    fun emailBody(description: String, report: String): String {
+        val sb = StringBuilder()
+        val desc = description.trim()
+        if (desc.isNotEmpty()) {
+            sb.appendLine("--- Что делал пользователь перед сбоем ---")
+            sb.appendLine(Sanitizer.clean(desc))
+            sb.appendLine()
+        }
+        sb.append(report)
+        return sb.toString()
+    }
+
     @Volatile private var appContext: Context? = null
     private var previous: Thread.UncaughtExceptionHandler? = null
 

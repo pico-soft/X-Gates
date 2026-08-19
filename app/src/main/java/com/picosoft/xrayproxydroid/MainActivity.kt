@@ -1391,6 +1391,11 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                     speedMbps = activeServer?.let { effSpeed(it) },
                     uploadMbps = activeUploadMbps,
                     hidden = activeHidden, blocked = activeBlocked,
+                    problem = proxy.running && (
+                        health.phase == TunnelHealth.Phase.NO_INTERNET ||
+                        health.phase == TunnelHealth.Phase.RECOVERING ||
+                        health.phase == TunnelHealth.Phase.NO_SERVERS
+                    ),
                     message = proxy.message,
                     checking = checking, checkStatus = checkStatus,
                     onCheck = { onCheck(alive) }, onCancelCheck = { onCancelCheck() },
@@ -1624,6 +1629,7 @@ private fun StatusBox(
     uploadMbps: Double?,
     hidden: Boolean,
     blocked: Boolean,
+    problem: Boolean,
     message: String,
     checking: Boolean,
     checkStatus: String,
@@ -1631,15 +1637,22 @@ private fun StatusBox(
     onCancelCheck: () -> Unit,
     onExclude: () -> Unit,
 ) {
-    val bg = when {
-        running && verified -> Color(0xFF1B5E20)  // зелёный — туннель подтверждён (есть IP)
-        running -> Color(0xFF6D4C00)              // янтарный — подключаемся/не подтверждено
-        else -> Color(0xFF3A3A3A)                 // серый — выключен
-    }
-    val fg = when {
-        running && verified -> Color(0xFFA5D6A7)
-        running -> Color(0xFFFFE082)
-        else -> Color(0xFFBDBDBD)
+    // Цвет плашки рабочего сервера — по СКОРОСТИ скачивания (правило Elyor): >5 зелёный, 1–5 сине-серый,
+    // 0.2–1 коричневый, <0.2 красно-коричневый. Порядок оценки — сверху вниз по убыванию скорости.
+    // ВАЖНО (принцип непрерывности связи): при ПОЛНОМ обрыве (нет интернета/восстановление/нет серверов)
+    // трафик НЕ идёт — плашка ТЁМНО-КРАСНАЯ независимо от прошлой скорости. Зелёный остаётся признаком
+    // живого быстрого туннеля, а не молча-зелёным при поломке.
+    val (bg, fg) = when {
+        !running -> Color(0xFF3A3A3A) to Color(0xFFBDBDBD)             // серый — выключен
+        problem -> Color(0xFF7F1D1D) to Color(0xFFFFCDD2)             // тёмно-красный — полный обрыв связи
+        speedMbps != null && speedMbps > 0.0 -> when {
+            speedMbps > 5.0  -> Color(0xFF1B5E20) to Color(0xFFA5D6A7) // зелёный — быстро
+            speedMbps >= 1.0 -> Color(0xFF37474F) to Color(0xFFB0BEC5) // сине-серый — средне
+            speedMbps >= 0.2 -> Color(0xFF5D4037) to Color(0xFFD7CCC8) // коричневый — медленно
+            else             -> Color(0xFF5D2A2A) to Color(0xFFEF9A9A) // красно-коричневый — очень медленно
+        }
+        verified -> Color(0xFF1B5E20) to Color(0xFFA5D6A7)           // подтверждён, скорость ещё не мерена — зелёный
+        else -> Color(0xFF6D4C00) to Color(0xFFFFE082)               // подключаемся/проверяем — янтарный
     }
     Column(
         modifier = Modifier
@@ -3069,13 +3082,106 @@ private fun shareText(context: Context, text: String) {
 }
 
 /**
+ * Промпт 97.A/B: открыть почтовый клиент с готовым письмом (адрес получателя в mailto: — задан даже если
+ * приложение игнорирует EXTRA_EMAIL). Отправку жмёт человек. Возвращает false, если почтового клиента нет
+ * или он не открылся — тогда UI показывает адрес текстом и предлагает «Скопировать» (НЕ системную ошибку).
+ * Полагаемся на перехват ActivityNotFoundException, а не на resolveActivity: в манифесте нет <queries>,
+ * и resolveActivity на Android 11+ вернул бы null даже при наличии клиента.
+ */
+private fun emailReport(context: Context, subject: String, body: String): Boolean =
+    try {
+        val intent = Intent(Intent.ACTION_SENDTO).apply {
+            data = android.net.Uri.parse("mailto:" + android.net.Uri.encode(CrashReporter.DEVELOPER_EMAIL))
+            putExtra(Intent.EXTRA_EMAIL, arrayOf(CrashReporter.DEVELOPER_EMAIL))
+            putExtra(Intent.EXTRA_SUBJECT, subject)
+            putExtra(Intent.EXTRA_TEXT, body)
+        }
+        context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        true
+    } catch (_: Throwable) {
+        false
+    }
+
+/**
+ * Промпт 97.A/D/E: перед отправкой показать человеку, ЧТО именно уйдёт (полный текст, прокрутка), дать
+ * необязательное поле «что делал перед сбоем» (уходит блоком сверху), показать адрес получателя ТЕКСТОМ.
+ * «Открыть почту» формирует письмо; если клиента нет — понятное сообщение + «Скопировать» с видимым адресом.
+ * «Поделиться» (мессенджер) остаётся на виду — запасной путь мимо туннеля (Промпт 97.C). Автоотправки нет.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun SendToDeveloperDialog(report: String, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    var description by remember { mutableStateOf("") }
+    var noMailClient by remember { mutableStateOf(false) }
+    val subject = remember { CrashReporter.emailSubject() }
+    val body = CrashReporter.emailBody(description, report)
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Отправить разработчику") },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text("Отчёт отправляется на адрес:", style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    CrashReporter.DEVELOPER_EMAIL,
+                    style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .clickable { copyToClipboard(context, CrashReporter.DEVELOPER_EMAIL); copyToast(context, "Адрес скопирован") }
+                        .padding(vertical = 2.dp),
+                )
+                Text(
+                    "Ничего не отправляется автоматически — письмо отправляете вы вручную одним нажатием в почте.",
+                    style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+                )
+                OutlinedTextField(
+                    value = description, onValueChange = { description = it },
+                    label = { Text("Что вы делали перед сбоем (необязательно)") },
+                    modifier = Modifier.fillMaxWidth(), minLines = 2,
+                )
+                Text("Будет отправлено:", style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
+                Text(
+                    body, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                        .padding(8.dp),
+                )
+                if (noMailClient) {
+                    Text(
+                        "Почтовое приложение не открылось. Скопируйте отчёт (адрес выше) и отправьте удобным способом, либо нажмите «Поделиться».",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error,
+                    )
+                }
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Button(onClick = {
+                        if (emailReport(context, subject, body)) onDismiss() else noMailClient = true
+                    }) { Text("Открыть почту") }
+                    OutlinedButton(onClick = {
+                        copyToClipboard(context, "${CrashReporter.DEVELOPER_EMAIL}\n\n$body"); copyToast(context, "Скопировано")
+                    }) { Text("Скопировать") }
+                    OutlinedButton(onClick = { shareText(context, body) }) { Text("Поделиться") }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Закрыть") } },
+    )
+}
+
+/**
  * Заметная полоса на ГЛАВНОЙ после падения (Промпт 93.B): приложение аварийно завершилось, есть отчёт.
  * Кнопки «Скопировать»/«Поделиться» действуют на ПОСЛЕДНИЙ отчёт. Никакой автоотправки. Крестик — снять
  * (пометить показанным; для следующего падения покажется снова).
  */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun CrashBanner(onDismiss: () -> Unit) {
     val context = LocalContext.current
+    var showSend by remember { mutableStateOf(false) }
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -3090,9 +3196,11 @@ private fun CrashBanner(onDismiss: () -> Unit) {
                 "Приложение аварийно завершилось — сохранён отчёт о сбое.",
                 style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold, color = Color.White,
             )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 val btn = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color(0xFFB71C1C))
                 val pad = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                Button(onClick = { if (CrashReporter.reports().firstOrNull() != null) showSend = true },
+                    colors = btn, contentPadding = pad) { Text("Отправить разработчику") }
                 Button(onClick = { CrashReporter.reports().firstOrNull()?.let { copyToClipboard(context, CrashReporter.read(it)) } },
                     colors = btn, contentPadding = pad) { Text("Скопировать") }
                 Button(onClick = { CrashReporter.reports().firstOrNull()?.let { shareText(context, CrashReporter.read(it)) } },
@@ -3102,6 +3210,11 @@ private fun CrashBanner(onDismiss: () -> Unit) {
         }
         Text("✕", color = Color.White, fontWeight = FontWeight.Bold,
             modifier = Modifier.clip(RoundedCornerShape(6.dp)).clickable { onDismiss() }.padding(8.dp))
+    }
+    if (showSend) {
+        val report = remember { CrashReporter.reports().firstOrNull()?.let { CrashReporter.read(it) } }
+        if (report != null) SendToDeveloperDialog(report = report, onDismiss = { showSend = false })
+        else showSend = false
     }
 }
 
@@ -3145,6 +3258,7 @@ private fun CrashReportsSection() {
     var refresh by remember { mutableStateOf(0) }
     val reports = remember(refresh) { CrashReporter.reports() }
     var openText by remember { mutableStateOf<String?>(null) }
+    var sendText by remember { mutableStateOf<String?>(null) }
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (reports.isEmpty()) {
             Text("Отчётов о сбоях нет.", style = MaterialTheme.typography.bodyMedium, color = TABLE_GRAY)
@@ -3161,6 +3275,7 @@ private fun CrashReportsSection() {
                     Text(firstLines, style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         TextButton(onClick = { openText = CrashReporter.read(f) }) { Text("Показать") }
+                        TextButton(onClick = { sendText = CrashReporter.read(f) }) { Text("Отправить разработчику") }
                         TextButton(onClick = { copyToClipboard(context, CrashReporter.read(f)) }) { Text("Скопировать") }
                         TextButton(onClick = { shareText(context, CrashReporter.read(f)) }) { Text("Поделиться") }
                         TextButton(onClick = { CrashReporter.delete(f); refresh++ }) { Text("Удалить") }
@@ -3185,6 +3300,8 @@ private fun CrashReportsSection() {
             dismissButton = { TextButton(onClick = { openText = null }) { Text("Закрыть") } },
         )
     }
+    val send = sendText
+    if (send != null) SendToDeveloperDialog(report = send, onDismiss = { sendText = null })
 }
 
 @OptIn(ExperimentalLayoutApi::class)
