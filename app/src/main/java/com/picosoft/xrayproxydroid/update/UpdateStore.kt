@@ -31,6 +31,13 @@ object UpdateStore {
         val summary: String = "",      // человекочитаемый итог
         val updateAvailable: Boolean = false,
         val details: String = "",      // полная постадийная диагностика (77.E) — под «Подробности» в UI
+        // Промпт 93.J/K/L: доступная версия ПЕРСИСТИТСЯ (полоса переживает перезапуск/возврат из «недавних»),
+        // + состояние «уже показали»/«отклонено» (одно уведомление на версию, снятие в двух местах).
+        val availCode: Int = 0,        // versionCode доступного обновления (0 = нет)
+        val availName: String = "",
+        val availNotes: String = "",
+        val dismissedCode: Int = 0,    // версия, которую пользователь отклонил (полоса+уведомление сняты)
+        val notifiedCode: Int = 0,     // версия, о которой уже показали уведомление (одно на версию)
     )
 
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
@@ -57,12 +64,23 @@ object UpdateStore {
     fun apply(context: Context, report: CheckReport, nowMs: Long) {
         val result = report.result
         _live.value = result
-        val rec = Record(
+        val prev = _record.value
+        val avail = result as? UpdateCheckResult.Available
+        val rec = prev.copy(
             checkedAtMs = nowMs,
             summary = summarize(result),
             updateAvailable = result is UpdateCheckResult.Available || result is UpdateCheckResult.AvailableUnverified,
             details = report.details,
+            // Доступную версию сохраняем только для проверяемого Available (с update.json); иначе полоса не нужна.
+            availCode = avail?.versionCode ?: 0,
+            availName = avail?.versionName ?: "",
+            availNotes = avail?.notes ?: "",
+            // dismissedCode/notifiedCode НЕ сбрасываем — переживают проверки (одно уведомление на версию).
         )
+        save(context, rec)
+    }
+
+    private fun save(context: Context, rec: Record) {
         _record.value = rec
         val target = File(context.filesDir, FILE)
         val tmp = File(context.filesDir, TMP)
@@ -75,6 +93,30 @@ object UpdateStore {
             Log.w(TAG, "save failed", e)
         }
     }
+
+    // ── Промпт 93.J/K/L: полоса и уведомление о новой версии ──
+    private fun currentCode() = BuildConfig.VERSION_CODE
+
+    /** Инфо для ПОЛОСЫ: доступная версия НОВЕЕ текущей, не отклонена, настройка вкл. Иначе null. Переживает
+     *  перезапуск (из персистентной записи) — полоса видна и при возврате из «недавних» (L). */
+    fun bannerVersion(notifyOn: Boolean): Pair<Int, String>? {
+        val r = _record.value
+        return if (notifyOn && r.availCode > currentCode() && r.availCode != r.dismissedCode) r.availCode to r.availName else null
+    }
+
+    fun availNotesFirstLine(): String = _record.value.availNotes.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() }.orEmpty()
+
+    /** Показать ли УВЕДОМЛЕНИЕ: новее + не отклонено + ещё НЕ показывали (одно на версию) + настройка вкл. */
+    fun shouldNotify(notifyOn: Boolean): Boolean {
+        val r = _record.value
+        return notifyOn && r.availCode > currentCode() && r.availCode != r.dismissedCode && r.availCode != r.notifiedCode
+    }
+
+    /** Уведомление показано — больше про эту версию не напоминаем (даже после перезапусков). */
+    fun markNotified(context: Context) { val r = _record.value; if (r.availCode != 0) save(context, r.copy(notifiedCode = r.availCode)) }
+
+    /** Пользователь отклонил (крестик полосы / установка) — снять полосу И уведомление для ЭТОЙ версии. */
+    fun markDismissed(context: Context) { val r = _record.value; if (r.availCode != 0) save(context, r.copy(dismissedCode = r.availCode)) }
 
     /** Пора ли авто-проверить при холодном старте (не чаще раза в сутки). */
     fun dueForAutoCheck(nowMs: Long): Boolean {

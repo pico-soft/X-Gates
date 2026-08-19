@@ -20,6 +20,27 @@ object MonitorCoordinator {
         get() = _fullTest.get()
         set(value) = _fullTest.set(value)
 
+    // Как прервать идущий полный тест (ставит onFullTest на время прогона, снимает по завершении).
+    @Volatile
+    var fullTestCancel: (() -> Unit)? = null
+
+    /**
+     * Промпт 93.E: операции с ИСТОЧНИКАМИ (добавить/обновить/удалить/выключить) и полный тест ВЗАИМНО
+     * ИСКЛЮЧЕНЫ — реестр не должен перестраиваться под идущим обходом. ВЫБОР: не очередь, а ЧЕСТНОЕ
+     * ПРЕРЫВАНИЕ теста перед изменением данных. ПОЧЕМУ: добавление источника — осознанное действие
+     * пользователя, оно должно вступить в силу сразу; тест легко перезапустить (кнопкой/автоподбором).
+     * Очередь запутала бы («добавил — ничего не происходит, пока тест идёт»). Прерываем и ЖДЁМ реальной
+     * остановки (флаг снимается в onDone теста), только потом меняем данные. Вызывать из ФОНОВОГО потока.
+     */
+    fun abortFullTestAndWait(timeoutMs: Long = 8000L) {
+        if (!fullTestRunning) return
+        runCatching { fullTestCancel?.invoke() }
+        val end = System.currentTimeMillis() + timeoutMs
+        while (fullTestRunning && System.currentTimeMillis() < end) {
+            try { Thread.sleep(50) } catch (e: InterruptedException) { break }
+        }
+    }
+
     // Идёт перебор кандидатов монитором (он уже крутит temp-инстансы). Ступень 5 каскада не должна
     // поднимать ЕЩЁ один temp-инстанс параллельно — пропускается на это время.
     private val _monitorSearch = AtomicBoolean(false)

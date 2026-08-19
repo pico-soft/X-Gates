@@ -102,6 +102,8 @@ object FullTestRunner {
                 var bestSpeed = 0.0
                 var selectable = 0
                 var measured = 0
+                // Промпт 93.C: фон не должен ронять процесс — любое исключение фазы завершает тест штатно (onDone).
+                try {
                 for (p in candidates) {
                     if (cancelled.get()) break
                     // Общий бюджет времени (Промпт 82): не мерим ВСЕХ бесконечно — стоп по лимиту.
@@ -134,6 +136,9 @@ object FullTestRunner {
                     emitProgress(measured, candidates.size)
                     // Батч-остановка: набрали минимум живых на границе батча — дальше не мерим (экономия трафика).
                     if (minAlive > 0 && selectable >= minAlive && measured % batch == 0) break
+                }
+                } catch (e: Throwable) {
+                    runCatching { onPhase("Ошибка теста: ${e.javaClass.simpleName}: ${e.message}") }
                 }
                 onDone(Result(connected ?: best, best, bestSpeed, candidates.size, cancelled.get()))
             }.start()

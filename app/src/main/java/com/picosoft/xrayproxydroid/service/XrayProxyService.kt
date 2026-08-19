@@ -23,6 +23,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import com.picosoft.xrayproxydroid.update.UpdateChecker
+import com.picosoft.xrayproxydroid.update.UpdateNotifier
+import com.picosoft.xrayproxydroid.update.UpdateStore
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
@@ -49,6 +53,9 @@ class XrayProxyService : Service() {
 
     // Подписка на системную сеть: появление сети мгновенно будит монитор из паузы «нет интернета».
     private var netCallback: ConnectivityManager.NetworkCallback? = null
+    // Промпт 95.B: экран включён / устройство вышло из простоя → немедленная проверка связи (в Doze циклы
+    // растягиваются и после пробуждения монитор может не успеть — событие компенсирует).
+    private var screenReceiver: android.content.BroadcastReceiver? = null
 
     // Обход ЧУЖОГО системного VPN (Промпт 57/60). coreActive — ядро поднято (привязать исходящие ДО
     // первого дозвона). lastRelation — для логирования СМЕНЫ СОСТОЯНИЯ. bypassRetryAfterMs — троттлинг
@@ -64,18 +71,41 @@ class XrayProxyService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        // Реактивно поднимаем/гасим монитор: работает только при monitorEnabled И активном прокси
-        // (выключенный монитор не выполняет НИЧЕГО — ради батареи).
+        // Промпт 95: цикл НЕПРЕРЫВНОСТИ СВЯЗИ работает ВСЕГДА, пока прокси активен (НЕ гейтится monitorEnabled —
+        // это ОСНОВНОЙ принцип, а не опция; monitorEnabled внутри цикла гейтит лишь вторичную оптимизацию).
         monitorScope.launch {
-            combine(SettingsStore.state, ProxyState.state) { s, p -> s.monitorEnabled && p.running }
-                .distinctUntilChanged()
+            ProxyState.state.map { it.running }.distinctUntilChanged()
                 .collect { active -> if (active) startMonitor() else stopMonitor() }
         }
         // Переключение «Обходить системный VPN» применяем сразу (не ждём сетевого события).
         monitorScope.launch {
             SettingsStore.state.map { it.bypassSystemVpn }.distinctUntilChanged().collect { applyVpnBypass() }
         }
+        // Промпт 93.I: пока прокси активен — раз в сутки проверять новую версию ЧЕРЕЗ уже работающий туннель
+        // (несколько КБ). НЕ будим телефон (обычный delay в живом сервисе), НЕ при загрузке, тихо при неудаче.
+        monitorScope.launch {
+            while (true) {
+                delay(60 * 60 * 1000L)   // раз в час смотрим «пора ли»; dueForAutoCheck троттлит до суток
+                if (!ProxyState.state.value.running) continue
+                if (!UpdateStore.dueForAutoCheck(System.currentTimeMillis())) continue
+                val r = runCatching { UpdateChecker.check(applicationContext) }.getOrNull() ?: continue
+                UpdateStore.apply(applicationContext, r, System.currentTimeMillis())
+                UpdateNotifier.maybeNotify(applicationContext)
+            }
+        }
         registerNetworkCallback()
+        registerScreenReceiver()
+    }
+
+    private fun registerScreenReceiver() {
+        val r = object : android.content.BroadcastReceiver() {
+            override fun onReceive(c: Context?, i: Intent?) { MonitorCoordinator.wake() }   // немедленная проверка связи
+        }
+        val f = android.content.IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }
+        runCatching { registerReceiver(r, f); screenReceiver = r }
     }
 
     private fun registerNetworkCallback() {
@@ -264,6 +294,8 @@ class XrayProxyService : Service() {
 
     private fun handleStop() {
         stopMonitor()
+        com.picosoft.xrayproxydroid.monitor.TunnelHealth.reset()   // Промпт 95: прокси остановлен — статус не зелёный
+        NotificationHelper.cancelNoServers(applicationContext)
         coreActive = false
         // Снять привязку сразу и без блокирующей пробы (main-поток) — полное applyVpnBypass не зовём.
         runCatching { getSystemService(ConnectivityManager::class.java)?.bindProcessToNetwork(null) }
@@ -317,6 +349,9 @@ class XrayProxyService : Service() {
         monitorScope.cancel()   // погасить цикл монитора + реактивный коллектор вместе с сервисом
         netCallback?.let { cb -> runCatching { getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb) } }
         netCallback = null
+        screenReceiver?.let { r -> runCatching { unregisterReceiver(r) } }
+        screenReceiver = null
+        com.picosoft.xrayproxydroid.monitor.TunnelHealth.reset()
         // Страховка: если сервис уничтожают — гасим ядро.
         if (XrayController.isRunning) {
             XrayController.queryTunnelDelta()?.let { TrafficTracker.addTunnel(it.first, it.second) }

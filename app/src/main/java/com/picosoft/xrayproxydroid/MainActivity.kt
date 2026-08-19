@@ -1,6 +1,8 @@
 package com.picosoft.xrayproxydroid
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -26,6 +28,8 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.PaddingValues
@@ -42,6 +46,9 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
@@ -115,6 +122,9 @@ import com.picosoft.xrayproxydroid.monitor.MonitorLog
 import com.picosoft.xrayproxydroid.monitor.MonitorPrompt
 import com.picosoft.xrayproxydroid.monitor.MonitorStatus
 import com.picosoft.xrayproxydroid.monitor.NetworkMonitor
+import com.picosoft.xrayproxydroid.monitor.TunnelHealth
+import com.picosoft.xrayproxydroid.crash.CrashContext
+import com.picosoft.xrayproxydroid.crash.CrashReporter
 import com.picosoft.xrayproxydroid.monitor.ServerLabels
 import com.picosoft.xrayproxydroid.net.VpnRelation
 import com.picosoft.xrayproxydroid.service.NotificationHelper
@@ -144,8 +154,28 @@ import com.picosoft.xrayproxydroid.xray.link.Protocol
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
 
 class MainActivity : ComponentActivity() {
+    companion object {
+        const val EXTRA_OPEN = "open"          // Промпт 93.J: интент-навигация из уведомления
+        const val OPEN_UPDATE = "update"       // открыть на «О приложении»/экране обновления
+        // Запрос навигации (из уведомления) — StateFlow, чтобы AppRoot среагировал и при onNewIntent (приложение уже открыто).
+        val pendingOpen = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        intent.getStringExtra(EXTRA_OPEN)?.let { pendingOpen.value = it }
+    }
+
+    // Промпт 95.B: приложение выведено на передний план → немедленная проверка связи (не ждать цикла).
+    override fun onResume() {
+        super.onResume()
+        MonitorCoordinator.wake()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        intent?.getStringExtra(EXTRA_OPEN)?.let { pendingOpen.value = it }
         SettingsStore.init(applicationContext)   // загрузить настройки до первого замера
         BlocklistStore.init(applicationContext)  // стоп-лист (первый запуск → засев дефолтом RU/BY)
         MonitorLog.init(applicationContext)      // журнал автомониторинга (переживает перезапуск)
@@ -169,6 +199,7 @@ class MainActivity : ComponentActivity() {
                 if (!com.picosoft.xrayproxydroid.net.CascadeFetch.isOwnProxyUp()) return@Thread  // туннеля нет — молчим
                 val r = runCatching { UpdateChecker.check(app) }.getOrNull() ?: return@Thread
                 UpdateStore.apply(app, r, System.currentTimeMillis())
+                com.picosoft.xrayproxydroid.update.UpdateNotifier.maybeNotify(app)   // Промпт 93.J: уведомить, если новее
             }.start()
         }
         enableEdgeToEdge()
@@ -182,7 +213,7 @@ class MainActivity : ComponentActivity() {
 
 /** Высота собственной нижней панели (стандартный NavigationBar фиксирован 80dp — не годится).
  *  Подбирать здесь; системный отступ навигации сюда НЕ входит (он добавляется отдельно инсетом). */
-private val BOTTOM_BAR_HEIGHT = 42.dp
+private val BOTTOM_BAR_HEIGHT = 60.dp   // икона + подпись минимальным шрифтом
 
 /** Корень с компактной нижней навигацией: «Главная» (рабочий экран) + «Настройки» (что настраивают). */
 @Composable
@@ -192,6 +223,11 @@ private fun AppRoot() {
     // теста) — остаётся ровно там, где пользователь. Раньше был plain remember и на пересоздании прыгал
     // на «Главную» (это тоже самопроизвольная смена вкладки — убрано).
     var tab by rememberSaveable { mutableStateOf(0) }
+    // Навигация по тапу уведомления об обновлении (Промпт 93.J) → вкладка «Настройки» (там «О приложении» + обновление).
+    val pendingOpen by MainActivity.pendingOpen.collectAsState()
+    LaunchedEffect(pendingOpen) {
+        if (pendingOpen == MainActivity.OPEN_UPDATE) { tab = 2; MainActivity.pendingOpen.value = null }
+    }
     val stateHolder = rememberSaveableStateHolder()   // сохраняет состояние вкладки (раскрытые секции) при переключении
     Scaffold(
         modifier = Modifier.fillMaxSize(),
@@ -199,7 +235,7 @@ private fun AppRoot() {
     ) { innerPadding ->
         stateHolder.SaveableStateProvider(tab) {
             when (tab) {
-                0 -> BootScreen(modifier = Modifier.padding(innerPadding))
+                0 -> BootScreen(modifier = Modifier.padding(innerPadding), onOpenUpdate = { tab = 2 })
                 1 -> SubscriptionsScreen(modifier = Modifier.padding(innerPadding))
                 else -> SettingsTab(modifier = Modifier.padding(innerPadding))
             }
@@ -260,11 +296,26 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
     var blocklistExpanded by rememberSaveable { mutableStateOf(false) }
     var monitorExpanded by rememberSaveable { mutableStateOf(false) }
     var trafficExpanded by rememberSaveable { mutableStateOf(false) }
+    var crashExpanded by rememberSaveable { mutableStateOf(false) }
+    val updateRec by UpdateStore.record.collectAsState()   // Промпт 93.K: та же полоса «новая версия» в настройках
+    val listState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
     LazyColumn(
+        state = listState,
         modifier = modifier.fillMaxSize().padding(horizontal = 14.dp),
         contentPadding = PaddingValues(vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
+        // Полоса «новая версия» (Промпт 93.K) — одно событие в двух местах; «Обновить» листает к разделу обновления.
+        if (settings.notifyNewVersions && updateRec.availCode > BuildConfig.VERSION_CODE && updateRec.availCode != updateRec.dismissedCode) {
+            item {
+                UpdateBanner(
+                    versionName = updateRec.availName,
+                    onUpdate = { scope.launch { runCatching { listState.animateScrollToItem(Int.MAX_VALUE) } } },
+                    onDismiss = { UpdateStore.markDismissed(context); NotificationHelper.cancelUpdate(context) },
+                )
+            }
+        }
         // Сообщение о системном VPN — на цветном поле, только эта надпись (перенесено с Главной).
         if (vpnStatus.relation != VpnRelation.NONE) {
             item { VpnStatusCard(vpnStatus, onRetry = { XrayProxyService.retryVpnBypass(context) }) }
@@ -319,6 +370,11 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
         item {
             CollapsibleSection("Трафик", trafficExpanded, { trafficExpanded = !trafficExpanded }, icon = UiIcon.TRAFFIC) { TrafficSection() }
         }
+        item {
+            CollapsibleSection("Отчёты о сбоях", crashExpanded, { crashExpanded = !crashExpanded }, icon = UiIcon.WARN) {
+                CrashReportsSection()
+            }
+        }
         // Проверка обновления — на виду (не в подменю), ниже «Трафик».
         item { UpdateCheckSection() }
         // Трафик замеров + режим экономии — в САМОМ НИЗУ (Промпт 77).
@@ -345,6 +401,7 @@ private fun SubscriptionsScreen(modifier: Modifier = Modifier) {
 
     fun onImportFile(uri: android.net.Uri) {
         Thread {
+            MonitorCoordinator.abortFullTestAndWait()   // Промпт 93.E: не менять реестр под идущим тестом
             val body = runCatching {
                 context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
             }.getOrNull().orEmpty()
@@ -361,6 +418,7 @@ private fun SubscriptionsScreen(modifier: Modifier = Modifier) {
     fun onAddUrl(url: String, name: String) {
         if (url.isBlank()) { status = "введите URL"; return }
         Thread {
+            MonitorCoordinator.abortFullTestAndWait()   // Промпт 93.E: сначала остановить тест, потом менять реестр
             val id = SubscriptionManager.addUrl(context, url, name)
             if (id == null) { activity.runOnUiThread { status = "дубликат URL или пусто"; reload() }; return@Thread }
             val s = SubscriptionManager.refreshOne(context, id)
@@ -372,6 +430,7 @@ private fun SubscriptionsScreen(modifier: Modifier = Modifier) {
     fun onAddPaste(text: String) {
         if (text.isBlank()) { status = "вставьте ссылки"; return }
         Thread {
+            MonitorCoordinator.abortFullTestAndWait()   // Промпт 93.E
             val (_, s) = SubscriptionManager.addLocalFromBody(context, text)
             activity.runOnUiThread {
                 status = "вставка: +${s.added}  дубли=${s.duplicates}  неподдерж=${s.unsupported}  ошибок=${s.invalid}"; reload()
@@ -383,6 +442,7 @@ private fun SubscriptionsScreen(modifier: Modifier = Modifier) {
         if (sources.none { it.enabled && it.url.isNotBlank() }) { status = "нет включённых подписок с URL"; return }
         refreshing = true; status = "обновление…"
         Thread {
+            MonitorCoordinator.abortFullTestAndWait()   // Промпт 93.E: не обновлять реестр под идущим тестом
             val res = SubscriptionManager.refreshAllEnabled(context, cancelled = { false }, onEach = { _, _ -> activity.runOnUiThread { reload() } })
             val okN = res.values.count { it.ok }; val failN = res.values.count { !it.ok }
             activity.runOnUiThread { refreshing = false; status = "обновлено: $okN ок, $failN ошибок"; reload() }
@@ -394,10 +454,31 @@ private fun SubscriptionsScreen(modifier: Modifier = Modifier) {
         contentPadding = PaddingValues(vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        item { Text("Подписки (${sources.size})", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold) }
+        // Заголовок КРУПНЕЕ + «Обновить» ИКОНКОЙ справа (Промпт 93).
         item {
-            OutlinedButton(onClick = { onRefreshAll() }, enabled = !refreshing, modifier = Modifier.fillMaxWidth()) {
-                if (refreshing) Text("Обновление…") else ButtonLabel(UiIcon.REFRESH, "Обновить все")
+            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "Подписки (${sources.size})",
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f),
+                )
+                // Явная нажимаемая кнопка (Промпт 93: голая иконка «неубедительна»): залитый круг с ↻ + подпись.
+                Row(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(50))
+                        .background(if (refreshing) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.primary)
+                        .clickable(enabled = !refreshing) { onRefreshAll() }
+                        .padding(horizontal = 14.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    FlatIcon(UiIcon.REFRESH, size = 20.dp,
+                        color = if (refreshing) TABLE_GRAY else MaterialTheme.colorScheme.onPrimary)
+                    Text(if (refreshing) "Обновление…" else "Обновить",
+                        style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold,
+                        color = if (refreshing) TABLE_GRAY else MaterialTheme.colorScheme.onPrimary)
+                }
             }
         }
         item {
@@ -406,7 +487,7 @@ private fun SubscriptionsScreen(modifier: Modifier = Modifier) {
                 onAddUrl = { url, name -> onAddUrl(url, name) },
                 onAddPaste = { onAddPaste(it) },
                 onImportFile = { filePicker.launch("*/*") },
-                onToggle = { id, en -> SubscriptionManager.setEnabled(context, id, en); reload() },
+                onToggle = { id, en -> Thread { MonitorCoordinator.abortFullTestAndWait(); SubscriptionManager.setEnabled(context, id, en); activity.runOnUiThread { reload() } }.start() },
                 onDeleteRequest = { pendingDelete = it },
                 onRenameRequest = { renameSource = it },
             )
@@ -427,7 +508,7 @@ private fun SubscriptionsScreen(modifier: Modifier = Modifier) {
             onDismissRequest = { pendingDelete = null },
             title = { Text("Удалить источник?") },
             text = { Text("«${src.name}»\nИсчезнет серверов: $lost (только те, которых нет в других подписках).") },
-            confirmButton = { TextButton(onClick = { SubscriptionManager.remove(context, src.id); pendingDelete = null; reload() }) { Text("Удалить") } },
+            confirmButton = { TextButton(onClick = { pendingDelete = null; Thread { MonitorCoordinator.abortFullTestAndWait(); SubscriptionManager.remove(context, src.id); activity.runOnUiThread { reload() } }.start() }) { Text("Удалить") } },
             dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("Отмена") } },
         )
     }
@@ -467,7 +548,7 @@ private fun CompactBottomBar(selected: Int, onSelect: (Int) -> Unit) {
                         .clickable { onSelect(i) },
                     contentAlignment = Alignment.Center,
                 ) {
-                    // Иконка меньше высоты панели → сверху/снизу остаются поля. Активность: цвет + полоса.
+                    // Иконка + подпись минимальным шрифтом (Промпт 93). Активность: цвет + полоса сверху.
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Box(
                             modifier = Modifier
@@ -477,6 +558,13 @@ private fun CompactBottomBar(selected: Int, onSelect: (Int) -> Unit) {
                         )
                         Spacer(Modifier.height(4.dp))
                         NavIcon(i, if (active) activeColor else inactiveColor, size = 18.dp)
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            when (i) { 0 -> "Главная"; 1 -> "Подписки"; else -> "Настройки" },
+                            fontSize = 10.sp,
+                            color = if (active) activeColor else inactiveColor,
+                            maxLines = 1,
+                        )
                     }
                 }
             }
@@ -732,7 +820,7 @@ private var autoStartDone = false
 
 @OptIn(ExperimentalFoundationApi::class)   // stickyHeader
 @Composable
-private fun BootScreen(modifier: Modifier = Modifier) {
+private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit = {}) {
     val context = LocalContext.current
     val activity = context as ComponentActivity
 
@@ -763,9 +851,15 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     var checkStatus by remember { mutableStateOf("") }
     // Промпт 90: отдача АКТИВНОГО соединения (Мбит/с) — показываем в статус-боксе и деталях. null = не мерена.
     var activeUploadMbps by remember { mutableStateOf<Double?>(null) }
+    // Промпт 93.I: полоса «было падение» на главной. Показ, если есть непоказанный отчёт; снимается крестиком.
+    var showCrashBanner by remember { mutableStateOf(CrashReporter.hasUnseen()) }
+    // Промпт 93.K: полоса «новая версия» — реактивно из UpdateStore (переживает перезапуск/возврат из «недавних»).
+    val updateRec by UpdateStore.record.collectAsState()
 
     // Внешний IP через активный туннель. "" = не запрашивался, "…" = идёт запрос, ip, "нет ответа".
     var externalIp by remember { mutableStateOf("") }
+    // Промпт 95: единый ФАКТ-статус туннеля (движется монитором в сервисе; один процесс — общий синглтон).
+    val health by TunnelHealth.state.collectAsState()
 
     // Диалог деталей сервера (долгое нажатие) + отладочный «Перемерить».
     var detailProfile by remember { mutableStateOf<ServerProfile?>(null) }
@@ -785,7 +879,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         }
     }
 
-    fun reloadServers() { servers = SubscriptionManager.allServers(context) }
+    fun reloadServers() { servers = SubscriptionManager.allServers(context); CrashContext.registrySize = servers.size }
     fun reloadSources() { sources = SubscriptionManager.sources(context) }
 
     fun effPing(p: ServerProfile): Int? = pingResults[SubscriptionManager.serverKey(p)] ?: p.pingMs
@@ -823,7 +917,14 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         externalIp = "…"
         Thread {
             val ip = ExternalIpChecker.fetch()
+            val nowMs = System.currentTimeMillis()
+            // Промпт 95: результат — в единый ФАКТ-статус. Успех = OK (зелёный); провал = связь не подтверждена
+            // (монитор запустит лестницу восстановления). Не оставляем «зелёный + прочерк».
+            if (ip != null) TunnelHealth.ok(ip, nowMs)
+            else if (TunnelHealth.snapshot().phase == TunnelHealth.Phase.OK)
+                TunnelHealth.setPhase(TunnelHealth.Phase.VERIFYING, nowMs, "связь не подтверждена — проверяю")
             activity.runOnUiThread { externalIp = ip ?: "нет ответа" }
+            MonitorCoordinator.wake()   // разбудить монитор для немедленной проверки/восстановления
         }.start()
     }
 
@@ -854,6 +955,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         val hasUrl = sources.any { it.enabled && it.url.isNotBlank() }
         if (!hasUrl) { subStatus = "нет включённых подписок с URL"; return }
         refreshingSubs = true; subRefreshCancel = false
+        CrashContext.set("обновление всех источников")
         TestProgress.startIndeterminate("обновление подписок…")
         Thread {
             val res = SubscriptionManager.refreshAllEnabled(
@@ -890,7 +992,10 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         if (all.isEmpty()) { subStatus = "нет серверов"; return }
         fullTesting = true
         MonitorCoordinator.fullTestRunning = true   // монитор молчит, пока идёт ручной тест
+        // Промпт 93.E: как прервать тест извне (операции с источниками) — отмена handle → onDone снимет флаги.
+        MonitorCoordinator.fullTestCancel = { fullHandle?.cancel() }
         MonitorCoordinator.wake()                   // прервать возможный перебор/паузу монитора
+        CrashContext.set("полный тест: старт")
         TestProgress.startIndeterminate("запуск…")   // до первого done/total — indeterminate
         pingResults = emptyMap(); speedResults = emptyMap()
 
@@ -898,7 +1003,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
             context = context,
             allServers = all,
             // Прогресс и текст фазы — в ОТДЕЛЬНЫЙ StateFlow (не в state экрана): тик не рекомпозит список.
-            onPhase = { ph -> TestProgress.phase(ph) },
+            onPhase = { ph -> TestProgress.phase(ph); CrashContext.set("тест: $ph") },
             emitProgress = { done, total -> TestProgress.progress(done, total) },
             onPingResult = { p, ms ->
                 activity.runOnUiThread { pingResults = pingResults + (SubscriptionManager.serverKey(p) to ms) }
@@ -916,6 +1021,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                         activity.runOnUiThread {
                             fullTesting = false; fullHandle = null
                             MonitorCoordinator.fullTestRunning = false   // тест закончился — монитор снова может работать
+                            MonitorCoordinator.fullTestCancel = null; CrashContext.set("простой")
                             TestProgress.finish(                             // бар гаснет, итог остаётся текстом
                                 if (r.cancelled) "отменено"
                                 else "готово: быстрейший ${r.fastest?.remarks?.ifBlank { r.fastest.address } ?: "—"} ${r.fastestMbps} Мбит/с"
@@ -941,6 +1047,7 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         fullHandle?.cancel(); fullHandle = null
         fullTesting = false
         MonitorCoordinator.fullTestRunning = false   // отмена теста — монитор снова может работать
+        MonitorCoordinator.fullTestCancel = null
         TestProgress.finish("отменено")
         val pSnap = pingResults; val sSnap = speedResults
         Thread {
@@ -1150,6 +1257,8 @@ private fun BootScreen(modifier: Modifier = Modifier) {
     // Внешний IP запрашиваем при появлении подключения / смене активного сервера (даём туннелю осесть).
     LaunchedEffect(proxy.running, proxy.serverKey) {
         if (proxy.running) {
+            TunnelHealth.setPhase(TunnelHealth.Phase.VERIFYING, System.currentTimeMillis(), "проверяю связь…")
+            MonitorCoordinator.wake()      // немедленная проверка (не ждать цикла)
             kotlinx.coroutines.delay(800)
             refreshIp()
         } else {
@@ -1157,7 +1266,16 @@ private fun BootScreen(modifier: Modifier = Modifier) {
             activeUploadMbps = null         // прокси стоит → отдачи нет
         }
     }
-    val ipVerified = externalIp.isNotEmpty() && externalIp != "…" && externalIp != "нет ответа"
+    // Промпт 95: пока экран «Главная» открыт И прокси активен — ПЕРИОДИЧЕСКИ подтверждаем связь ФАКТОМ
+    // (внешний IP через SOCKS), чтобы статус НЕ протухал (даже когда монитор занят полным тестом). ~12с.
+    LaunchedEffect(proxy.running) {
+        while (proxy.running) {
+            kotlinx.coroutines.delay(12_000)
+            if (ProxyState.state.value.running && !checking) refreshIp()
+        }
+    }
+    // Промпт 95.D: «зелёный» — ТОЛЬКО при факте OK (прошедший запрос). Никаких «зелёный + прочерк».
+    val ipVerified = proxy.running && health.phase == TunnelHealth.Phase.OK
 
     // Автозапуск при старте (по умолчанию, отключаемо в Настройках). Один раз за процесс. Два шага:
     //  1) МГНОВЕННАЯ СВЯЗЬ — сразу подключиться к последнему успешному серверу (если он ещё в списке),
@@ -1226,6 +1344,18 @@ private fun BootScreen(modifier: Modifier = Modifier) {
         item {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.padding(bottom = 12.dp)) {
                 AppHeader()
+                // Полоса «было падение» (Промпт 93.B) — заметно, над списками; крестик снимает для этого отчёта.
+                if (showCrashBanner) {
+                    CrashBanner(onDismiss = { CrashReporter.markLatestSeen(); showCrashBanner = false })
+                }
+                // Полоса «новая версия» (Промпт 93.K): новее текущей, не отклонена, настройка вкл.
+                if (settings.notifyNewVersions && updateRec.availCode > BuildConfig.VERSION_CODE && updateRec.availCode != updateRec.dismissedCode) {
+                    UpdateBanner(
+                        versionName = updateRec.availName,
+                        onUpdate = onOpenUpdate,
+                        onDismiss = { UpdateStore.markDismissed(context); NotificationHelper.cancelUpdate(context) },
+                    )
+                }
                 // Промпт 74: подписок нет (дефолт не зафетчился при первом запуске или юзер их не добавил) —
                 // зовём добавить свою. Показываем ТОЛЬКО когда список источников пуст.
                 if (sources.isEmpty()) {
@@ -1241,8 +1371,20 @@ private fun BootScreen(modifier: Modifier = Modifier) {
                         )
                     }
                 }
+                // Промпт 95.D: явный текст, когда связь НЕ подтверждена фактом (не «зелёный молча»).
+                val healthLine = when {
+                    !proxy.running -> ""
+                    health.phase == TunnelHealth.Phase.OK -> ""
+                    health.phase == TunnelHealth.Phase.NO_INTERNET -> "Нет интернета — проверьте сеть"
+                    health.phase == TunnelHealth.Phase.RECOVERING -> "Восстановление связи: ${health.detail.ifBlank { "перебор серверов" }}"
+                    health.phase == TunnelHealth.Phase.NO_SERVERS ->
+                        "Рабочих серверов сейчас нет" + (if (health.lastCheckMs > 0) " · посл. попытка ${monitorTimeFmt.format(Date(health.lastCheckMs))}" else "")
+                    else -> "Проверяется связь…"
+                }
                 StatusBox(
-                    running = proxy.running, verified = ipVerified, ipText = externalIp,
+                    running = proxy.running, verified = ipVerified,
+                    ipText = if (health.ip.isNotEmpty()) health.ip else externalIp,
+                    statusLine = healthLine,
                     onRefreshIp = { refreshIp() },
                     serverName = activeServer?.let { displayName(it, blocklist) } ?: proxy.label,
                     subtitle = activeServer?.let { protoNetSec(it) },
@@ -1474,6 +1616,7 @@ private fun StatusBox(
     running: Boolean,
     verified: Boolean,
     ipText: String,
+    statusLine: String,
     onRefreshIp: () -> Unit,
     serverName: String?,
     subtitle: String?,
@@ -1521,6 +1664,14 @@ private fun StatusBox(
             fontWeight = FontWeight.Bold,
             color = fg,
         )
+        // Промпт 95.D: связь НЕ подтверждена фактом → ЯВНЫЙ текст (проверяется/восстанавливается/нет серверов).
+        // Не бывает «зелёный молча»: если тут есть строка — блок НЕ зелёный (verified=false).
+        if (running && statusLine.isNotEmpty()) {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                FlatIcon(UiIcon.WARN, size = 14.dp, color = fg)
+                Text(statusLine, style = MaterialTheme.typography.bodyMedium, color = fg, fontWeight = FontWeight.Bold)
+            }
+        }
         if (running) {
             // Активный сервер попал под стоп-лист — туннель не рвём молча, помечаем и предлагаем переключиться.
             if (blocked) {
@@ -1857,18 +2008,22 @@ private fun ServerRow(
                 textAlign = TextAlign.End,
                 maxLines = 1,
             )
-            // ▶ запуск сервера — ЕДИНСТВЕННЫЙ элемент, по которому тап подключает.
-            Text(
-                if (isActive) "●" else "▶",
-                fontSize = TABLE_FONT,
-                color = MaterialTheme.colorScheme.primary,
-                textAlign = TextAlign.End,
-                maxLines = 1,
+            // Запуск сервера — ЗАМЕТНАЯ залитая круглая кнопка (Промпт 93): треугольник Play на фоне primary;
+            // активный — точка (подключён). ЕДИНСТВЕННЫЙ элемент, по которому тап подключает.
+            Box(
                 modifier = Modifier
-                    .clip(RoundedCornerShape(6.dp))
-                    .clickable { onConnect() }
-                    .padding(horizontal = 8.dp, vertical = 4.dp),
-            )
+                    .size(30.dp)
+                    .clip(RoundedCornerShape(50))
+                    .background(MaterialTheme.colorScheme.primary)
+                    .clickable { onConnect() },
+                contentAlignment = Alignment.Center,
+            ) {
+                if (isActive) {
+                    Box(Modifier.size(10.dp).clip(RoundedCornerShape(50)).background(MaterialTheme.colorScheme.onPrimary))
+                } else {
+                    FlatIcon(UiIcon.PLAY, size = 16.dp, color = MaterialTheme.colorScheme.onPrimary)
+                }
+            }
         }
     }
 }
@@ -1947,9 +2102,15 @@ private fun ServerDetailDialog(
         onDismissRequest = onDismiss,
         title = { Text(name) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                // «Имя от сервера» — ВСЕГДА и НЕИЗМЕННО, даже когда задано своё (требование Elyor).
-                DetailRow("Имя от сервера", originalName)
+            // Промпт 96.B: контент ПРОКРУЧИВАЕМЫЙ — при крупных системных шрифтах он не влезает в высоту
+            // диалога и нижние кнопки («Переименовать»/«В стоп-лист») обрезались (выглядели как «пустая кнопка»).
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                // Промпт 96.D: «Имя от сервера» имеет смысл ТОЛЬКО когда задано своё имя (сверху своё в заголовке,
+                // тут исходное). Без переименования строка дублировала заголовок — скрываем.
+                if (hasCustomName) DetailRow("Имя от сервера", originalName)
                 DetailRow("Протокол", profile.protocol.name)
                 DetailRow("Адрес", "${profile.address}:${profile.port}")
                 DetailRow("Транспорт", profile.network)
@@ -1971,11 +2132,14 @@ private fun ServerDetailDialog(
                     )
                 }
                 Spacer(Modifier.height(8.dp))
-                // «Не использовать» (Промпт 91) — ОТДЕЛЬНО от стоп-листа: исключить из «Живых»/автовыбора/поиска,
-                // возврат на месте (глаз-переключатель, как в списках).
+                // «Не использовать» (отложить) — скрыт из «Живых»/автовыбора, ВИДЕН и возвращается в «Все серверы».
                 OutlinedButton(onClick = onTogglePause, modifier = Modifier.fillMaxWidth()) {
                     if (paused) ButtonLabel(UiIcon.EYE, "Использовать снова") else ButtonLabel(UiIcon.EYE_OFF, "Не использовать")
                 }
+                Text(
+                    if (paused) "Отложен: не в «Живых» и автовыборе; вернётся в список." else "Отложить: убрать из «Живых» и автовыбора (виден в «Все серверы»).",
+                    style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+                )
                 // Переименование (оверрайд по serverKey; remarks провайдера не трогаем).
                 OutlinedButton(onClick = onRename, modifier = Modifier.fillMaxWidth()) {
                     ButtonLabel(UiIcon.PENCIL, "Переименовать")
@@ -1985,10 +2149,15 @@ private fun ServerDetailDialog(
                         Text("Вернуть имя от сервера")
                     }
                 }
-                // Точечная блокировка ИМЕННО этого serverKey (не всех одноимённых).
+                // Точечная блокировка ИМЕННО этого serverKey (не всех одноимённых) — ОТЛИЧАЕТСЯ от «Не использовать».
                 OutlinedButton(onClick = onToggleBlock, modifier = Modifier.fillMaxWidth()) {
                     if (blockedByKey) Text("Убрать из стоп-листа") else ButtonLabel(UiIcon.BLOCK, "В стоп-лист")
                 }
+                Text(
+                    if (blockedByKey) "В стоп-листе: скрыт отовсюду; снять — здесь или Настройки → Стоп-лист."
+                    else "Стоп-лист: скрыть ОТОВСЮДУ (возврат через Настройки → Стоп-лист).",
+                    style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+                )
                 // Если сервер УЖЕ скрыт правилом-словом — точечное снятие не поможет, объясняем куда идти.
                 if (blockedByWord && !blockedByKey) {
                     Text(
@@ -2156,6 +2325,9 @@ private fun SettingsSection(
         SettingsGroupLabel("Прочее")
         BoolSettingRow("Автозапуск при старте", settings.autoStartOnLaunch, d.autoStartOnLaunch) {
             onChange(settings.copy(autoStartOnLaunch = it))
+        }
+        BoolSettingRow("Сообщать о новых версиях", settings.notifyNewVersions, d.notifyNewVersions) {
+            onChange(settings.copy(notifyNewVersions = it))
         }
         BoolSettingRow("Обходить системный VPN", settings.bypassSystemVpn, d.bypassSystemVpn) {
             onChange(settings.copy(bypassSystemVpn = it))
@@ -2876,6 +3048,146 @@ private fun ConfigRow(key: String, value: String) {
  * изменения, скачивание с прогрессом/отменой и «Установить» (СИСТЕМНЫЙ установщик — подтверждает
  * пользователь). Проверки суммы и подписи делает [UpdateInstaller] ДО передачи файла установщику.
  */
+// ─────────────────────── Отчёты о сбоях (Промпт 93.I) ───────────────────────
+
+private fun copyToClipboard(context: Context, text: String) {
+    runCatching {
+        val cm = context.getSystemService(ClipboardManager::class.java)
+        cm?.setPrimaryClip(ClipData.newPlainText("Отчёт о сбое", text))
+    }
+}
+
+private fun shareText(context: Context, text: String) {
+    runCatching {
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_SUBJECT, "XrayProxyDroid — отчёт о сбое")
+            putExtra(Intent.EXTRA_TEXT, text)
+        }
+        context.startActivity(Intent.createChooser(send, "Поделиться отчётом").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    }
+}
+
+/**
+ * Заметная полоса на ГЛАВНОЙ после падения (Промпт 93.B): приложение аварийно завершилось, есть отчёт.
+ * Кнопки «Скопировать»/«Поделиться» действуют на ПОСЛЕДНИЙ отчёт. Никакой автоотправки. Крестик — снять
+ * (пометить показанным; для следующего падения покажется снова).
+ */
+@Composable
+private fun CrashBanner(onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(Color(0xFFB71C1C))
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(
+                "Приложение аварийно завершилось — сохранён отчёт о сбое.",
+                style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold, color = Color.White,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                val btn = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color(0xFFB71C1C))
+                val pad = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                Button(onClick = { CrashReporter.reports().firstOrNull()?.let { copyToClipboard(context, CrashReporter.read(it)) } },
+                    colors = btn, contentPadding = pad) { Text("Скопировать") }
+                Button(onClick = { CrashReporter.reports().firstOrNull()?.let { shareText(context, CrashReporter.read(it)) } },
+                    colors = btn, contentPadding = pad) { Text("Поделиться") }
+            }
+            Text("Данные пересылаются только по вашему решению.", style = MaterialTheme.typography.bodySmall, color = Color(0xFFFFCDD2))
+        }
+        Text("✕", color = Color.White, fontWeight = FontWeight.Bold,
+            modifier = Modifier.clip(RoundedCornerShape(6.dp)).clickable { onDismiss() }.padding(8.dp))
+    }
+}
+
+/**
+ * Полоса «доступна новая версия» (Промпт 93.K) — в потоке экрана НАД списками (не модальное окно). Номер
+ * версии + «Обновить» (на экран обновления) + крестик (снять для ЭТОЙ версии; для следующей появится снова).
+ * Одно событие в двух местах (главная+настройки) — состояние в UpdateStore, отклонение снимает обе + уведомление.
+ */
+@Composable
+private fun UpdateBanner(versionName: String, onUpdate: () -> Unit, onDismiss: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(MaterialTheme.colorScheme.primaryContainer)
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text("Доступна новая версия", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onPrimaryContainer)
+            Text(versionName, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onPrimaryContainer)
+        }
+        Button(onClick = onUpdate, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)) {
+            ButtonLabel(UiIcon.REFRESH, "Обновить")
+        }
+        Text("✕", color = MaterialTheme.colorScheme.onPrimaryContainer, fontWeight = FontWeight.Bold,
+            modifier = Modifier.clip(RoundedCornerShape(6.dp)).clickable { onDismiss() }.padding(8.dp))
+    }
+}
+
+/**
+ * Раздел «Отчёты о сбоях» в настройках (Промпт 93.B): список сохранённых, просмотр, «Скопировать»/«Поделиться»,
+ * удаление. Данные уже вычищены от адресов/учёток при записи (Sanitizer).
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun CrashReportsSection() {
+    val context = LocalContext.current
+    var refresh by remember { mutableStateOf(0) }
+    val reports = remember(refresh) { CrashReporter.reports() }
+    var openText by remember { mutableStateOf<String?>(null) }
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (reports.isEmpty()) {
+            Text("Отчётов о сбоях нет.", style = MaterialTheme.typography.bodyMedium, color = TABLE_GRAY)
+        } else {
+            for (f in reports) {
+                val firstLines = CrashReporter.read(f).lineSequence().drop(1).take(2).joinToString(" · ")
+                Column(
+                    modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
+                        .background(lerp(MaterialTheme.colorScheme.surface, MaterialTheme.colorScheme.errorContainer, 0.25f))
+                        .padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(f.name.removePrefix("crash-").removeSuffix(".txt"), fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodyMedium)
+                    Text(firstLines, style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        TextButton(onClick = { openText = CrashReporter.read(f) }) { Text("Показать") }
+                        TextButton(onClick = { copyToClipboard(context, CrashReporter.read(f)) }) { Text("Скопировать") }
+                        TextButton(onClick = { shareText(context, CrashReporter.read(f)) }) { Text("Поделиться") }
+                        TextButton(onClick = { CrashReporter.delete(f); refresh++ }) { Text("Удалить") }
+                    }
+                }
+            }
+            OutlinedButton(onClick = { CrashReporter.clearAll(); refresh++ }, modifier = Modifier.fillMaxWidth()) {
+                Text("Очистить все")
+            }
+        }
+    }
+    val dlg = openText
+    if (dlg != null) {
+        AlertDialog(
+            onDismissRequest = { openText = null },
+            title = { Text("Отчёт о сбое") },
+            text = {
+                Text(dlg, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace,
+                    modifier = Modifier.verticalScroll(rememberScrollState()))
+            },
+            confirmButton = { TextButton(onClick = { copyToClipboard(context, dlg) }) { Text("Скопировать") } },
+            dismissButton = { TextButton(onClick = { openText = null }) { Text("Закрыть") } },
+        )
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun UpdateCheckSection() {
     val context = LocalContext.current
@@ -2945,6 +3257,8 @@ private fun UpdateCheckSection() {
             return
         }
         UpdateInstaller.launchInstaller(context, file)
+        // Промпт 93.J: обновление устанавливается → снять уведомление и полосу для этой версии.
+        NotificationHelper.cancelUpdate(context); UpdateStore.markDismissed(context)
     }
 
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {

@@ -55,153 +55,143 @@ object NetworkMonitor {
 
     private enum class SwitchResult { SWITCHED, ABORTED, NO_CANDIDATES }
 
+    /**
+     * Промпт 95 — ФАКТ-ПЕРВЫЙ цикл непрерывности связи. Работает ВСЕГДА, пока прокси активен (НЕ гейтится
+     * monitorEnabled — это ОСНОВНОЙ принцип, а не опция; monitorEnabled гейтит лишь вторичную оптимизацию
+     * «держать лучший»). ЖИВОСТЬ = ФАКТ прохождения запроса (внешний IP через SOCKS). Провал = мёртвый
+     * туннель → немедленная лестница восстановления. Проверка идёт и по расписанию, и по событиям (wake()).
+     */
     suspend fun loop(context: Context) {
         val app = context.applicationContext
         var failures = 0
-        var phase = "ok"            // ok | nonet | problem
-        var problemSince = 0L
-        var verdictActed = false
-        var lastSwitchMs = 0L
-        var backoffMs = 0L          // текущая пауза «нет интернета/нет замены» (0 = нет)
+        var backoffMs = 0L
         var cycles = 0
-        var lastOptimizeMs = now()  // Промпт 82: «держать самый быстрый» — первый перемер через monitorOptimizeSec
+        var lastSwitchMs = 0L
+        var lastOptimizeMs = now()
         Log.i(TAG, "monitor loop started")
 
         while (true) {
-            val s = SettingsStore.current()
-            if (!s.monitorEnabled) return                 // выключили — корутина завершается (сервис пересоздаст при включении)
-            if (!XrayController.isRunning || !ProxyState.state.value.running) return
+            if (!XrayController.isRunning || !ProxyState.state.value.running) { TunnelHealth.reset(); return }
 
-            // Интервал: в ЗДОРОВОМ состоянии — обычный; при ПАДЕНИИ (phase=="problem") — чаще (раз в минуту),
-            // чтобы быстрее переключиться на рабочий (Промпт 82). Прерываемый (wake() поднимает досрочно).
-            // Дешёвая проверка соединения (Промпт 90): в здоровом состоянии раз в connectionCheckIntervalSec
-            // (жив ли туннель — сигналы A/B ниже, ДЁШЕВО). Тяжёлый замер скачивания/отдачи — только по подозрению.
-            val waitSec = if (phase == "problem") s.monitorProblemIntervalSec.coerceAtLeast(30)
-                          else s.connectionCheckIntervalSec.coerceAtLeast(30)
+            // Интервал: при восстановлении/нет-серверов — чаще (быстрее вернуть связь); в норме — обычный.
+            // Прерываемый wake() — событийные триггеры (сеть/экран/передний план) поднимают ДОСРОЧНО.
+            val s = SettingsStore.current()
+            val ph = TunnelHealth.snapshot().phase
+            val recovering = ph == TunnelHealth.Phase.RECOVERING || ph == TunnelHealth.Phase.NO_SERVERS
+            val waitSec = if (recovering) s.monitorProblemIntervalSec.coerceAtLeast(15)
+                          else s.connectionCheckIntervalSec.coerceAtLeast(15)
             MonitorCoordinator.drainWakeups()
             MonitorCoordinator.awaitWake(waitSec * 1000L)
 
             val cur = SettingsStore.current()
-            if (!cur.monitorEnabled) return
-            if (!XrayController.isRunning || !ProxyState.state.value.running) return
-            if (MonitorCoordinator.fullTestRunning) continue   // ручной тест сам переключает — молчим
-
+            if (!XrayController.isRunning || !ProxyState.state.value.running) { TunnelHealth.reset(); return }
+            if (MonitorCoordinator.fullTestRunning) {
+                // Тест сам управляет переключением — лестницу НЕ запускаем. Но статус держим ЧЕСТНЫМ:
+                // нет интернета → сказать; иначе не трогаем (факт подтвердит UI-проверка/следующий цикл).
+                if (!directAlive()) TunnelHealth.setPhase(TunnelHealth.Phase.NO_INTERNET, now(), "нет интернета")
+                continue
+            }
             cycles++
 
-            // ── Оптимизация «держать самый быстрый» (Промпт 82) — ТОЛЬКО в здоровом состоянии, раз в
-            //    monitorOptimizeSec: перемер top-N по скорости и переход на быстрейший (>margin). ──
-            if (phase == "ok" && cur.monitorOptimizeSec > 0 && now() - lastOptimizeMs >= cur.monitorOptimizeSec * 1000L) {
-                lastOptimizeMs = now()
-                if (userTrafficActive()) {   // идёт живой трафик — не мешаем (Промпт 90.D)
-                    MonitorLog.event(app, "monitor", "Оптимизация пропущена", "идёт активный трафик")
-                } else {
-                    runCatching { optimizeToFastest(app, cur) }
-                        .onFailure { MonitorLog.event(app, "error", "Ошибка оптимизации", it.message ?: "") }
-                    if (!ProxyState.state.value.running) continue
-                }
-            }
-
-            // ── Сигнал A: нет интернета → пауза с удвоением, ДО любого перебора ──
+            // ── СИГНАЛ A: есть ли интернет ВООБЩЕ (прямой канал) — отличаем «нет интернета» от «нет серверов» ──
             if (!directAlive()) {
+                TunnelHealth.setPhase(TunnelHealth.Phase.NO_INTERNET, now(), "нет интернета")
+                NotificationHelper.cancelNoServers(app)   // это НЕ «нет серверов» — туннель не виноват
                 backoffMs = if (backoffMs == 0L) BACKOFF_START_MS else minOf(backoffMs * 2, BACKOFF_MAX_MS)
-                if (phase != "nonet") {
-                    MonitorLog.event(app, "net", "Пропал интернет", "пауза ${humanDur(backoffMs)}")
-                    phase = "nonet"; failures = 0; verdictActed = false
-                } else {
-                    MonitorLog.event(app, "net", "Интернета всё нет — пауза увеличена", humanDur(backoffMs))
-                }
-                MonitorStatus.update(true, "нет интернета, пауза ${humanDur(backoffMs)}", now(), cycles)
-                MonitorCoordinator.drainWakeups()
-                val woke = MonitorCoordinator.awaitWake(backoffMs)
-                if (woke) MonitorLog.event(app, "net", "Пробуждение (сеть/действие) — проверяю", "пауза длилась < ${humanDur(backoffMs)}")
-                continue
-            }
-            if (phase == "nonet") {
-                MonitorLog.event(app, "net", "Интернет появился", if (backoffMs > 0) "пауза сброшена" else "")
-                phase = "ok"; backoffMs = 0
-            }
-
-            // ── Сигнал B: туннель отвечает? (лёгкая проверка) ──
-            if (ExternalIpChecker.fetch() != null) {
-                onHealthy(app, phase, problemSince, "OK")
-                phase = "ok"; failures = 0; verdictActed = false; backoffMs = 0
-                MonitorStatus.update(true, "ок", now(), cycles)
-                continue
-            }
-
-            // Идёт активный трафик пользователя → туннель работает (сигнал B мог мигнуть). Тяжёлый замер НЕ
-            // гоняем — испортили бы и замер, и его загрузку (Промпт 90.D). Считаем здоровым.
-            if (userTrafficActive()) {
-                onHealthy(app, phase, problemSince, "трафик идёт")
-                phase = "ok"; failures = 0; verdictActed = false; backoffMs = 0
-                MonitorStatus.update(true, "ок (активный трафик)", now(), cycles)
-                continue
-            }
-
-            // ── Тяжёлый замер (лёгкая указала на проблему, живого трафика нет) ──
-            val directMbps = measureDirectMbps(app)
-            if (directMbps == null) {   // канал не тянет — считаем как нет интернета
-                backoffMs = if (backoffMs == 0L) BACKOFF_START_MS else minOf(backoffMs * 2, BACKOFF_MAX_MS)
-                if (phase != "nonet") { MonitorLog.event(app, "net", "Пропал интернет", "канал не тянет, пауза ${humanDur(backoffMs)}"); phase = "nonet" }
-                failures = 0; verdictActed = false
                 MonitorStatus.update(true, "нет интернета, пауза ${humanDur(backoffMs)}", now(), cycles)
                 MonitorCoordinator.drainWakeups(); MonitorCoordinator.awaitWake(backoffMs)
                 continue
             }
-            // Сопоставимый замер активного туннеля (тот же метод, что кандидаты). ОТДАЧА — только для лога, НЕ
-            // триггер переключения (Промпт 92: приёмник отдачи не верифицирован; низкая/провальная отдача НЕ
-            // должна ронять рабочий сервер и устраивать churn в фоне). Решение о падении — по СКАЧИВАНИЮ.
-            val tunnelMbps = ServerSpeedTester.measureActiveDownloadMbps(app)
-            val upMbps = ServerSpeedTester.measureActiveUploadMbps(app)
-            val weak = directMbps < cur.monitorDirectThreshold
-            val effThr = if (weak) maxOf(directMbps / 2, 0.05) else cur.monitorTunnelThreshold
-            if (tunnelMbps >= effThr) {
-                onHealthy(app, phase, problemSince, "↓${fmt(tunnelMbps)}/↑${fmt(upMbps)}")
-                phase = "ok"; failures = 0; verdictActed = false; backoffMs = 0
+
+            // ── СИГНАЛ B (ФАКТ): реальный запрос через SOCKS вернул внешний IP = связь РАБОТАЕТ ──
+            val ip = ExternalIpChecker.fetch()
+            if (ip != null) {
+                onRecovered(app)
+                TunnelHealth.ok(ip, now())
+                failures = 0; backoffMs = 0
                 MonitorStatus.update(true, "ок", now(), cycles)
+                // Вторичное: «держать лучший» — ТОЛЬКО если monitorEnabled, в норме, раз в monitorOptimizeSec, без живого трафика.
+                if (cur.monitorEnabled && cur.monitorOptimizeSec > 0 && now() - lastOptimizeMs >= cur.monitorOptimizeSec * 1000L && !userTrafficActive()) {
+                    lastOptimizeMs = now()
+                    runCatching { optimizeToFastest(app, cur) }.onFailure { MonitorLog.event(app, "error", "Ошибка оптимизации", it.message ?: "") }
+                }
                 continue
             }
 
-            // ── ПАДЕНИЕ (скачивание ниже порога) ──
-            failures++
-            if (phase != "problem") { problemSince = now(); phase = "problem" }
-            val reason = "скачивание ${fmt(tunnelMbps)} < ${fmt(effThr)} (отдача ${fmt(upMbps)})" +
-                if (weak) " (слабый интернет, прямой ${fmt(directMbps)})" else " (прямой ${fmt(directMbps)})"
-            MonitorStatus.update(true, "падение ($failures)", now(), cycles)
-            if (failures == 1) MonitorLog.event(app, "monitor", "Туннель: первая неудача", reason)
+            // Живой трафик пользователя — тоже ФАКТ работы туннеля (сигнал B мог мигнуть).
+            if (userTrafficActive()) {
+                onRecovered(app)
+                TunnelHealth.ok(TunnelHealth.snapshot().ip, now())
+                failures = 0; backoffMs = 0
+                MonitorStatus.update(true, "ок (активный трафик)", now(), cycles)
+                continue
+            }
 
-            if (failures >= cur.monitorFailuresToVerdict && !verdictActed) {
-                verdictActed = true
-                if (now() - lastSwitchMs < SWITCH_THROTTLE_MS) {
-                    MonitorLog.event(app, "monitor", "Падение — переключение отложено", "$reason · троттлинг 60с")
-                } else {
-                    MonitorLog.event(app, "monitor", "Падение туннеля — ищу замену", reason)
-                    when (runSwitchSearch(app, cur)) {
-                        SwitchResult.SWITCHED -> {
-                            lastSwitchMs = now(); phase = "ok"; failures = 0; verdictActed = false; backoffMs = 0
-                            MonitorPrompt.resetDeclined()
-                        }
-                        SwitchResult.ABORTED -> { /* пользователь вмешался — оставляем как есть до следующего цикла */ }
-                        SwitchResult.NO_CANDIDATES -> {
-                            backoffMs = if (backoffMs == 0L) BACKOFF_START_MS else minOf(backoffMs * 2, BACKOFF_MAX_MS)
-                            MonitorLog.event(app, "monitor", "Замену не нашёл — пауза ${humanDur(backoffMs)}", "")
-                            MonitorStatus.update(true, "нет замены, пауза ${humanDur(backoffMs)}", now(), cycles)
-                            MonitorCoordinator.drainWakeups(); MonitorCoordinator.awaitWake(backoffMs)
-                        }
-                    }
+            // ── СВЯЗИ НЕТ (факт: запрос не прошёл) → ЛЕСТНИЦА ВОССТАНОВЛЕНИЯ (сама, без пользователя) ──
+            failures++
+            TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "восстановление…")
+            MonitorStatus.update(true, "восстановление ($failures)", now(), cycles)
+            if (failures == 1) MonitorLog.event(app, "monitor", "Связь не подтверждена — восстанавливаю", "внешний IP не получен")
+            if (failures < cur.monitorFailuresToVerdict) continue   // короткий анти-дребезг (одиночная миганка)
+
+            when (runRecoveryLadder(app, cur)) {
+                SwitchResult.SWITCHED -> {
+                    lastSwitchMs = now(); failures = 0; backoffMs = 0
+                    val ip2 = ExternalIpChecker.fetch()   // подтвердить ФАКТОМ сразу
+                    if (ip2 != null) { TunnelHealth.ok(ip2, now()); onRecovered(app) }
+                    else TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "проверяю после переключения…")
+                }
+                SwitchResult.ABORTED -> { /* пользователь вмешался — оставляем как есть */ }
+                SwitchResult.NO_CANDIDATES -> {
+                    // РАБОЧИХ СЕРВЕРОВ НЕТ НИ ОДНИМ СПОСОБОМ — СКАЗАТЬ ПРЯМО (Промпт 95.E) + уведомление в шторке.
+                    TunnelHealth.setPhase(TunnelHealth.Phase.NO_SERVERS, now(), "рабочих серверов нет")
+                    NotificationHelper.notifyNoServers(app)
+                    backoffMs = if (backoffMs == 0L) BACKOFF_START_MS else minOf(backoffMs * 2, BACKOFF_MAX_MS)
+                    MonitorLog.event(app, "monitor", "Рабочих серверов нет — пауза ${humanDur(backoffMs)}", "выход по любому событию")
+                    MonitorStatus.update(true, "нет рабочих серверов, пауза ${humanDur(backoffMs)}", now(), cycles)
+                    MonitorCoordinator.drainWakeups(); MonitorCoordinator.awaitWake(backoffMs)
                 }
             }
         }
     }
 
-    /** Переход в здоровое состояние: восстановление (со временем простоя) — событие; рутину не пишем. */
-    private fun onHealthy(context: Context, prevPhase: String, problemSince: Long, tunnelStr: String) {
-        if (prevPhase == "problem") {
-            MonitorLog.event(context, "monitor", "Восстановление туннеля", "скорость $tunnelStr, длилось ${humanDur(now() - problemSince)}")
-        }
-        // Здоровы → снимаем предложение включить источники (если висело) и разрешаем спрашивать снова.
+    /** Связь подтверждена — снять предложения/уведомления «нет серверов»/«включить источники». */
+    private fun onRecovered(context: Context) {
         if (MonitorPrompt.pending) { MonitorPrompt.clear(); NotificationHelper.cancelEnableSources(context) }
         MonitorPrompt.resetDeclined()
+        NotificationHelper.cancelNoServers(context)
+    }
+
+    /**
+     * ЛЕСТНИЦА ВОССТАНОВЛЕНИЯ (Промпт 95.C), сама, по порядку:
+     *  1) ПЕРЕЗАПУСК ЯДРА на том же сервере (после смены сети соединения привязаны к ушедшей сети, сами не оживают);
+     *  2–5) перебор живых сверху вниз → обновить подписки → перебор заново → предложить включить источники.
+     * После каждой ступени — подтверждение ФАКТОМ (внешний IP). Отменяется, если вмешался пользователь.
+     */
+    private suspend fun runRecoveryLadder(app: Context, s: AppSettings): SwitchResult {
+        MonitorCoordinator.monitorSearchRunning = true
+        try {
+            val startKey = ProxyState.state.value.serverKey
+            // Ступень 1: перезапуск ядра на ТОМ ЖЕ сервере.
+            if (startKey != null && !aborted(startKey)) {
+                val curSrv = SubscriptionManager.allServers(app).firstOrNull { SubscriptionManager.serverKey(it) == startKey }
+                val cfg = curSrv?.let { runCatching { XrayConfigBuilder.build(it) }.getOrNull() }
+                if (curSrv != null && cfg != null) {
+                    MonitorLog.event(app, "monitor", "Восстановление 1: перезапуск ядра", ServerLabels.display(curSrv))
+                    TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "перезапуск ядра…")
+                    XrayProxyService.start(app, cfg, ServerLabels.full(curSrv), startKey)
+                    var waited = 0
+                    while (waited < 8000 && (!ProxyState.state.value.running || ProxyState.state.value.serverKey != startKey)) { delay(500); waited += 500 }
+                    delay(1500)
+                    if (aborted(startKey)) return SwitchResult.ABORTED
+                    if (ExternalIpChecker.fetch() != null) { MonitorLog.event(app, "monitor", "Восстановление: перезапуск ядра помог", ""); return SwitchResult.SWITCHED }
+                }
+            }
+            // Ступени 2–5.
+            return runSwitchSearchInner(app, s)
+        } finally {
+            MonitorCoordinator.monitorSearchRunning = false
+        }
     }
 
     // ---- Перебор кандидатов / переключение ----
