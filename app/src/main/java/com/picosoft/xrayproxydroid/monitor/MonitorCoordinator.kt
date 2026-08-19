@@ -51,16 +51,8 @@ object MonitorCoordinator {
     // CONFLATED: держим максимум один сигнал; несколько wake() подряд = одно пробуждение.
     private val wakeups = Channel<Unit>(Channel.CONFLATED)
 
-    // Промпт 98.B: событие требует ПОЛНОЙ перепроверки (смена сети/экран/действие), а не дешёвого пропуска
-    // «недавно было ОК». Возврат на передний план (частое переключение приложений) — force=false: если связь
-    // подтверждена совсем недавно, повторный сетевой запрос не оправдан.
-    private val forceRecheck = AtomicBoolean(false)
-
-    /** Разбудить монитор. force=true — сеть/экран/действие: перепроверить связь фактом, не пропускать по «недавно ок». */
-    fun wake(force: Boolean = false) { if (force) forceRecheck.set(true); wakeups.trySend(Unit) }
-
-    /** Прочитать и сбросить требование полной перепроверки (один раз за цикл монитора). */
-    fun consumeForceRecheck(): Boolean = forceRecheck.getAndSet(false)
+    /** Разбудить монитор (сеть появилась / пользователь подключился или запустил тест). */
+    fun wake() { wakeups.trySend(Unit) }
 
     /** Съесть накопленные сигналы перед началом ожидания, чтобы «спать» реально до нового события. */
     fun drainWakeups() { while (wakeups.tryReceive().isSuccess) { /* drain */ } }

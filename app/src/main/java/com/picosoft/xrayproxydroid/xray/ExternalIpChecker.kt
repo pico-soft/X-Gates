@@ -17,10 +17,7 @@ import java.net.URL
 object ExternalIpChecker {
 
     private const val TAG = "ExternalIpChecker"
-    // Промпт 98: короче прежних 5с — живой туннель отвечает за 1–3с, а «холодный после простоя» первый запрос
-    // всё равно может не успеть; на это есть ПОВТОР у вызывающих ([NetworkMonitor.probeExternalIp]/[fetchConfirmed]),
-    // а не длинный единичный таймаут. Короткий таймаут ускоряет и обнаружение реально мёртвого туннеля.
-    private const val TIMEOUT_MS = 3_500
+    private const val TIMEOUT_MS = 5_000
 
     private val endpoints = listOf(
         "https://api.ipify.org",
@@ -55,20 +52,5 @@ object ExternalIpChecker {
             }
         }
         return null
-    }
-
-    /**
-     * Промпт 98.A: подтверждённая проверка. Холодный туннель после простоя (возврат из фона/Doze) может НЕ
-     * ответить на ПЕРВЫЙ запрос — это ещё не смерть. Если первый запрос пуст, короткий прогрев и ОДИН повтор,
-     * прежде чем вернуть null. Блокирующий — вызывать с фонового потока. Логирует длительность и исход.
-     */
-    fun fetchConfirmed(socksPort: Int = XrayConfig.SOCKS_PORT, retryGapMs: Long = 1_500): String? {
-        val t0 = System.currentTimeMillis()
-        fetch(socksPort)?.let { return it }
-        try { Thread.sleep(retryGapMs) } catch (_: InterruptedException) { return null }
-        val ip = fetch(socksPort)
-        Log.i(TAG, if (ip != null) "подтверждено со 2-й попытки за ${System.currentTimeMillis() - t0} мс"
-                   else "нет ответа даже с повтором за ${System.currentTimeMillis() - t0} мс")
-        return ip
     }
 }

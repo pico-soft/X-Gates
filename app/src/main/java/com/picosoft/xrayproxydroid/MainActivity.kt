@@ -916,9 +916,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
         if (!ProxyState.state.value.running) return
         externalIp = "…"
         Thread {
-            // Промпт 98.A: холодный туннель после простоя может не ответить на первый запрос — повтор с прогревом,
-            // чтобы значок не мигал «проверяю» на живом туннеле при возврате на передний план.
-            val ip = ExternalIpChecker.fetchConfirmed()
+            val ip = ExternalIpChecker.fetch()
             val nowMs = System.currentTimeMillis()
             // Промпт 95: результат — в единый ФАКТ-статус. Успех = OK (зелёный); провал = связь не подтверждена
             // (монитор запустит лестницу восстановления). Не оставляем «зелёный + прочерк».
