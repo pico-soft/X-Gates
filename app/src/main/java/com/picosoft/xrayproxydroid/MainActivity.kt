@@ -1741,6 +1741,17 @@ private fun StatusBox(
                 }
             }
         }
+        // Тонкий индикатор процесса замера текущего соединения (кнопка «Проверить»). Неопределённый: проверка —
+        // это последовательность шагов (замер активного туннеля → перебор кандидатов), чистой доли нет.
+        if (checking) {
+            Spacer(Modifier.height(6.dp))
+            LinearProgressIndicator(
+                modifier = Modifier.fillMaxWidth().height(2.dp),
+                color = fg,
+                trackColor = fg.copy(alpha = 0.20f),
+                strokeCap = StrokeCap.Round,
+            )
+        }
         if (checkStatus.isNotEmpty()) {
             Text(checkStatus, style = MaterialTheme.typography.bodySmall, color = fg, fontWeight = FontWeight.Bold)
         }
