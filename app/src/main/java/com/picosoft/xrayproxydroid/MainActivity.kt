@@ -3354,6 +3354,17 @@ private fun UpdateCheckSection() {
         }.start()
     }
 
+    fun install(file: File) {
+        if (!UpdateInstaller.canInstall(context)) {
+            message = "Нужно разрешить установку приложений из этого источника — открываю системный экран. После разрешения нажмите «Установить»."
+            UpdateInstaller.openInstallPermissionSettings(context)
+            return
+        }
+        UpdateInstaller.launchInstaller(context, file)
+        // Промпт 93.J: обновление устанавливается → снять уведомление и полосу для этой версии.
+        NotificationHelper.cancelUpdate(context); UpdateStore.markDismissed(context)
+    }
+
     fun startDownload(available: UpdateCheckResult.Available) {
         if (downloading) return
         downloading = true; cancelFlag = false; downloaded = 0L
@@ -3375,7 +3386,10 @@ private fun UpdateCheckSection() {
                 when (outcome) {
                     is UpdateInstaller.DownloadOutcome.Ok -> {
                         readyFile = outcome.file
-                        message = "Файл проверен (контрольная сумма и подпись). Нажмите «Установить» — откроется системный установщик, подтверждаете вы."
+                        // Промпт: «Скачать и установить» без второго тапа — сумма и подпись уже сверены, сразу
+                        // запускаем системный установщик (подтверждение установки — уже в системном окне Android).
+                        message = "Файл проверен (сумма и подпись). Открывается системный установщик — подтвердите установку."
+                        install(outcome.file)
                     }
                     is UpdateInstaller.DownloadOutcome.Fail -> {
                         readyFile = null
@@ -3385,17 +3399,6 @@ private fun UpdateCheckSection() {
                 }
             }
         }.start()
-    }
-
-    fun install(file: File) {
-        if (!UpdateInstaller.canInstall(context)) {
-            message = "Нужно разрешить установку приложений из этого источника — открываю системный экран."
-            UpdateInstaller.openInstallPermissionSettings(context)
-            return
-        }
-        UpdateInstaller.launchInstaller(context, file)
-        // Промпт 93.J: обновление устанавливается → снять уведомление и полосу для этой версии.
-        NotificationHelper.cancelUpdate(context); UpdateStore.markDismissed(context)
     }
 
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -3428,12 +3431,34 @@ private fun UpdateCheckSection() {
             Text("Проверка ещё не выполнялась.", style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
         }
 
-        Button(onClick = { startCheck() }, enabled = !checking && !downloading, modifier = Modifier.fillMaxWidth()) {
-            if (checking) Text("Проверяю…") else ButtonLabel(UiIcon.REFRESH, "Проверить обновление")
+        // ЕДИНАЯ основная кнопка НА ОДНОМ МЕСТЕ (Промпт): нет обновления → «Проверить обновление»; после
+        // проверки, если обновление есть → «Скачать и установить» (качает и СРАЗУ запускает системный
+        // установщик, без второго тапа в приложении); файл скачан, но установка не запустилась (не выдано
+        // разрешение) → «Установить» для повтора после выдачи разрешения.
+        val avail = live as? UpdateCheckResult.Available
+        Button(
+            onClick = {
+                when {
+                    checking || downloading -> {}
+                    readyFile != null -> install(readyFile!!)
+                    avail != null -> startDownload(avail)
+                    else -> startCheck()
+                }
+            },
+            enabled = !checking && !downloading,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            when {
+                checking -> Text("Проверяю…")
+                downloading -> Text("Скачиваю…")
+                readyFile != null -> ButtonLabel(UiIcon.PLAY, "Установить")
+                avail != null -> ButtonLabel(UiIcon.PLAY, "Скачать и установить" + if (avail.sizeBytes > 0) " (${fmtBytes(avail.sizeBytes)})" else "")
+                else -> ButtonLabel(UiIcon.REFRESH, "Проверить обновление")
+            }
         }
 
-        // Подтверждённое обновление (update.json): размер, изменения, скачивание/установка.
-        val avail = live as? UpdateCheckResult.Available
+        // Подтверждённое обновление (update.json): версия, размер, сеть, изменения + прогресс скачивания.
+        // Сами кнопки скачивания/установки убраны — действие на ЕДИНОЙ кнопке выше.
         if (avail != null) {
             Text("Новая версия: ${avail.versionName}",
                 style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
@@ -3442,8 +3467,8 @@ private fun UpdateCheckSection() {
                     (if (avail.usingUniversal) " · универсальная сборка (нет точной под вашу архитектуру)" else ""),
                 style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
             )
-            // Тип сети — ЗАРАНЕЕ, до нажатия (Промпт 91.G): решение принимается один раз и осознанно. Мобильная
-            // сеть — не диалог, а ЗАМЕТНАЯ пометка рядом с размером. Нажатие «Скачать» = согласие, без переспроса.
+            // Тип сети — ЗАРАНЕЕ, до нажатия (Промпт 91.G): решение осознанное. Мобильная сеть — заметная пометка;
+            // нажатие «Скачать и установить» = согласие, без переспроса.
             if (isMeteredNetwork(context)) {
                 Text(
                     "⚠ Мобильная сеть — скачивание израсходует мобильный трафик" +
@@ -3455,31 +3480,21 @@ private fun UpdateCheckSection() {
             }
             if (avail.notes.isNotBlank()) Text(avail.notes, style = MaterialTheme.typography.bodySmall)
 
-            when {
-                downloading -> {
-                    val frac = if (totalBytes > 0) (downloaded.toFloat() / totalBytes).coerceIn(0f, 1f) else 0f
-                    if (totalBytes > 0) LinearProgressIndicator(progress = { frac }, modifier = Modifier.fillMaxWidth())
-                    else LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                    Text(
-                        if (totalBytes > 0) "Скачано ${fmtBytes(downloaded)} из ${fmtBytes(totalBytes)} (${(frac * 100).roundToInt()}%)"
-                        else "Скачано ${fmtBytes(downloaded)}",
-                        style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
-                    )
-                    OutlinedButton(onClick = { cancelFlag = true }, modifier = Modifier.fillMaxWidth()) { Text("Отменить") }
-                }
-                readyFile != null -> {
-                    Button(onClick = { install(readyFile!!) }, modifier = Modifier.fillMaxWidth()) { Text("Установить") }
-                }
-                else -> {
-                    // Промпт 91.G: нажатие = согласие → скачивание начинается СРАЗУ, без диалога-переспроса.
-                    Button(onClick = { startDownload(avail) }, modifier = Modifier.fillMaxWidth()) {
-                        Text("Скачать" + if (avail.sizeBytes > 0) " (${fmtBytes(avail.sizeBytes)})" else "")
-                    }
-                    Text(
-                        "Скачаем файл, сверим контрольную сумму и подпись с установленным приложением, затем откроется системный установщик — подтверждаете вы.",
-                        style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
-                    )
-                }
+            if (downloading) {
+                val frac = if (totalBytes > 0) (downloaded.toFloat() / totalBytes).coerceIn(0f, 1f) else 0f
+                if (totalBytes > 0) LinearProgressIndicator(progress = { frac }, modifier = Modifier.fillMaxWidth())
+                else LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                Text(
+                    if (totalBytes > 0) "Скачано ${fmtBytes(downloaded)} из ${fmtBytes(totalBytes)} (${(frac * 100).roundToInt()}%)"
+                    else "Скачано ${fmtBytes(downloaded)}",
+                    style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+                )
+                OutlinedButton(onClick = { cancelFlag = true }, modifier = Modifier.fillMaxWidth()) { Text("Отменить") }
+            } else if (readyFile == null) {
+                Text(
+                    "Скачаем файл, сверим контрольную сумму и подпись с установленным приложением, затем откроется системный установщик — подтверждаете вы.",
+                    style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+                )
             }
         }
 
