@@ -55,6 +55,13 @@ object NetworkMonitor {
 
     private enum class SwitchResult { SWITCHED, ABORTED, NO_CANDIDATES }
 
+    // Промпт 102 (ГЛАВНЫЙ ФИКС): ключ сервера, ядро которого УЖЕ перезапускали в текущем эпизоде обрыва.
+    // ПОЧЕМУ: перезапуск ядра (шаг 1 лестницы) через XrayProxyService.start ставит running=false → сервис
+    // пересоздаёт корутину монитора и УБИВАЕТ идущую лестницу ещё ДО перебора серверов; новый монитор снова
+    // делает шаг 1 → ВЕЧНЫЙ ЦИКЛ на мёртвом сервере (подтверждено логами P102). Поле object'а переживает рестарт
+    // монитора: один и тот же сервер повторно НЕ перезапускаем — сразу к перебору живых. Сбрасывается при OK.
+    @Volatile private var restartedKeySinceOk: String? = null
+
     /**
      * Промпт 95 — ФАКТ-ПЕРВЫЙ цикл непрерывности связи. Работает ВСЕГДА, пока прокси активен (НЕ гейтится
      * monitorEnabled — это ОСНОВНОЙ принцип, а не опция; monitorEnabled гейтит лишь вторичную оптимизацию
@@ -108,7 +115,7 @@ object NetworkMonitor {
             if (ip != null) {
                 onRecovered(app)
                 TunnelHealth.ok(ip, now())
-                failures = 0; backoffMs = 0
+                failures = 0; backoffMs = 0; restartedKeySinceOk = null   // Промпт 102: связь ок — сбросить «уже перезапускали»
                 MonitorStatus.update(true, "ок", now(), cycles)
                 // Вторичное: «держать лучший» — ТОЛЬКО если monitorEnabled, в норме, раз в monitorOptimizeSec, без живого трафика.
                 if (cur.monitorEnabled && cur.monitorOptimizeSec > 0 && now() - lastOptimizeMs >= cur.monitorOptimizeSec * 1000L && !userTrafficActive()) {
@@ -122,7 +129,7 @@ object NetworkMonitor {
             if (userTrafficActive()) {
                 onRecovered(app)
                 TunnelHealth.ok(TunnelHealth.snapshot().ip, now())
-                failures = 0; backoffMs = 0
+                failures = 0; backoffMs = 0; restartedKeySinceOk = null   // Промпт 102
                 MonitorStatus.update(true, "ок (активный трафик)", now(), cycles)
                 continue
             }
@@ -172,11 +179,17 @@ object NetworkMonitor {
         MonitorCoordinator.monitorSearchRunning = true
         try {
             val startKey = ProxyState.state.value.serverKey
-            // Ступень 1: перезапуск ядра на ТОМ ЖЕ сервере.
-            if (startKey != null && !aborted(startKey)) {
+            // Ступень 1: перезапуск ядра на ТОМ ЖЕ сервере — ТОЛЬКО ОДИН РАЗ за эпизод обрыва (Промпт 102).
+            // Если этот сервер уже перезапускали и связь не вернулась — перезапуск бесполезен (сервер мёртв) И
+            // вдобавок убивает лестницу (см. restartedKeySinceOk). Пропускаем шаг 1 → сразу перебор живых серверов.
+            val alreadyRestarted = startKey != null && startKey == restartedKeySinceOk
+            if (startKey != null && !aborted(startKey) && !alreadyRestarted) {
                 val curSrv = SubscriptionManager.allServers(app).firstOrNull { SubscriptionManager.serverKey(it) == startKey }
                 val cfg = curSrv?.let { runCatching { XrayConfigBuilder.build(it) }.getOrNull() }
                 if (curSrv != null && cfg != null) {
+                    // Отметить ДО start: XrayProxyService.start ставит running=false → монитор (и эта корутина)
+                    // пересоздаётся, код НИЖЕ может не выполниться; флаг object'а переживёт рестарт.
+                    restartedKeySinceOk = startKey
                     MonitorLog.event(app, "monitor", "Восстановление 1: перезапуск ядра", ServerLabels.display(curSrv))
                     TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "перезапуск ядра…")
                     XrayProxyService.start(app, cfg, ServerLabels.full(curSrv), startKey)
