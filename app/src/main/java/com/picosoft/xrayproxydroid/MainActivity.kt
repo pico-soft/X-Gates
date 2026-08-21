@@ -38,6 +38,7 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
@@ -101,6 +102,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -142,6 +145,7 @@ import com.picosoft.xrayproxydroid.ui.TestProgress
 import com.picosoft.xrayproxydroid.update.UpdateCheckResult
 import com.picosoft.xrayproxydroid.update.UpdateChecker
 import com.picosoft.xrayproxydroid.update.UpdateInstaller
+import com.picosoft.xrayproxydroid.update.UpdateFlowController
 import com.picosoft.xrayproxydroid.update.UpdateStore
 import com.picosoft.xrayproxydroid.ui.theme.XrayProxyDroidTheme
 import com.picosoft.xrayproxydroid.xray.ExternalIpChecker
@@ -307,12 +311,11 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
         contentPadding = PaddingValues(vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        // Полоса «новая версия» (Промпт 93.K) — одно событие в двух местах; «Обновить» листает к разделу обновления.
+        // Полоса «новая версия» (Промпт 93.K) — одно событие в двух местах; тап по плашке = скачать+установить.
         if (settings.notifyNewVersions && updateRec.availCode > BuildConfig.VERSION_CODE && updateRec.availCode != updateRec.dismissedCode) {
             item {
                 UpdateBanner(
                     versionName = updateRec.availName,
-                    onUpdate = { scope.launch { runCatching { listState.animateScrollToItem(Int.MAX_VALUE) } } },
                     onDismiss = { UpdateStore.markDismissed(context); NotificationHelper.cancelUpdate(context) },
                 )
             }
@@ -754,10 +757,13 @@ private fun FlatIcon(
 
 /** Метка кнопки: плоская иконка + текст (внутри RowScope кнопки), единый стиль во всех кнопках. */
 @Composable
-private fun ButtonLabel(icon: UiIcon, text: String) {
-    FlatIcon(icon, size = 16.dp)
-    Spacer(Modifier.width(6.dp))
-    Text(text)
+private fun ButtonLabel(
+    icon: UiIcon, text: String,
+    iconSize: Dp = 16.dp, fontSize: TextUnit = TextUnit.Unspecified, fontWeight: FontWeight? = null,
+) {
+    FlatIcon(icon, size = iconSize)
+    Spacer(Modifier.width(if (iconSize >= 20.dp) 8.dp else 6.dp))
+    Text(text, fontSize = fontSize, fontWeight = fontWeight)
 }
 
 private fun serverLabel(p: ServerProfile, bl: Blocklist): String =
@@ -1028,11 +1034,22 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                             fullTesting = false; fullHandle = null
                             MonitorCoordinator.fullTestRunning = false   // тест закончился — монитор снова может работать
                             MonitorCoordinator.fullTestCancel = null; CrashContext.set("простой")
+                            // «Готово» БЕЗ числа скорости: единый источник правды по скорости — ЖИВАЯ плашка
+                            // (иначе «готово: 47» из temp-инстанса конфликтует с живым замером туннеля на плашке).
                             TestProgress.finish(                             // бар гаснет, итог остаётся текстом
-                                if (r.cancelled) "отменено"
-                                else "готово: быстрейший ${r.fastest?.remarks?.ifBlank { r.fastest.address } ?: "—"} ${r.fastestMbps} Мбит/с"
+                                if (r.cancelled) "Отменено"
+                                else r.connected?.let { "Готово · подключён к ${it.remarks.ifBlank { it.address }}" }
+                                    ?: "Готово · рабочих серверов не нашлось"
                             )
                             reloadServers()
+                            // A (обратная связь после 0.23): активный сервер ПРИОРИТЕТНО — реальную скорость на
+                            // плашку СРАЗУ (не ждём цикл монитора), чтобы число совпадало с «Готово» и не было «—».
+                            if (!r.cancelled && r.connected != null) {
+                                Thread {
+                                    Thread.sleep(1500)   // дать туннелю осесть после подключения
+                                    runCatching { NetworkMonitor.probeActiveSpeedNow(context) }
+                                }.start()
+                            }
                         }
                     }.start()
                 }
@@ -1364,7 +1381,6 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                 if (settings.notifyNewVersions && updateRec.availCode > BuildConfig.VERSION_CODE && updateRec.availCode != updateRec.dismissedCode) {
                     UpdateBanner(
                         versionName = updateRec.availName,
-                        onUpdate = onOpenUpdate,
                         onDismiss = { UpdateStore.markDismissed(context); NotificationHelper.cancelUpdate(context) },
                     )
                 }
@@ -1771,14 +1787,18 @@ private fun StatusBox(
         Spacer(Modifier.height(4.dp))
         val solid = ButtonDefaults.buttonColors(containerColor = fg, contentColor = bg)
         val subtle = ButtonDefaults.buttonColors(containerColor = fg.copy(alpha = 0.22f), contentColor = fg)
-        val pad = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = { if (checking) onCancelCheck() else onCheck() }, colors = solid, contentPadding = pad) {
-                ButtonLabel(if (checking) UiIcon.STOP else UiIcon.REFRESH, if (checking) "Прервать проверку" else "Проверить")
+        // КОМПАКТНЫЕ и В ОДИН РЯД (просьба Elyor): мелкие паддинги/иконка/шрифт, оба чипа рядом в одной строке —
+        // не отвлекают от активного сервера и от главной кнопки «Самый быстрый».
+        val pad = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+            Button(onClick = { if (checking) onCancelCheck() else onCheck() }, colors = solid, contentPadding = pad,
+                modifier = Modifier.heightIn(min = 0.dp)) {
+                ButtonLabel(if (checking) UiIcon.STOP else UiIcon.REFRESH, if (checking) "Прервать проверку" else "Проверить",
+                    iconSize = 12.dp, fontSize = 12.sp)
             }
             if (running && !checking) {
-                Button(onClick = onExclude, colors = subtle, contentPadding = pad) {
-                    ButtonLabel(UiIcon.EYE_OFF, "Не использовать")
+                Button(onClick = onExclude, colors = subtle, contentPadding = pad, modifier = Modifier.heightIn(min = 0.dp)) {
+                    ButtonLabel(UiIcon.EYE_OFF, "Не использовать", iconSize = 12.dp, fontSize = 12.sp)
                 }
             }
         }
@@ -1908,17 +1928,27 @@ private fun ActionsBar(
     onCancelFull: () -> Unit,
     onStop: () -> Unit,
 ) {
-    FlowRow(
+    Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
+        // ГЛАВНОЕ ДЕЙСТВИЕ (просьба Elyor: заметнее) — «Самый быстрый» занимает БОЛЬШУЮ часть ряда (weight),
+        // высокая, крупный жирный текст+иконка. «Стоп» — компактная справа, В ОДНОМ РЯДУ.
         if (fullTesting || refreshingSubs) {
-            Button(onClick = onCancelFull) { Text(if (refreshingSubs) "Обновление…" else "Прервать") }
+            Button(onClick = onCancelFull, modifier = Modifier.weight(1f),
+                contentPadding = PaddingValues(vertical = 12.dp)) {
+                ButtonLabel(UiIcon.STOP, if (refreshingSubs) "Обновление…" else "Прервать", iconSize = 20.dp, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+            }
         } else {
-            Button(onClick = onFullTest) { ButtonLabel(UiIcon.PLAY, "Самый быстрый") }
+            Button(onClick = onFullTest, modifier = Modifier.weight(1f),
+                contentPadding = PaddingValues(vertical = 14.dp)) {
+                ButtonLabel(UiIcon.PLAY, "Самый быстрый", iconSize = 24.dp, fontSize = 19.sp, fontWeight = FontWeight.Bold)
+            }
         }
-        OutlinedButton(onClick = onStop, enabled = running) { ButtonLabel(UiIcon.STOP, "Стоп") }
+        OutlinedButton(onClick = onStop, enabled = running, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)) {
+            ButtonLabel(UiIcon.STOP, "Стоп")
+        }
     }
 }
 
@@ -3276,26 +3306,52 @@ private fun CrashBanner(onDismiss: () -> Unit) {
  * Одно событие в двух местах (главная+настройки) — состояние в UpdateStore, отклонение снимает обе + уведомление.
  */
 @Composable
-private fun UpdateBanner(versionName: String, onUpdate: () -> Unit, onDismiss: () -> Unit) {
-    Row(
+private fun UpdateBanner(versionName: String, onDismiss: () -> Unit) {
+    // ОДИН ТАП по плашке = скачать и установить (без лишних тапов): контроллер проверит при необходимости,
+    // скачает, сверит сумму+подпись и откроет системный установщик. Прогресс/отмена — прямо на плашке.
+    val context = LocalContext.current
+    val phase by UpdateFlowController.phase.collectAsState()
+    val dl = phase as? UpdateFlowController.Phase.Downloading
+    val busy = dl != null || phase is UpdateFlowController.Phase.Checking
+    Column(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(10.dp))
             .background(MaterialTheme.colorScheme.primaryContainer)
+            .clickable(enabled = !busy) { UpdateFlowController.oneTap(context) }
             .padding(horizontal = 12.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        Column(modifier = Modifier.weight(1f)) {
-            Text("Доступна новая версия", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onPrimaryContainer)
-            Text(versionName, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onPrimaryContainer)
+        val fg = MaterialTheme.colorScheme.onPrimaryContainer
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Доступна новая версия", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold, color = fg)
+                val sub = when (val p = phase) {
+                    is UpdateFlowController.Phase.Checking -> "Проверяю обновление…"
+                    is UpdateFlowController.Phase.Downloading ->
+                        if (p.total > 0) "Скачиваю ${p.done * 100 / p.total}% · ${fmtBytes(p.done)} из ${fmtBytes(p.total)}"
+                        else "Скачиваю ${fmtBytes(p.done)}…"
+                    is UpdateFlowController.Phase.NeedPermission -> "Разрешите установку и нажмите ещё раз"
+                    is UpdateFlowController.Phase.Failed -> p.message
+                    else -> "$versionName · нажмите, чтобы обновить"
+                }
+                Text(sub, style = MaterialTheme.typography.bodySmall, color = fg)
+            }
+            if (busy) {
+                Text("Отмена", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold, color = fg,
+                    modifier = Modifier.clip(RoundedCornerShape(6.dp)).clickable { UpdateFlowController.cancel() }.padding(8.dp))
+            } else {
+                FlatIcon(UiIcon.PLAY, size = 18.dp, color = fg)   // намёк «тапни, чтобы обновить»
+                Text("✕", color = fg, fontWeight = FontWeight.Bold,
+                    modifier = Modifier.clip(RoundedCornerShape(6.dp)).clickable { onDismiss() }.padding(8.dp))
+            }
         }
-        Button(onClick = onUpdate, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)) {
-            ButtonLabel(UiIcon.REFRESH, "Обновить")
+        if (dl != null && dl.total > 0) {
+            LinearProgressIndicator(
+                progress = { (dl.done.toFloat() / dl.total).coerceIn(0f, 1f) },
+                modifier = Modifier.fillMaxWidth(),
+            )
         }
-        Text("✕", color = MaterialTheme.colorScheme.onPrimaryContainer, fontWeight = FontWeight.Bold,
-            modifier = Modifier.clip(RoundedCornerShape(6.dp)).clickable { onDismiss() }.padding(8.dp))
     }
 }
 
