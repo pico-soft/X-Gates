@@ -123,6 +123,7 @@ import com.picosoft.xrayproxydroid.monitor.MonitorPrompt
 import com.picosoft.xrayproxydroid.monitor.MonitorStatus
 import com.picosoft.xrayproxydroid.monitor.NetworkMonitor
 import com.picosoft.xrayproxydroid.monitor.TunnelHealth
+import com.picosoft.xrayproxydroid.monitor.TunnelSpeed
 import com.picosoft.xrayproxydroid.crash.CrashContext
 import com.picosoft.xrayproxydroid.crash.CrashReporter
 import com.picosoft.xrayproxydroid.monitor.ServerLabels
@@ -796,7 +797,7 @@ private fun buildDiscriminators(servers: List<ServerProfile>, bl: Blocklist): Ma
     return result
 }
 
-/** Компактная ячейка скорости (число: ≥10 → целое, <10 → 1 знак; единица «Мб/с» — в шапке). */
+/** Компактная ячейка скорости (число: ≥10 → целое, <10 → 1 знак; единица «Мбит/с» — в шапке). */
 private fun speedCell(mbps: Double?): String = when {
     mbps == null -> "—"
     mbps <= 0 -> "✗"
@@ -860,6 +861,8 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
     var externalIp by remember { mutableStateOf("") }
     // Промпт 95: единый ФАКТ-статус туннеля (движется монитором в сервисе; один процесс — общий синглтон).
     val health by TunnelHealth.state.collectAsState()
+    // Живая скорость активного туннеля для плашки (гибрид: реальный трафик / проба в простое) — источник монитор.
+    val tunnelSpeed by TunnelSpeed.state.collectAsState()
 
     // Диалог деталей сервера (долгое нажатие) + отладочный «Перемерить».
     var detailProfile by remember { mutableStateOf<ServerProfile?>(null) }
@@ -1399,6 +1402,12 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                     subtitle = activeServer?.let { protoNetSec(it) },
                     speedMbps = activeServer?.let { effSpeed(it) },
                     uploadMbps = activeUploadMbps,
+                    // Живая скорость (гибрид) + время замера. Показываем ТОЛЬКО при OK; при обрыве говорит statusLine.
+                    directDownMbps = tunnelSpeed.directDownMbps,
+                    tunnelDownMbps = tunnelSpeed.tunnelDownMbps,
+                    tunnelUpMbps = tunnelSpeed.tunnelUpMbps,
+                    liveMeasuredAtMs = tunnelSpeed.measuredAtMs,
+                    tunnelOk = health.phase == TunnelHealth.Phase.OK,
                     hidden = activeHidden, blocked = activeBlocked,
                     problem = proxy.running && (
                         health.phase == TunnelHealth.Phase.NO_INTERNET ||
@@ -1636,6 +1645,11 @@ private fun StatusBox(
     subtitle: String?,
     speedMbps: Double?,
     uploadMbps: Double?,
+    directDownMbps: Double?,
+    tunnelDownMbps: Double?,
+    tunnelUpMbps: Double?,
+    liveMeasuredAtMs: Long,
+    tunnelOk: Boolean,
     hidden: Boolean,
     blocked: Boolean,
     problem: Boolean,
@@ -1671,21 +1685,39 @@ private fun StatusBox(
             .padding(horizontal = 14.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(3.dp),
     ) {
-        // Скачивание и ОТДАЧА (Промпт 90.B) рядом: «↓X / ↑Y Мб/с». Отдача мерится кнопкой «Проверить»/монитором.
-        fun r1(v: Double) = (v * 10).roundToInt() / 10.0
-        val downStr = if (running && speedMbps != null && speedMbps > 0) "${r1(speedMbps)}" else null
-        val upStr = if (running && uploadMbps != null && uploadMbps > 0) "${r1(uploadMbps)}" else null
-        val speedSuffix = when {
-            downStr != null && upStr != null -> "  (↓$downStr / ↑$upStr Мб/с)"
-            downStr != null -> "  (↓$downStr Мб/с)"
-            else -> ""
-        }
         Text(
-            if (running) "● ${serverName ?: "Активен"}$speedSuffix" else "○ Не запущен",
+            if (running) "● ${serverName ?: "Активен"}" else "○ Не запущен",
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.Bold,
             color = fg,
         )
+        // ЖИВАЯ скорость интернета (не «скорость подбора»), ВСЁ в Мбит/с (без смешения КБ/МБ), + мелко время замера.
+        // Две группы: НАПРЯМУЮ ↓ (прямой канал без туннеля) и В ТУННЕЛЕ ↓/↑. Показываем ТОЛЬКО при OK; при обрыве —
+        // statusLine ниже сам скажет «нет интернета/восстановление».
+        if (running && tunnelOk) {
+            fun r1(v: Double) = (v * 10).roundToInt() / 10.0
+            val direct = directDownMbps?.takeIf { it >= 0 }
+            val tDn = tunnelDownMbps?.takeIf { it >= 0 }
+            val tUp = tunnelUpMbps?.takeIf { it >= 0 }
+            val ageStr = when {
+                liveMeasuredAtMs <= 0L -> null
+                else -> {
+                    val ageMin = ((System.currentTimeMillis() - liveMeasuredAtMs) / 60_000L).toInt()
+                    if (ageMin <= 0) "сейчас" else "$ageMin мин назад"
+                }
+            }
+            // Прямой канал: показываем «—», если замер не удался (а не прячем строку молча).
+            Text("Напрямую: ↓${direct?.let { r1(it).toString() } ?: "—"} Мбит/с",
+                style = MaterialTheme.typography.bodySmall, color = fg)
+            // Туннель: ВСЕГДА оба слота ↓/↑ («—» при неудаче/недоступности отдачи — чтобы отдача не «пропадала»).
+            // «замеряю…» — только пока ещё ни разу не мерили (measuredAtMs==0).
+            val tunLine = if (liveMeasuredAtMs <= 0L) "замеряю скорость…" else {
+                val dnStr = tDn?.let { "↓${r1(it)}" } ?: "↓—"
+                val upStr = tUp?.let { "↑${r1(it)}" } ?: "↑—"
+                "Туннель: $dnStr / $upStr Мбит/с" + (ageStr?.let { " · $it" } ?: "")
+            }
+            Text(tunLine, style = MaterialTheme.typography.bodySmall, color = fg)
+        }
         // Промпт 95.D: связь НЕ подтверждена фактом → ЯВНЫЙ текст (проверяется/восстанавливается/нет серверов).
         // Не бывает «зелёный молча»: если тут есть строка — блок НЕ зелёный (verified=false).
         if (running && statusLine.isNotEmpty()) {
@@ -1891,7 +1923,7 @@ private fun ActionsBar(
 }
 
 // Ширины колонок таблицы серверов — общие для шапки и строк (чтобы колонки совпадали).
-// Колонки: Сервер | Мб/с | ▶ (#, Пров., Пинг убраны по решению — на телефоне зажимали имя).
+// Колонки: Сервер | Мбит/с | ▶ (#, Пров., Пинг убраны по решению — на телефоне зажимали имя).
 private val COL_SPEED = 58.dp
 private val COL_BTN = 28.dp
 private val TABLE_FONT = 14.sp     // базовый шрифт таблицы (плотный)
@@ -1954,7 +1986,7 @@ private fun SectionBottomCap(bg: Color) {
     Box(Modifier.fillMaxWidth().height(12.dp).clip(RoundedCornerShape(bottomStart = 14.dp, bottomEnd = 14.dp)).background(bg))
 }
 
-/** Шапка таблицы серверов: Сервер | Мб/с | (кнопка). Колонки как у строк. */
+/** Шапка таблицы серверов: Сервер | Мбит/с | (кнопка). Колонки как у строк. */
 @Composable
 private fun ServerTableHeader() {
     CompositionLocalProvider(LocalDensity provides cappedDensity()) {
@@ -1964,7 +1996,7 @@ private fun ServerTableHeader() {
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             Text("Сервер", modifier = Modifier.weight(1f), fontSize = TABLE_FONT_SUB, color = TABLE_GRAY, maxLines = 1)
-            Text("Мб/с", modifier = Modifier.width(COL_SPEED), fontSize = TABLE_FONT_SUB, color = TABLE_GRAY, textAlign = TextAlign.End, maxLines = 1)
+            Text("Мбит/с", modifier = Modifier.width(COL_SPEED), fontSize = TABLE_FONT_SUB, color = TABLE_GRAY, textAlign = TextAlign.End, maxLines = 1)
             Spacer(Modifier.width(COL_BTN))
         }
     }
