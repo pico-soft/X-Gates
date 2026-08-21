@@ -125,7 +125,8 @@ object ServerSpeedTester {
                 var lastFail = Measurement(-1.0, false, "нет пробников")
                 var testBytes = 0L
                 for (probe in probes) {
-                    val m = downloadMbps(probe, port, warmupMs, measureMs, warmupBudget, measureBudget, name, verbose)
+                    val m = downloadMbps(probe, Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", port)),
+                        warmupMs, measureMs, warmupBudget, measureBudget, name, verbose)
                     testBytes += m.bytes                    // тестовый трафик: скачанное каждым пробником
                     if (m.ok) {
                         TrafficTracker.addTest(testBytes)
@@ -349,12 +350,12 @@ object ServerSpeedTester {
      * это НЕ «не измерено».
      */
     private fun downloadMbps(
-        probe: String, socksPort: Int, warmupMs: Int, measureMs: Int,
+        probe: String, proxy: Proxy?, warmupMs: Int, measureMs: Int,
         warmupBudget: Long, measureBudget: Long, name: String, verbose: Boolean,
     ): Measurement {
         fun log(msg: String) { if (verbose) Log.i(TAG, msg) }
-        val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", socksPort))
-        val conn = (URL(probe).openConnection(proxy) as HttpURLConnection).apply {
+        // proxy=null → ПРЯМОЕ соединение (замер прямого канала, без туннеля); иначе через SOCKS.
+        val conn = ((if (proxy != null) URL(probe).openConnection(proxy) else URL(probe).openConnection()) as HttpURLConnection).apply {
             connectTimeout = CONNECT_TIMEOUT_MS
             readTimeout = warmupMs + measureMs + 2_000
             setRequestProperty("User-Agent", "v2rayNG/1.8.0")
@@ -490,13 +491,26 @@ object ServerSpeedTester {
         var testBytes = 0L
         for (probe in probes) {
             if (measureAborted) break   // Промпт 101.B: отмена — не перебираем оставшиеся пробники
-            val m = downloadMbps(probe, XrayConfig.SOCKS_PORT, s.speedWarmupMs, s.speedWindowMs,
-                s.speedWarmupBudgetBytes, s.speedMeasureBudgetBytes, "активный↓", s.verboseLogs)
+            val m = downloadMbps(probe, Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", XrayConfig.SOCKS_PORT)),
+                s.speedWarmupMs, s.speedWindowMs, s.speedWarmupBudgetBytes, s.speedMeasureBudgetBytes, "активный↓", s.verboseLogs)
             testBytes += m.bytes
             if (m.ok) { TrafficTracker.addTest(testBytes); return m.mbps }
         }
         TrafficTracker.addTest(testBytes)
         return -1.0
+    }
+
+    /**
+     * Скорость ПРЯМОГО канала (БЕЗ туннеля), Mbps — «Напрямую» на плашке. Тем же надёжным окном/прогревом, что и
+     * туннель (иначе числа несравнимы), но по ПРЯМОМУ соединению (proxy=null) и с БОЛЬШОГО файла (directProbeUrl):
+     * наивный замер мелкой страницы мерил бы задержку, а не ширину канала. Трафик → «Тест». -1 = провал/недоступно.
+     */
+    fun measureDirectDownloadMbps(context: Context): Double {
+        val s = SettingsStore.current()
+        val m = downloadMbps(s.directProbeUrl, null, s.speedWarmupMs, s.speedWindowMs,
+            s.speedWarmupBudgetBytes, s.speedMeasureBudgetBytes, "напрямую↓", s.verboseLogs)
+        if (m.bytes > 0) TrafficTracker.addTest(m.bytes)
+        return if (m.ok) m.mbps else -1.0
     }
 
     /** Скорость ОТДАЧИ активного туннеля, Mbps (>0 валидно, -1 провал). Трафик → «Тест». */
@@ -534,7 +548,7 @@ object ServerSpeedTester {
         var total = 0L; var warmupBytes = 0L; var measuredBytes = 0L
         var firstNanos = 0L; var warmupTimeEnd = 0L; var warmupDoneNanos = 0L
         var measureTimeEnd = 0L; var lastMeasuredNanos = 0L
-        var inWarmup = true; var writeErr: String? = null
+        var inWarmup = true; var writeErr: String? = null; var code = -1
         try {
             conn.outputStream.use { out ->
                 loop@ while (true) {
@@ -552,7 +566,7 @@ object ServerSpeedTester {
                 }
                 out.flush()
             }
-            val code = try { conn.responseCode } catch (e: Exception) { -1 }
+            code = try { conn.responseCode } catch (e: Exception) { -1 }
             log("«$name» upload=$url http=$code всего=${total}Б измер=${measuredBytes}Б")
         } catch (e: Exception) {
             writeErr = writeErr ?: "${e.javaClass.simpleName}: ${e.message}"
@@ -566,6 +580,9 @@ object ServerSpeedTester {
             (lastMeasuredNanos - warmupDoneNanos) / 1_000_000 else 0L
         val failReason = when {
             writeErr != null -> "ошибка отдачи: $writeErr"
+            // ГЛАВНОЕ: сервер должен ПРИНЯТЬ отдачу (2xx). Иначе байты лишь ушли в буфер сокета до отказа —
+            // окно 9мс/2МБ давало фейковые ~1864 Мбит/с (http=-1). Как и в скачивании: код вне 2xx = провал.
+            code !in 200..299 -> "отдача не принята (HTTP $code)"
             measuredBytes == 0L -> "0 отданных байт"
             windowMs <= 0L -> "нулевое окно отдачи"
             else -> null
