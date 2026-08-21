@@ -2,6 +2,7 @@ package com.picosoft.xrayproxydroid.xray
 
 import android.content.Context
 import com.picosoft.xrayproxydroid.monitor.MonitorLog
+import com.picosoft.xrayproxydroid.monitor.NetworkMonitor
 import com.picosoft.xrayproxydroid.monitor.ServerLabels
 import com.picosoft.xrayproxydroid.service.ProxyState
 import com.picosoft.xrayproxydroid.settings.BlocklistStore
@@ -104,6 +105,12 @@ object FullTestRunner {
                 var measured = 0
                 // Промпт 93.C: фон не должен ронять процесс — любое исключение фазы завершает тест штатно (onDone).
                 try {
+                // ПРИОРИТЕТ АКТИВНОГО ТУННЕЛЯ (обратная связь): если есть активное соединение — мерим ЕГО ПЕРВЫМ и
+                // МОЛЧА, ДО общего перебора. Плашка сразу показывает реальную ↓/↑ активного сервера, а не «замеряю…».
+                // Общий замер как бы «на паузе», пока идёт приоритетный (он короткий, через активный SOCKS).
+                if (ProxyState.state.value.running && ProxyState.state.value.serverKey != null) {
+                    runCatching { NetworkMonitor.probeActiveSpeedNow(appCtx) }
+                }
                 for (p in candidates) {
                     if (cancelled.get()) break
                     // Общий бюджет времени (Промпт 82): не мерим ВСЕХ бесконечно — стоп по лимиту.

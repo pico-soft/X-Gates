@@ -52,6 +52,12 @@ object ServerSpeedTester {
         "http://speedtest.tele2.net/100MB.zip",               // 100 МБ — запас (eof теперь валиден, мерим по факт. окну)
     )
 
+    // Фолбэк-приёмники ОТДАЧИ (POST): если основной (uploadProbeUrl=tele2) отвергает/тормозит — пробуем дальше,
+    // иначе отдача часто показывалась «—». Cloudflare __up отдаёт 200 через туннель (проверено на устройстве).
+    private val uploadFallbacks = listOf(
+        "https://speed.cloudflare.com/__up",
+    )
+
     /**
      * Пробники КАНАЛА (baseline «мой интернет», ПРЯМО, без туннеля) — русские незаблокированные CDN.
      * НЕ для туннеля! Сейчас НЕ используются — заложены для будущего замера канала (сигнал A монитора).
@@ -70,6 +76,9 @@ object ServerSpeedTester {
 
     /** Минимум байт, ниже которого замер считаем несостоявшимся (backstop к «измерено==0»). */
     private const val MIN_TOTAL_BYTES = 16 * 1024
+    // Потолок правдоподобия ОТДАЧИ: выше — это не отдача, а мгновенная запись в буфер сокета (фейк ~1864 Мбит/с).
+    // Реальная отдача через мобильный туннель много ниже; 500 Мбит/с с огромным запасом отсекает буфер-фейк.
+    private const val MAX_PLAUSIBLE_UPLOAD_MBPS = 500.0
 
     /**
      * Скорость одного сервера, Mbps. >0 — ВАЛИДНЫЙ замер; -1.0 — ПРОВАЛ/«не измерено»
@@ -517,9 +526,14 @@ object ServerSpeedTester {
     fun measureActiveUploadMbps(context: Context): Double {
         XrayController.ensureEnv(context)
         val s = SettingsStore.current()
-        val m = uploadMbps(s.uploadProbeUrl, XrayConfig.SOCKS_PORT, s.speedWarmupMs, s.speedWindowMs,
-            s.uploadMeasureBudgetBytes, "активный↑", s.verboseLogs)
-        return if (m.ok) m.mbps else -1.0
+        val probes = (listOf(s.uploadProbeUrl) + uploadFallbacks).distinct()
+        for (url in probes) {
+            if (measureAborted) break   // Промпт 101.B: отмена — не перебираем оставшиеся приёмники
+            val m = uploadMbps(url, XrayConfig.SOCKS_PORT, s.speedWarmupMs, s.speedWindowMs,
+                s.uploadMeasureBudgetBytes, "активный↑", s.verboseLogs)
+            if (m.ok) return m.mbps
+        }
+        return -1.0
     }
 
     /**
@@ -578,19 +592,21 @@ object ServerSpeedTester {
 
         val windowMs = if (warmupDoneNanos != 0L && lastMeasuredNanos > warmupDoneNanos)
             (lastMeasuredNanos - warmupDoneNanos) / 1_000_000 else 0L
+        val mbps = if (windowMs > 0) measuredBytes * 8.0 / (windowMs / 1000.0) / 1_000_000.0 else -1.0
+        // Фейк «буфер сокета» (2МБ за 9мс = ~1864 Мбит/с) отличаем от честного замера НЕ по http-коду:
+        // флаки-сервер часто НЕ отвечает (http=-1), хотя передача реально прошла с backpressure (окно ~500мс) —
+        // требование 2xx душило валидную отдачу (пользователь видел «—»). Признак фейка — НЕРЕАЛЬНАЯ скорость
+        // (реальная отдача через мобильный туннель много ниже потолка); реальный замер имеет осмысленное окно.
         val failReason = when {
             writeErr != null -> "ошибка отдачи: $writeErr"
-            // ГЛАВНОЕ: сервер должен ПРИНЯТЬ отдачу (2xx). Иначе байты лишь ушли в буфер сокета до отказа —
-            // окно 9мс/2МБ давало фейковые ~1864 Мбит/с (http=-1). Как и в скачивании: код вне 2xx = провал.
-            code !in 200..299 -> "отдача не принята (HTTP $code)"
             measuredBytes == 0L -> "0 отданных байт"
             windowMs <= 0L -> "нулевое окно отдачи"
+            mbps > MAX_PLAUSIBLE_UPLOAD_MBPS -> "нереально ${mbps.roundToInt()} Мбит/с — буфер сокета, не отдача (http=$code)"
             else -> null
         }
         if (failReason != null) { log("«$name» upload ПРОВАЛ [$failReason]"); return Measurement(-1.0, false, failReason, bytes = total) }
-        val mbps = measuredBytes * 8.0 / (windowMs / 1000.0) / 1_000_000.0
         val rounded = (mbps * 100).roundToInt() / 100.0
-        log("«$name» upload → $rounded Mbps (окно ${windowMs}мс, ${measuredBytes}Б)")
+        log("«$name» upload → $rounded Mbps (окно ${windowMs}мс, ${measuredBytes}Б, http=$code)")
         return Measurement(rounded, true, "ok-upload", bytes = total)
     }
 

@@ -434,15 +434,24 @@ object NetworkMonitor {
         if (now() - lastActiveProbeMs < cur.liveSpeedActiveProbeSec * 1000L) return lastActiveProbeMs
         if (!screenInteractive(app)) return lastActiveProbeMs
         if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey != curKey) return lastActiveProbeMs
-
-        val direct = ServerSpeedTester.measureDirectDownloadMbps(app).takeIf { it >= 0.0 }   // НАПРЯМУЮ ↓ (без туннеля)
-        val down = ServerSpeedTester.measureActiveDownloadMbps(app)   // В ТУННЕЛЕ ↓
-        // Пользователь мог сменить сервер / запустить тест во время скачивания — не приписываем чужой результат.
-        if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey != curKey) return now()
-        val up = ServerSpeedTester.measureActiveUploadMbps(app)   // В ТУННЕЛЕ ↑
-        TunnelSpeed.setProbe(direct, down.takeIf { it >= 0.0 }, up.takeIf { it >= 0.0 }, now())
-        if (down > 0) SubscriptionManager.applySpeedResults(app, mapOf(curKey to down))   // обновить «Живые»
+        probeActiveSpeedNow(app)
         return now()
+    }
+
+    /**
+     * ПРИОРИТЕТНЫЙ активный замер СЕЙЧАС: прямой канал + туннель ↓/↑ активного сервера → в [TunnelSpeed] (плашка).
+     * Блокирующий (зовётся из потока полного теста сразу после подключения И из монитора). Обратная связь после
+     * 0.23: чтобы плашка показывала РЕАЛЬНЫЕ числа активного сервера ASAP (а не «замеряю…» до цикла монитора),
+     * и чтобы они были ЕДИНЫМ источником правды по скорости (без расхождения с «Готово: …»).
+     */
+    fun probeActiveSpeedNow(app: Context) {
+        val curKey = ProxyState.state.value.serverKey ?: return
+        val direct = ServerSpeedTester.measureDirectDownloadMbps(app).takeIf { it >= 0.0 }   // НАПРЯМУЮ ↓ (без туннеля)
+        val down = ServerSpeedTester.measureActiveDownloadMbps(app)                          // В ТУННЕЛЕ ↓
+        if (ProxyState.state.value.serverKey != curKey) return   // сервер сменили во время замера — не приписываем чужое
+        val up = ServerSpeedTester.measureActiveUploadMbps(app)                              // В ТУННЕЛЕ ↑
+        TunnelSpeed.setProbe(direct, down.takeIf { it >= 0.0 }, up.takeIf { it >= 0.0 }, now())
+        if (down > 0) SubscriptionManager.applySpeedResults(app, mapOf(curKey to down))      // обновить «Живые»
     }
 
     /** Экран включён (пользователь потенциально смотрит на плашку)? Гейт для платной активной пробы. */
