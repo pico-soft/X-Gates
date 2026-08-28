@@ -52,11 +52,20 @@ object ServerSpeedTester {
         "http://speedtest.tele2.net/100MB.zip",               // 100 МБ — запас (eof теперь валиден, мерим по факт. окну)
     )
 
-    // Фолбэк-приёмники ОТДАЧИ (POST): если основной (uploadProbeUrl=tele2) отвергает/тормозит — пробуем дальше,
-    // иначе отдача часто показывалась «—». Cloudflare __up отдаёт 200 через туннель (проверено на устройстве).
+    // Приёмники ОТДАЧИ (POST). Промпт 104.B (проверено ФАКТОМ, POST 2МБ): cloudflare __up отвечает 200 за ~1.2с
+    // (принимает тело и сразу отвечает) → БЫСТРЫЙ, ставим первым. tele2/upload.php отвечает 200 напрямую, но
+    // ЧЕРЕЗ ТУННЕЛЬ отдаёт байты и НЕ шлёт ответ (http=000) → клиент ждёт весь таймаут = сток 25-75с. Оставляем
+    // tele2 как запасной (distinct убирает дубль основного из настроек). httpbin отвергнут (http=100, 15с).
+    // Дефолт uploadProbeUrl в SettingsStore теперь cloudflare __up; на устройствах со старым (tele2) сохранённым
+    // значением сток обрезает жёсткий потолок UPLOAD_HARD_CAP_MS в uploadMbps.
     private val uploadFallbacks = listOf(
         "https://speed.cloudflare.com/__up",
+        "http://speedtest.tele2.net/upload.php",
     )
+    // Промпт 104.B: жёсткий потолок ОБЩЕГО времени одного замера отдачи. Кооперативное окно (measureMs) между
+    // записями НЕ спасает, если приёмник не отвечает / канал насыщён (одна запись блокируется). Отдача display-only —
+    // не даём ей быть 25-75с стоком в КАЖДОМ активном замере. Потолок от первой записи (коннект ограничен отдельно).
+    private const val UPLOAD_HARD_CAP_MS = 6_000L
 
     /**
      * Пробники КАНАЛА (baseline «мой интернет», ПРЯМО, без туннеля) — русские незаблокированные CDN.
@@ -566,6 +575,12 @@ object ServerSpeedTester {
         try {
             conn.outputStream.use { out ->
                 loop@ while (true) {
+                    // Промпт 104.B: жёсткий потолок ОБЩЕГО времени от первой записи — приёмник может не отвечать /
+                    // канал насыщён, и кооперативное окно (measureMs, проверка МЕЖДУ записями) даёт переполнение
+                    // до 25-75с. Обрезаем сток независимо от настроек/буферов.
+                    if (firstNanos != 0L && (System.nanoTime() - firstNanos) / 1_000_000 > UPLOAD_HARD_CAP_MS) {
+                        writeErr = writeErr ?: "потолок времени отдачи ${UPLOAD_HARD_CAP_MS}мс"; break@loop
+                    }
                     try { out.write(buf) } catch (e: Exception) { writeErr = "${e.javaClass.simpleName}: ${e.message}"; break@loop }
                     val now = System.nanoTime()
                     if (firstNanos == 0L) { firstNanos = now; warmupTimeEnd = now + warmupMs * 1_000_000L }
@@ -580,7 +595,9 @@ object ServerSpeedTester {
                 }
                 out.flush()
             }
-            code = try { conn.responseCode } catch (e: Exception) { -1 }
+            // Промпт 104.B: не блокируемся на ответе, если запись оборвалась/упёрлась в потолок (приёмник, скорее
+            // всего, не ответит → ждали бы весь readTimeout). Код нужен лишь для лога/правдоподобия при УСПЕХЕ.
+            code = if (writeErr == null) try { conn.responseCode } catch (e: Exception) { -1 } else -1
             log("«$name» upload=$url http=$code всего=${total}Б измер=${measuredBytes}Б")
         } catch (e: Exception) {
             writeErr = writeErr ?: "${e.javaClass.simpleName}: ${e.message}"

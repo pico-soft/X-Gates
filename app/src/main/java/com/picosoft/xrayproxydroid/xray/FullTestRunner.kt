@@ -160,9 +160,21 @@ object FullTestRunner {
                 if (ProxyState.state.value.running && ProxyState.state.value.serverKey != null) {
                     onPhase("Этап 2: замер активного туннеля…")
                     beat()
-                    val probe = Thread { runCatching { NetworkMonitor.probeActiveSpeedNow(appCtx) } }.apply { isDaemon = true }
+                    // Промпт 104.B: отдача (↑) — display-only и ГАРАНТИРОВАННЫЙ сток 25-75с (приёмник может не
+                    // отвечать через туннель → ждём весь таймаут). В приоритетном (полнотестовом) замере её НЕ
+                    // делаем — здесь важна скорость перебора; ↑ обновит монитор в фоне.
+                    val probe = Thread { runCatching { NetworkMonitor.probeActiveSpeedNow(appCtx, includeUpload = false) } }.apply { isDaemon = true }
                     probe.start()
                     probe.join(PRIORITY_MEASURE_CAP_MS)
+                    if (probe.isAlive) {
+                        // Промпт 104.A: потолок обязан ПРЕРЫВАТЬ работу, а не просто перестать её ждать — иначе
+                        // фоновый замер продолжит качать через активный SOCKS ПАРАЛЛЕЛЬНО с перебором временных
+                        // инстансов и испортит их числа (то самое наложение, ради устранения которого делался Пр.101).
+                        runCatching { ServerSpeedTester.abortCurrentMeasure() }
+                        probe.join(10_000)                              // дождаться РЕАЛЬНОГО завершения после прерывания
+                        runCatching { ServerSpeedTester.resetMeasureAbort() }   // снять флаг — иначе монитор/следующие замеры «немы»
+                        runCatching { onPhase("Активный замер прерван по таймауту — продолжаю перебор") }
+                    }
                     beat()
                 }
                 for (p in candidates) {

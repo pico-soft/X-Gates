@@ -105,7 +105,9 @@ data class AppSettings(
     val connectionCheckIntervalSec: Int = 60,
     // ОТДАЧА (Промпт 90.B): измеряется у АКТИВНОГО соединения (выгрузка через туннель на приёмник).
     // Приёмник редактируемый (как для скачивания). НЕ Cloudflare (403 на прокси-адреса) и НЕ Hetzner (рвёт TLS).
-    val uploadProbeUrl: String = "http://speedtest.tele2.net/upload.php",
+    // Промпт 104.B: cloudflare __up отвечает 200 за ~1.2с (факт, POST 2МБ) — быстрый приёмник отдачи. tele2/upload.php
+    // ЧЕРЕЗ ТУННЕЛЬ не отвечает (http=000) → ждали весь таймаут (сток 25-75с). tele2 остался запасным (uploadFallbacks).
+    val uploadProbeUrl: String = "https://speed.cloudflare.com/__up",
     // Минимальная отдача, Мбит/с. Дефолт = порогу скачивания (monitorTunnelThreshold=1.0). Недобор → искать замену.
     val minUploadMbps: Double = 1.0,
     // Бюджет ПО ОБЪЁМУ на один замер отдачи, МБ (отдельный от скачивания). Дефолт скромный — отдача дороже.
