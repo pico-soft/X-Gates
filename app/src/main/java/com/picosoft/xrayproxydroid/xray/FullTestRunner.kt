@@ -162,11 +162,10 @@ object FullTestRunner {
                 if (ProxyState.state.value.running && activeServerKey != null) {
                     onPhase("Этап 2: замер активного туннеля…")
                     beat()
-                    // Промпт 104.B: отдача (↑) — display-only и сток 25-75с → в приоритетном замере не делаем.
-                    // Промпт 108: результат активного↓ ЗАБИРАЕМ (замер идёт на отдельном потоке) — он нужен для
-                    // сравнения активного сервера с кандидатами, а не для подключения к первому годному вслепую.
-                    val activeDownRef = AtomicReference(-1.0)
-                    val probe = Thread { runCatching { activeDownRef.set(NetworkMonitor.probeActiveSpeedNow(appCtx, includeUpload = false)) } }.apply { isDaemon = true }
+                    // Промпт 104.B: отдача (↑) — display-only и сток → не делаем. Промпт 108: замер на отдельном
+                    // потоке с потолком. Промпт 109: ЭТОТ живой замер — ТОЛЬКО для «живой» ↓/↑ на плашке (что
+                    // пользователь реально видит); в РЕШЕНИЕ его число НЕ берём (см. ниже — оно систематически занижено).
+                    val probe = Thread { runCatching { NetworkMonitor.probeActiveSpeedNow(appCtx, includeUpload = false) } }.apply { isDaemon = true }
                     probe.start()
                     probe.join(PRIORITY_MEASURE_CAP_MS)
                     if (probe.isAlive) {
@@ -178,20 +177,25 @@ object FullTestRunner {
                         runCatching { ServerSpeedTester.resetMeasureAbort() }   // снять флаг — иначе монитор/следующие замеры «немы»
                     }
                     beat()
-                    // Промпт 108.C/D: РЕШЕНИЕ по факту, а плашка — по факту. Активный измерен и «в норме» (≥ порога) →
-                    // делаем его ИНКУМБЕНТОМ (не ранний коннект): переключимся только на кандидата, кратно
-                    // (keepBestMultiplier) быстрее — правило Пр.90 «держать лучший». Не запущен/провал/ниже порога —
-                    // ЧЕСТНО пишем это и оставляем прежний ранний коннект к первому годному.
-                    val activeDown = activeDownRef.get()
+                    // Промпт 109.D: КРИТЕРИЙ СОПОСТАВИМОСТИ. Замер через ЖИВОЙ SOCKS систематически ЗАНИЖАЕТ (один и
+                    // тот же сервер: живой 2.67 vs temp-инстанс 68 — перегружен/нестабилен сам путь замера, не пробник
+                    // и не окно). Поэтому для РЕШЕНИЯ активный сервер меряем ТЕМ ЖЕ способом, что кандидата — свежим
+                    // temp-инстансом (measureSpeed) → числа сравнимы. Иначе кандидат всегда «кратно быстрее» и
+                    // переключение случайно. Активный «в норме» (≥ порога) → ИНКУМБЕНТ (Пр.90 «держать лучший ×N»);
+                    // иначе — честный текст + прежний ранний коннект.
                     val activeProfile = allServers.firstOrNull { key(it) == activeServerKey }
-                    if (activeDown > 0.0 && activeProfile != null && activeDown >= s.monitorTunnelThreshold) {
-                        connected = activeProfile; connectedSpeed = activeDown; hbConnected.set(activeProfile); keepActive = true
-                        onPhase("Активный ${label(activeProfile)}: ↓${fmt(activeDown)} Мбит/с (в норме) — переключусь только если кандидат ×${fmt(s.keepBestMultiplier)} быстрее")
+                    val activeMbps = if (activeProfile != null && !cancelled.get())
+                        ServerSpeedTester.measureSpeed(appCtx, activeProfile) else -1.0
+                    if (activeProfile != null && activeMbps > 0.0) onSpeedResult(activeProfile, activeMbps)   // сопоставимое число — в «Живые»
+                    beat()
+                    if (activeProfile != null && activeMbps >= s.monitorTunnelThreshold) {
+                        connected = activeProfile; connectedSpeed = activeMbps; hbConnected.set(activeProfile); keepActive = true
+                        onPhase("Активный ${label(activeProfile)}: ↓${fmt(activeMbps)} Мбит/с (в норме) — переключусь только если кандидат ×${fmt(s.keepBestMultiplier)} быстрее")
                     } else {
                         onPhase(
                             when {
-                                activeDown <= 0.0 -> "Активный туннель не измерился — ищу рабочий сервер"
-                                else -> "Активный ↓${fmt(activeDown)} < порога ${fmt(s.monitorTunnelThreshold)} Мбит/с — ищу быстрее"
+                                activeMbps <= 0.0 -> "Активный туннель не измерился — ищу рабочий сервер"
+                                else -> "Активный ↓${fmt(activeMbps)} < порога ${fmt(s.monitorTunnelThreshold)} Мбит/с — ищу быстрее"
                             }
                         )
                     }
