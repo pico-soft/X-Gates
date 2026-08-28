@@ -35,7 +35,7 @@ object CrashReporter {
      * (приложение для обхода блокировок не может тихо слать данные разработчику).
      */
     const val DEVELOPER_EMAIL = "pico.soft.github@gmail.com"
-    private const val APP_NAME = "XrayProxyDroid"
+    private const val APP_NAME = "X-Gates"
 
     /** Тема письма: название, версия, versionCode, модель устройства, версия Android (Промпт 97.D). */
     fun emailSubject(): String =
@@ -111,7 +111,7 @@ object CrashReporter {
     private fun writeReport(thread: Thread, t: Throwable) {
         val ctx = appContext ?: return
         val sb = StringBuilder()
-        sb.appendLine("=== XrayProxyDroid — отчёт о сбое ===")
+        sb.appendLine("=== X-Gates — отчёт о сбое ===")
         runCatching { sb.appendLine("Время: ${stamp("yyyy-MM-dd HH:mm:ss")}") }
         sb.appendLine("Версия: ${BuildConfig.VERSION_NAME} (versionCode ${BuildConfig.VERSION_CODE})")
         sb.appendLine("Устройство: ${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})")

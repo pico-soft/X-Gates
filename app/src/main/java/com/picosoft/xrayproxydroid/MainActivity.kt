@@ -1518,7 +1518,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
         // ═══ ФУТЕР ═══
         item {
             Text(
-                "pico-soft/XrayProxyDroid · v${BuildConfig.VERSION_NAME}",
+                "pico-soft/X-Gates · v${BuildConfig.VERSION_NAME}",
                 style = MaterialTheme.typography.bodySmall,
                 color = Color(0xFF9E9E9E),
                 textAlign = TextAlign.Center,
@@ -1585,7 +1585,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
 private fun AppHeader() {
     Column {
         Text(
-            "XrayProxyDroid",
+            "X-Gates",
             style = MaterialTheme.typography.headlineSmall,
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.primary,
@@ -3156,7 +3156,7 @@ private fun shareText(context: Context, text: String) {
     runCatching {
         val send = Intent(Intent.ACTION_SEND).apply {
             type = "text/plain"
-            putExtra(Intent.EXTRA_SUBJECT, "XrayProxyDroid — отчёт о сбое")
+            putExtra(Intent.EXTRA_SUBJECT, "X-Gates — отчёт о сбое")
             putExtra(Intent.EXTRA_TEXT, text)
         }
         context.startActivity(Intent.createChooser(send, "Поделиться отчётом").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))

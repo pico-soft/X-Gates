@@ -20,7 +20,7 @@ object NotificationHelper {
     const val UPDATE_ID = 3
     const val NO_SERVERS_ID = 5   // Промпт 95.E: «нет рабочих серверов»
     private const val CHANNEL_ID = "xray_proxy"
-    private const val CHANNEL_NAME = "Xray proxy"
+    private const val CHANNEL_NAME = "X-Gates"   // отображаемое имя канала; CHANNEL_ID НЕ меняем (иначе осиротеет канал)
     // Промпт 93.J: ОТДЕЛЬНЫЙ канал «Обновления» — можно выключить, не трогая нотификацию сервиса.
     private const val UPDATE_CHANNEL_ID = "xray_updates"
     private const val UPDATE_CHANNEL_NAME = "Обновления"
@@ -123,7 +123,7 @@ object NotificationHelper {
         return NotificationCompat.Builder(service, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_proxy)
             .setContentTitle("Прокси активен")
-            .setContentText(label ?: "xray работает")
+            .setContentText(label ?: "X-Gates работает")
             .setOngoing(true)
             .setShowWhen(false)
             .setOnlyAlertOnce(true)
@@ -138,12 +138,13 @@ object NotificationHelper {
     private fun ensureChannel(context: Context) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val nm = context.getSystemService(NotificationManager::class.java)
-            if (nm.getNotificationChannel(CHANNEL_ID) == null) {
-                nm.createNotificationChannel(
-                    // LOW — тихая, но постоянная (обязательна для foreground-сервиса).
-                    NotificationChannel(CHANNEL_ID, CHANNEL_NAME, NotificationManager.IMPORTANCE_LOW)
-                )
-            }
+            // Промпт 105: создаём БЕЗУСЛОВНО (не гейтим по == null) — при том же CHANNEL_ID Android обновляет
+            // ИМЯ/описание канала, а пользовательскую важность не трогает. Иначе переименование «Xray proxy»→
+            // «X-Gates» не применилось бы у тестировщиков, у кого канал уже создан прошлой версией.
+            // LOW — тихая, но постоянная (обязательна для foreground-сервиса).
+            nm.createNotificationChannel(
+                NotificationChannel(CHANNEL_ID, CHANNEL_NAME, NotificationManager.IMPORTANCE_LOW)
+            )
         }
     }
 }

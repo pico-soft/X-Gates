@@ -1,4 +1,4 @@
-# XrayProxyDroid
+# X-Gates
 
 Android-приложение для обхода блокировок: поднимает **локальный SOCKS/HTTP-прокси** на движке
 **xray-core** и гоняет трафик через зарубежные серверы (`vless` / `vmess` / `trojan` / `shadowsocks`)

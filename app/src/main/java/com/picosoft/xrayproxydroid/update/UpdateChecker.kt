@@ -37,7 +37,7 @@ object UpdateChecker {
     private const val API_LATEST = "https://api.github.com/repos/pico-soft/XrayProxyDroid/releases/latest"
     // Запасной адрес без API: всегда ведёт на последний релиз (github.com → редирект на CDN вложения).
     private const val LATEST_DOWNLOAD = "https://github.com/pico-soft/XrayProxyDroid/releases/latest/download"
-    const val UA = "XrayProxyDroid-Updater"
+    const val UA = "X-Gates-Updater"
     private const val MANIFEST_NAME = "update.json"
 
     /**
