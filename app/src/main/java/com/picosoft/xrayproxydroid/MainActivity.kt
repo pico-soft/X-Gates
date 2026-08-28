@@ -3329,8 +3329,7 @@ private fun UpdateBanner(versionName: String, onDismiss: () -> Unit) {
                 val sub = when (val p = phase) {
                     is UpdateFlowController.Phase.Checking -> "Проверяю обновление…"
                     is UpdateFlowController.Phase.Downloading ->
-                        if (p.total > 0) "Скачиваю ${p.done * 100 / p.total}% · ${fmtBytes(p.done)} из ${fmtBytes(p.total)}"
-                        else "Скачиваю ${fmtBytes(p.done)}…"
+                        if (p.total > 0) "Скачиваю ${p.done * 100 / p.total}%" else "Скачиваю…"
                     is UpdateFlowController.Phase.NeedPermission -> "Разрешите установку и нажмите ещё раз"
                     is UpdateFlowController.Phase.Failed -> p.message
                     else -> "$versionName · нажмите, чтобы обновить"
@@ -3540,7 +3539,7 @@ private fun UpdateCheckSection() {
                 checking -> Text("Проверяю…")
                 downloading -> Text("Скачиваю…")
                 readyFile != null -> ButtonLabel(UiIcon.PLAY, "Установить")
-                avail != null -> ButtonLabel(UiIcon.PLAY, "Скачать и установить" + if (avail.sizeBytes > 0) " (${fmtBytes(avail.sizeBytes)})" else "")
+                avail != null -> ButtonLabel(UiIcon.PLAY, "Скачать и установить")
                 else -> ButtonLabel(UiIcon.REFRESH, "Проверить обновление")
             }
         }
@@ -3550,37 +3549,19 @@ private fun UpdateCheckSection() {
         if (avail != null) {
             Text("Новая версия: ${avail.versionName}",
                 style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
-            Text(
-                "Размер: " + (if (avail.sizeBytes > 0) fmtBytes(avail.sizeBytes) else "неизвестен") +
-                    (if (avail.usingUniversal) " · универсальная сборка (нет точной под вашу архитектуру)" else ""),
-                style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
-            )
-            // Тип сети — ЗАРАНЕЕ, до нажатия (Промпт 91.G): решение осознанное. Мобильная сеть — заметная пометка;
-            // нажатие «Скачать и установить» = согласие, без переспроса.
-            if (isMeteredNetwork(context)) {
-                Text(
-                    "⚠ Мобильная сеть — скачивание израсходует мобильный трафик" +
-                        (if (avail.sizeBytes > 0) " (~${fmtBytes(avail.sizeBytes)})" else ""),
-                    style = MaterialTheme.typography.bodySmall, color = Color(0xFFFFB300), fontWeight = FontWeight.Bold,
-                )
-            } else {
-                Text("Сеть: Wi-Fi / без учёта трафика", style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
-            }
             if (avail.notes.isNotBlank()) Text(avail.notes, style = MaterialTheme.typography.bodySmall)
 
             if (downloading) {
                 val frac = if (totalBytes > 0) (downloaded.toFloat() / totalBytes).coerceIn(0f, 1f) else 0f
                 if (totalBytes > 0) LinearProgressIndicator(progress = { frac }, modifier = Modifier.fillMaxWidth())
                 else LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                Text(
-                    if (totalBytes > 0) "Скачано ${fmtBytes(downloaded)} из ${fmtBytes(totalBytes)} (${(frac * 100).roundToInt()}%)"
-                    else "Скачано ${fmtBytes(downloaded)}",
-                    style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
-                )
+                Text(if (totalBytes > 0) "Скачиваю… ${(frac * 100).roundToInt()}%" else "Скачиваю…",
+                    style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
                 OutlinedButton(onClick = { cancelFlag = true }, modifier = Modifier.fillMaxWidth()) { Text("Отменить") }
             } else if (readyFile == null) {
+                // Простая подсказка про системные окна Android (без размеров/деталей процесса — просьба Elyor).
                 Text(
-                    "Скачаем файл, сверим контрольную сумму и подпись с установленным приложением, затем откроется системный установщик — подтверждаете вы.",
+                    "При установке Android спросит разрешение — разрешите (можно «Установить без проверки» или с проверкой). После обновления откройте приложение — тоже просто разрешите.",
                     style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
                 )
             }
