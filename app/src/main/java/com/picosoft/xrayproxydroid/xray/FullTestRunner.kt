@@ -146,6 +146,7 @@ object FullTestRunner {
                 val phaseStart = System.nanoTime()
                 var connected: ServerProfile? = null
                 var connectedSpeed = 0.0
+                var keepActive = false   // Промпт 108: инкумбент = активный сервер «в норме» → консервативно (Пр.90 «держать лучший ×N»)
                 var best: ServerProfile? = null
                 var bestSpeed = 0.0
                 var selectable = 0
@@ -157,13 +158,15 @@ object FullTestRunner {
                 // на ОТДЕЛЬНОМ потоке с потолком времени — он может длиться ~2 мин на провалах отдачи, и раньше это
                 // «подвешивало» бар на 0/N без обратной связи. Теперь: явный текст фазы + join не дольше потолка
                 // (замер, если долгий, дойдёт сам в фоне — плашка обновится позже, перебор не ждёт его вечно).
-                if (ProxyState.state.value.running && ProxyState.state.value.serverKey != null) {
+                val activeServerKey = ProxyState.state.value.serverKey
+                if (ProxyState.state.value.running && activeServerKey != null) {
                     onPhase("Этап 2: замер активного туннеля…")
                     beat()
-                    // Промпт 104.B: отдача (↑) — display-only и ГАРАНТИРОВАННЫЙ сток 25-75с (приёмник может не
-                    // отвечать через туннель → ждём весь таймаут). В приоритетном (полнотестовом) замере её НЕ
-                    // делаем — здесь важна скорость перебора; ↑ обновит монитор в фоне.
-                    val probe = Thread { runCatching { NetworkMonitor.probeActiveSpeedNow(appCtx, includeUpload = false) } }.apply { isDaemon = true }
+                    // Промпт 104.B: отдача (↑) — display-only и сток 25-75с → в приоритетном замере не делаем.
+                    // Промпт 108: результат активного↓ ЗАБИРАЕМ (замер идёт на отдельном потоке) — он нужен для
+                    // сравнения активного сервера с кандидатами, а не для подключения к первому годному вслепую.
+                    val activeDownRef = AtomicReference(-1.0)
+                    val probe = Thread { runCatching { activeDownRef.set(NetworkMonitor.probeActiveSpeedNow(appCtx, includeUpload = false)) } }.apply { isDaemon = true }
                     probe.start()
                     probe.join(PRIORITY_MEASURE_CAP_MS)
                     if (probe.isAlive) {
@@ -173,9 +176,25 @@ object FullTestRunner {
                         runCatching { ServerSpeedTester.abortCurrentMeasure() }
                         probe.join(10_000)                              // дождаться РЕАЛЬНОГО завершения после прерывания
                         runCatching { ServerSpeedTester.resetMeasureAbort() }   // снять флаг — иначе монитор/следующие замеры «немы»
-                        runCatching { onPhase("Активный замер прерван по таймауту — продолжаю перебор") }
                     }
                     beat()
+                    // Промпт 108.C/D: РЕШЕНИЕ по факту, а плашка — по факту. Активный измерен и «в норме» (≥ порога) →
+                    // делаем его ИНКУМБЕНТОМ (не ранний коннект): переключимся только на кандидата, кратно
+                    // (keepBestMultiplier) быстрее — правило Пр.90 «держать лучший». Не запущен/провал/ниже порога —
+                    // ЧЕСТНО пишем это и оставляем прежний ранний коннект к первому годному.
+                    val activeDown = activeDownRef.get()
+                    val activeProfile = allServers.firstOrNull { key(it) == activeServerKey }
+                    if (activeDown > 0.0 && activeProfile != null && activeDown >= s.monitorTunnelThreshold) {
+                        connected = activeProfile; connectedSpeed = activeDown; hbConnected.set(activeProfile); keepActive = true
+                        onPhase("Активный ${label(activeProfile)}: ↓${fmt(activeDown)} Мбит/с (в норме) — переключусь только если кандидат ×${fmt(s.keepBestMultiplier)} быстрее")
+                    } else {
+                        onPhase(
+                            when {
+                                activeDown <= 0.0 -> "Активный туннель не измерился — ищу рабочий сервер"
+                                else -> "Активный ↓${fmt(activeDown)} < порога ${fmt(s.monitorTunnelThreshold)} Мбит/с — ищу быстрее"
+                            }
+                        )
+                    }
                 }
                 for (p in candidates) {
                     if (cancelled.get()) break
@@ -191,19 +210,28 @@ object FullTestRunner {
                     if (ServerFilter.isSelectable(p, mbps, s, blocklist)) {
                         selectable++
                         if (mbps > bestSpeed) { bestSpeed = mbps; best = p; hbBest.set(p) }
-                        if (connected == null) {
+                        val curConn = connected
+                        if (curConn == null) {
+                            // Нет инкумбента (активный не измерен / ниже порога / не запущен) → ранний коннект к первому годному.
                             connected = p; connectedSpeed = mbps; hbConnected.set(p)
                             onPhase("Подключён ${label(p)} ($mbps Мбит/с), продолжаю…")
                             val from = ServerLabels.displayForKey(appCtx, ProxyState.state.value.serverKey)
                             MonitorLog.switch(appCtx, from, ServerLabels.display(p), "полный тест: первый рабочий", "${fmt(mbps)} Мбит/с")
                             connect(p)
-                        } else if (p !== connected && mbps > connectedSpeed * (1 + marginRatio)) {
-                            val prev = connectedSpeed
-                            onPhase("Быстрее на >10%: ${label(p)} ($mbps > $connectedSpeed) — переключаюсь")
-                            val from = ServerLabels.displayForKey(appCtx, ProxyState.state.value.serverKey)
-                            MonitorLog.switch(appCtx, from, ServerLabels.display(p), "полный тест: апгрейд", "было ${fmt(prev)} → стало ${fmt(mbps)} Мбит/с")
-                            connected = p; connectedSpeed = mbps; hbConnected.set(p)
-                            connect(p)
+                        } else if (key(p) != key(curConn)) {
+                            // Промпт 108.C: инкумбент есть — сравниваем. Активный «в норме» → порог КРАТНЫЙ
+                            // (keepBestMultiplier, Пр.90 «держать лучший»); иначе обычный апгрейд по марже (>10%).
+                            // Так первый годный кандидат уже НЕ подключается безусловно, если активный не хуже.
+                            val need = if (keepActive) connectedSpeed * s.keepBestMultiplier else connectedSpeed * (1 + marginRatio)
+                            if (mbps > need) {
+                                val prev = connectedSpeed
+                                onPhase("Быстрее: ${label(p)} (${fmt(mbps)} > ${fmt(prev)}) — переключаюсь")
+                                val from = ServerLabels.displayForKey(appCtx, ProxyState.state.value.serverKey)
+                                val cause = if (keepActive) "полный тест: кандидат кратно быстрее активного" else "полный тест: апгрейд"
+                                MonitorLog.switch(appCtx, from, ServerLabels.display(p), cause, "было ${fmt(prev)} → стало ${fmt(mbps)} Мбит/с")
+                                connected = p; connectedSpeed = mbps; hbConnected.set(p); keepActive = false
+                                connect(p)
+                            }
                         }
                     }
                     onPhase("Этап 2: скорость $measured / ${candidates.size} · подключён: ${connected?.let(::label) ?: "—"}")
@@ -239,8 +267,12 @@ object FullTestRunner {
                 if (cancelled.get()) {
                     finishOnce(Result(null, null, 0.0, 0, true))
                 } else {
+                    // Промпт 108: defensive-дедуп по serverKey. По логам один и тот же сервер попадал в перебор
+                    // 6–15 раз (реестр отдаёт дубли) → тест мерил его многократно и тянулся минутами. Один serverKey
+                    // за прогон меряем ОДИН раз (корневую дупликацию реестра разобрать отдельно).
                     val alive = testable
                         .filter { (pingByKey[key(it)] ?: it.pingMs ?: -1) >= 0 }
+                        .distinctBy { key(it) }
                         .sortedBy { pingByKey[key(it)] ?: it.pingMs ?: Int.MAX_VALUE }
                     startSpeedPhase(alive)
                 }

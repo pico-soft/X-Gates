@@ -447,14 +447,18 @@ object NetworkMonitor {
     // Промпт 104.B: [includeUpload]=false — пропустить замер ОТДАЧИ (он display-only и гарантированный сток
     // времени, см. ServerSpeedTester.uploadMbps). Полный тест зовёт с false (важна скорость перебора), монитор —
     // с true (для ↑ на плашке; там замер в фоне и с жёстким потолком времени).
-    fun probeActiveSpeedNow(app: Context, includeUpload: Boolean = true) {
-        val curKey = ProxyState.state.value.serverKey ?: return
+    // Промпт 108: ВОЗВРАЩАЕТ измеренную скорость активного туннеля ↓ (Мбит/с, -1 если не запущен/провал/сервер
+    // сменился) — чтобы полный тест мог СРАВНИТЬ активный сервер с кандидатами, а не подключаться к первому годному
+    // безусловно. Прочие вызыватели (монитор/onDone) возврат игнорируют.
+    fun probeActiveSpeedNow(app: Context, includeUpload: Boolean = true): Double {
+        val curKey = ProxyState.state.value.serverKey ?: return -1.0
         val direct = ServerSpeedTester.measureDirectDownloadMbps(app).takeIf { it >= 0.0 }   // НАПРЯМУЮ ↓ (без туннеля)
         val down = ServerSpeedTester.measureActiveDownloadMbps(app)                          // В ТУННЕЛЕ ↓
-        if (ProxyState.state.value.serverKey != curKey) return   // сервер сменили во время замера — не приписываем чужое
+        if (ProxyState.state.value.serverKey != curKey) return -1.0   // сервер сменили во время замера — не приписываем чужое
         val up = if (includeUpload) ServerSpeedTester.measureActiveUploadMbps(app) else -1.0 // В ТУННЕЛЕ ↑
         TunnelSpeed.setProbe(direct, down.takeIf { it >= 0.0 }, up.takeIf { it >= 0.0 }, now())
         if (down > 0) SubscriptionManager.applySpeedResults(app, mapOf(curKey to down))      // обновить «Живые»
+        return down
     }
 
     /** Экран включён (пользователь потенциально смотрит на плашку)? Гейт для платной активной пробы. */
