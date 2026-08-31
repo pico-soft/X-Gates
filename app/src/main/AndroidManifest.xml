@@ -23,6 +23,13 @@
          перезапуск после убийства (Промпт 115) помогает лишь когда система согласна перезапустить,
          а из «спящих» она не поднимает вовсе. Позволяет ПОПРОСИТЬ исключение (системный диалог). -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- Точный будильник цикла монитора (Промпт 118): корутинная пауза засыпает вместе с CPU в Doze
+         (142 цикла за 46ч вместо 1380). setExactAndAllowWhileIdle срабатывает и в Doze. Исключение из
+         энергосбережения (Промпт 117) авто-выдаёт это право; canScheduleExactAlarms() проверяем в рантайме,
+         при отказе — деградация до setAndAllowWhileIdle (неточный, но тоже в Doze), не молчим. -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <!-- Удержать CPU на время одного цикла проверки (иначе после срабатывания будильника CPU уснёт посреди пробы). -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
         android:name=".XrayApp"

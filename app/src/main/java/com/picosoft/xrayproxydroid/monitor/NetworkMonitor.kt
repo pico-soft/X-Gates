@@ -90,8 +90,11 @@ object NetworkMonitor {
         var lastOptimizeMs = now()
         var lastSpeedSampleMs = 0L      // живая скорость плашки: когда последний раз сэмплировали
         var lastActiveProbeMs = 0L      // когда последний раз делали АКТИВНУЮ пробу (в простое)
+        var lastExactAlarm = false      // Промпт 118: последний тик поставлен ТОЧНЫМ будильником? (для лога/диагностики)
+        val cycleLock = MonitorAlarm.newWakeLock(app)   // держит CPU на время ОДНОГО цикла (иначе уснёт посреди пробы)
         Log.i(TAG, "monitor loop started")
 
+        try {
         while (true) {
             if (!XrayController.isRunning || !ProxyState.state.value.running) { TunnelHealth.reset(); TunnelSpeed.clear(); return }
 
@@ -106,8 +109,16 @@ object NetworkMonitor {
                 TunnelHealth.Phase.RECOVERING, TunnelHealth.Phase.NO_SERVERS -> s.monitorProblemIntervalSec.coerceAtLeast(15) * 1000L
                 else -> s.connectionCheckIntervalSec.coerceAtLeast(15) * 1000L
             }
+            // ── СОН (Промпт 118): отпустить CPU, поставить ТОЧНЫЙ будильник (срабатывает и в Doze), ждать его ИЛИ
+            // событие (экран/сеть). Корутинный awaitWake здесь — лишь ЗАПАСНОЙ предел: в Doze он растягивается
+            // вместе с CPU (корень бага 111), реальный тик приносит будильник. Без точных будильников (система
+            // отказала) awaitWake и работает как раньше — деградация, а не молчание.
+            releaseCycleLock(cycleLock)
+            lastExactAlarm = MonitorAlarm.scheduleNext(app, waitMs)
             MonitorCoordinator.drainWakeups()
             MonitorCoordinator.awaitWake(waitMs)
+            MonitorAlarm.cancel(app)
+            acquireCycleLock(cycleLock)
 
             val cur = SettingsStore.current()
             if (!XrayController.isRunning || !ProxyState.state.value.running) { TunnelHealth.reset(); TunnelSpeed.clear(); return }
@@ -118,6 +129,7 @@ object NetworkMonitor {
                 continue
             }
             cycles++
+            Log.i(TAG, "cycle $cycles (exactAlarm=$lastExactAlarm, wait=${waitMs / 1000}s, phase=$ph)")
 
             // ── СИГНАЛ A: есть ли интернет ВООБЩЕ (прямой канал) — отличаем «нет интернета» от «нет серверов» ──
             // Нет интернета → туннель чинить БЕССМЫСЛЕННО (ядро НЕ трогаем): честно «нет связи» + переспрос
@@ -192,10 +204,27 @@ object NetworkMonitor {
                     backoffMs = if (backoffMs == 0L) BACKOFF_START_MS else minOf(backoffMs * 2, BACKOFF_MAX_MS)
                     MonitorLog.event(app, "monitor", "Рабочих серверов нет — пауза ${humanDur(backoffMs)}", "выход по любому событию")
                     MonitorStatus.update(true, "нет рабочих серверов, пауза ${humanDur(backoffMs)}", now(), cycles)
+                    // Длинная пауза «нет серверов» — тоже на будильнике: не держим CPU и просыпаемся в Doze (Промпт 118).
+                    releaseCycleLock(cycleLock)
+                    MonitorAlarm.scheduleNext(app, backoffMs)
                     MonitorCoordinator.drainWakeups(); MonitorCoordinator.awaitWake(backoffMs)
+                    MonitorAlarm.cancel(app)
+                    acquireCycleLock(cycleLock)
                 }
             }
         }
+        } finally {
+            releaseCycleLock(cycleLock)
+            MonitorAlarm.cancel(app)   // корутина монитора гаснет — снять запланированный тик
+        }
+    }
+
+    private const val CYCLE_WAKELOCK_TIMEOUT_MS = 10 * 60_000L   // страховка от утечки; нормальный цикл — секунды
+    private fun acquireCycleLock(wl: PowerManager.WakeLock?) {
+        runCatching { if (wl != null && !wl.isHeld) wl.acquire(CYCLE_WAKELOCK_TIMEOUT_MS) }
+    }
+    private fun releaseCycleLock(wl: PowerManager.WakeLock?) {
+        runCatching { if (wl?.isHeld == true) wl.release() }
     }
 
     /**

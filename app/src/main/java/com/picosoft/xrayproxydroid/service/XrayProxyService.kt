@@ -59,6 +59,9 @@ class XrayProxyService : Service() {
     // Промпт 95.B: экран включён / устройство вышло из простоя → немедленная проверка связи (в Doze циклы
     // растягиваются и после пробуждения монитор может не успеть — событие компенсирует).
     private var screenReceiver: android.content.BroadcastReceiver? = null
+    // Промпт 118: приёмник ТИКА точного будильника монитора. Будильник просыпается в Doze и доставляет этот
+    // бродкаст → будим цикл монитора (он сам возьмёт wake-lock на время проверки). Приёмник свой, не системный.
+    private var alarmReceiver: android.content.BroadcastReceiver? = null
 
     // Обход ЧУЖОГО системного VPN (Промпт 57/60). coreActive — ядро поднято (привязать исходящие ДО
     // первого дозвона). lastRelation — для логирования СМЕНЫ СОСТОЯНИЯ. bypassRetryAfterMs — троттлинг
@@ -98,6 +101,7 @@ class XrayProxyService : Service() {
         }
         registerNetworkCallback()
         registerScreenReceiver()
+        registerAlarmReceiver()
     }
 
     private fun registerScreenReceiver() {
@@ -109,6 +113,24 @@ class XrayProxyService : Service() {
             addAction(Intent.ACTION_USER_PRESENT)
         }
         runCatching { registerReceiver(r, f); screenReceiver = r }
+    }
+
+    /**
+     * Промпт 118: приёмник тика будильника монитора. Действие СВОЁ (не системное) → на Android 14+ обязателен
+     * флаг RECEIVER_NOT_EXPORTED. Короткий wake-lock (5с) мостит зазор между доставкой бродкаста и тем, как
+     * корутина монитора возьмёт свой лок на цикл; будим монитор тем же каналом, что экран/сеть.
+     */
+    private fun registerAlarmReceiver() {
+        val r = object : android.content.BroadcastReceiver() {
+            override fun onReceive(c: Context?, i: Intent?) {
+                val pm = getSystemService(POWER_SERVICE) as? android.os.PowerManager
+                runCatching { pm?.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "xray:monitor-tick")?.acquire(5_000L) }
+                Log.i("MonitorAlarm", "tick received (idle=${pm?.isDeviceIdleMode})")   // Промпт 118: виден факт срабатывания будильника (в т.ч. в Doze)
+                MonitorCoordinator.wake()
+            }
+        }
+        val f = android.content.IntentFilter(com.picosoft.xrayproxydroid.monitor.MonitorAlarm.ACTION_TICK)
+        runCatching { ContextCompat.registerReceiver(this, r, f, ContextCompat.RECEIVER_NOT_EXPORTED); alarmReceiver = r }
     }
 
     private fun registerNetworkCallback() {
@@ -406,6 +428,9 @@ class XrayProxyService : Service() {
         netCallback = null
         screenReceiver?.let { r -> runCatching { unregisterReceiver(r) } }
         screenReceiver = null
+        alarmReceiver?.let { r -> runCatching { unregisterReceiver(r) } }
+        alarmReceiver = null
+        com.picosoft.xrayproxydroid.monitor.MonitorAlarm.cancel(applicationContext)   // Промпт 118: снять запланированный тик
         com.picosoft.xrayproxydroid.monitor.TunnelHealth.reset()
         // Страховка: если сервис уничтожают — гасим ядро.
         if (XrayController.isRunning) {
