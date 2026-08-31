@@ -11,11 +11,14 @@ import androidx.core.content.ContextCompat
 import com.picosoft.xrayproxydroid.monitor.MonitorCoordinator
 import com.picosoft.xrayproxydroid.monitor.MonitorLog
 import com.picosoft.xrayproxydroid.monitor.NetworkMonitor
+import com.picosoft.xrayproxydroid.monitor.ServerLabels
 import com.picosoft.xrayproxydroid.net.NetworkUtils
 import com.picosoft.xrayproxydroid.net.VpnRelation
 import com.picosoft.xrayproxydroid.settings.SettingsStore
+import com.picosoft.xrayproxydroid.subscription.SubscriptionManager
 import com.picosoft.xrayproxydroid.traffic.TrafficTracker
 import com.picosoft.xrayproxydroid.xray.XrayConfig
+import com.picosoft.xrayproxydroid.xray.XrayConfigBuilder
 import com.picosoft.xrayproxydroid.xray.XrayController
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
@@ -214,9 +217,15 @@ class XrayProxyService : Service() {
             ACTION_START -> handleStart(intent)
             ACTION_STOP -> handleStop()
             ACTION_RETRY_BYPASS -> { bypassRetryAfterMs = 0L; scheduleVpnBypass() }   // «Повторить» из статус-бокса
+            // Промпт 115: intent==null при START_STICKY = система ВЕРНУЛА сервис после убийства (данные в
+            // намерении не передаются). Поднимаем последний сервер из LastServerStore, а не стопаемся.
+            null -> if (intent == null) handleRestartAfterKill() else stopSelfAndForeground()
             else -> stopSelfAndForeground()
         }
-        return START_NOT_STICKY
+        // Промпт 115: START_STICKY — система должна САМА вернуть сервис после убийства по памяти (без него
+        // не было ни монитора, ни порта 10815, Телеграм оставался без прокси). Осознанный стоп (handleStop→
+        // stopSelf) сбрасывает sticky-рестарт, так что «Стоп» пользователя не воскрешает сервис.
+        return START_STICKY
     }
 
     private fun handleStart(intent: Intent) {
@@ -234,8 +243,49 @@ class XrayProxyService : Service() {
 
         coreActive = true
         bypassRetryAfterMs = 0L   // ручной (пере)запуск = действие пользователя → снять троттлинг отката
+        Thread { runCoreStart(config, label, serverKey) }.start()
+    }
 
+    /**
+     * Промпт 115: ВОЗВРАТ ПОСЛЕ УБИЙСТВА системой (START_STICKY → onStartCommand с null-intent). Данных в
+     * намерении нет — поднимаем ПОСЛЕДНИЙ успешный сервер из [LastServerStore] (как автозапуск, но БЕЗ полного
+     * теста: это не открытие человеком). Нет сохранённого сервера/профиля/конфига — ядро вслепую НЕ поднимаем,
+     * а завершаем сервис и пишем событие. Записываем и факт восстановления с оценкой простоя (по heartbeat).
+     */
+    private fun handleRestartAfterKill() {
+        // Сразу в foreground (иначе ANR/таймаут FGS), затем в фоне поднимаем последний сервер.
+        startForeground(NotificationHelper.NOTIFICATION_ID, NotificationHelper.buildNotification(this, "восстановление…"))
+        ProxyState.update(running = false, label = null, serverKey = null, message = "восстановление после сбоя…")
+        coreActive = true
+        bypassRetryAfterMs = 0L
+        val downtimeMs = LastServerStore.lastAlive(applicationContext).let { if (it > 0L) System.currentTimeMillis() - it else -1L }
         Thread {
+            try {
+                val lastKey = LastServerStore.load(applicationContext)
+                val profile = lastKey?.let { k -> SubscriptionManager.allServers(applicationContext).firstOrNull { SubscriptionManager.serverKey(it) == k } }
+                val config = profile?.let { runCatching { XrayConfigBuilder.build(it) }.getOrNull() }
+                if (profile == null || config == null) {
+                    MonitorLog.event(
+                        applicationContext, "monitor", "Сервис убит системой — восстановить нечем",
+                        if (lastKey == null) "нет сохранённого сервера" else "последнего сервера нет в списке / конфиг не собрался",
+                    )
+                    runCatching { stopSelfAndForeground() }
+                    return@Thread
+                }
+                val label = ServerLabels.full(profile)
+                val serverKey = SubscriptionManager.serverKey(profile)
+                val downtimeStr = if (downtimeMs in 0..(48L * 3600_000L)) "простой ~${downtimeMs / 1000}с" else "простой неизвестен"
+                MonitorLog.event(applicationContext, "monitor", "Сервис был убит системой — восстанавливаюсь", "$downtimeStr · сервер: $label")
+                runCoreStart(config, label, serverKey)
+            } catch (e: Exception) {
+                Log.w("XrayProxyService", "восстановление после убийства упало (проглочено): ${e.message}", e)
+                runCatching { stopSelfAndForeground() }
+            }
+        }.start()
+    }
+
+    /** Блокирующий подъём ядра (обход VPN → старт xray → пробы портов). Зовётся из ФОНОВОГО потока. */
+    private fun runCoreStart(config: String, label: String?, serverKey: String?) {
           // Весь поток старта под перехватом: любая ошибка (в т.ч. сетевого API) → сообщение + стоп, НЕ падение.
           try {
             // Привязку МИМО чужого VPN ставим ДО старта ядра (его первый дозвон уже мимо VPN). На фоне,
@@ -278,7 +328,6 @@ class XrayProxyService : Service() {
             runCatching { ProxyState.update(running = false, label = label, serverKey = serverKey, message = "ОШИБКА старта: ${e.message}") }
             runCatching { stopSelfAndForeground() }
           }
-        }.start()
     }
 
     /** Запустить цикл монитора (идемпотентно). Зовётся реактивным коллектором в onCreate. */
@@ -316,10 +365,16 @@ class XrayProxyService : Service() {
         TrafficTracker.attachContext(applicationContext)
         TrafficTracker.onServiceStart()
         polling = true
+        LastServerStore.heartbeat(applicationContext)   // Промпт 115: отметить живость сразу при старте туннеля
         Thread {
+            var lastHeartbeatMs = System.currentTimeMillis()
             while (polling && XrayController.isRunning) {
                 try { Thread.sleep(POLL_MS) } catch (e: InterruptedException) { break }
                 if (!polling) break
+                // Промпт 115: «пульс живости» раз в ~15с (не на каждый опрос — бережём запись prefs). На
+                // восстановлении после убийства простой ≈ now − последний пульс.
+                val nowMs = System.currentTimeMillis()
+                if (nowMs - lastHeartbeatMs >= 15_000L) { lastHeartbeatMs = nowMs; LastServerStore.heartbeat(applicationContext) }
                 // Ошибка одного опроса не должна ронять поток/процесс — пропускаем тик.
                 try {
                     XrayController.queryTunnelDelta()?.let { (rx, tx) ->

@@ -16,6 +16,7 @@ import android.content.Context
 object LastServerStore {
     private const val PREFS = "last_server"
     private const val KEY = "serverKey"
+    private const val KEY_ALIVE = "aliveHeartbeatMs"   // Промпт 115: «пульс живости» сервиса — для оценки простоя
 
     private fun prefs(context: Context) =
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -27,4 +28,13 @@ object LastServerStore {
 
     /** Ключ последнего успешного сервера или null, если ещё не подключались. */
     fun load(context: Context): String? = prefs(context).getString(KEY, null)
+
+    /** Промпт 115: отметить, что сервис ЖИВ сейчас (периодически из опроса трафика). На восстановлении после
+     *  убийства простой ≈ now − этот штамп. */
+    fun heartbeat(context: Context) {
+        prefs(context).edit().putLong(KEY_ALIVE, System.currentTimeMillis()).apply()
+    }
+
+    /** Время последнего «пульса» (мс) или 0, если сервис ещё ни разу не отмечался. */
+    fun lastAlive(context: Context): Long = prefs(context).getLong(KEY_ALIVE, 0L)
 }
