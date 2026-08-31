@@ -113,6 +113,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.math.roundToInt
+import com.picosoft.xrayproxydroid.service.BatteryOptimization
 import com.picosoft.xrayproxydroid.service.LastServerStore
 import com.picosoft.xrayproxydroid.service.ProxyState
 import com.picosoft.xrayproxydroid.service.SystemVpnState
@@ -164,6 +165,9 @@ class MainActivity : ComponentActivity() {
         const val OPEN_UPDATE = "update"       // открыть на «О приложении»/экране обновления
         // Запрос навигации (из уведомления) — StateFlow, чтобы AppRoot среагировал и при onNewIntent (приложение уже открыто).
         val pendingOpen = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
+        // Промпт 117: тик возврата на передний план. Системные экраны (исключение из энергосбережения)
+        // не уведомляют Compose об изменении — по возврату в приложение перечитываем isIgnored заново.
+        val resumeTick = kotlinx.coroutines.flow.MutableStateFlow(0)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -176,6 +180,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         MonitorCoordinator.wake()
+        resumeTick.value = resumeTick.value + 1   // Промпт 117: перечитать состояние исключения из энергосбережения
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -300,6 +305,7 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
     var settingsExpanded by rememberSaveable { mutableStateOf(false) }
     var blocklistExpanded by rememberSaveable { mutableStateOf(false) }
     var monitorExpanded by rememberSaveable { mutableStateOf(false) }
+    var bgWorkExpanded by rememberSaveable { mutableStateOf(false) }
     var trafficExpanded by rememberSaveable { mutableStateOf(false) }
     var crashExpanded by rememberSaveable { mutableStateOf(false) }
     val updateRec by UpdateStore.record.collectAsState()   // Промпт 93.K: та же полоса «новая версия» в настройках
@@ -369,6 +375,11 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
                     log = monitorLog,
                     onClearLog = { MonitorLog.clear(context) },
                 )
+            }
+        }
+        item {
+            CollapsibleSection("Работа в фоне", bgWorkExpanded, { bgWorkExpanded = !bgWorkExpanded }, icon = UiIcon.SHIELD) {
+                BackgroundWorkSection()
             }
         }
         item {
@@ -862,6 +873,12 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
     var showCrashBanner by remember { mutableStateOf(CrashReporter.hasUnseen()) }
     // Промпт 93.K: полоса «новая версия» — реактивно из UpdateStore (переживает перезапуск/возврат из «недавних»).
     val updateRec by UpdateStore.record.collectAsState()
+    // Промпт 117: полоса «разрешите работу в фоне». Показ ОДИН РАЗ при первом подключении, если приложение
+    // НЕ исключено из энергосбережения и пользователь полосу не закрывал. resumeTick → перечитать факт
+    // исключения после возврата с системного экрана. Крестик закрывает навсегда (isBannerDismissed).
+    val resumeTick by MainActivity.resumeTick.collectAsState()
+    val batteryIgnored = remember(resumeTick) { BatteryOptimization.isIgnored(context) }
+    var batteryBannerClosed by remember { mutableStateOf(BatteryOptimization.isBannerDismissed(context)) }
 
     // Внешний IP через активный туннель. "" = не запрашивался, "…" = идёт запрос, ip, "нет ответа".
     var externalIp by remember { mutableStateOf("") }
@@ -1382,6 +1399,18 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                     UpdateBanner(
                         versionName = updateRec.availName,
                         onDismiss = { UpdateStore.markDismissed(context); NotificationHelper.cancelUpdate(context) },
+                    )
+                }
+                // Промпт 117: полоса «разрешите работу в фоне» — при первом (и последующих) подключении, пока
+                // приложение не исключено из энергосбережения и пользователь полосу не закрыл. Не модальная,
+                // не выпрашивается при каждом запуске (крестик закрывает навсегда). Кнопка → системный диалог.
+                if (proxy.running && !batteryIgnored && !batteryBannerClosed) {
+                    BatteryOptBanner(
+                        onEnable = {
+                            runCatching { context.startActivity(BatteryOptimization.requestIntent(context)) }
+                                .onFailure { runCatching { context.startActivity(BatteryOptimization.settingsListIntent()) } }
+                        },
+                        onDismiss = { BatteryOptimization.dismissBanner(context); batteryBannerClosed = true },
                     )
                 }
                 // Промпт 74: подписок нет (дефолт не зафетчился при первом запуске или юзер их не добавил) —
@@ -3350,6 +3379,111 @@ private fun UpdateBanner(versionName: String, onDismiss: () -> Unit) {
                 progress = { (dl.done.toFloat() / dl.total).coerceIn(0f, 1f) },
                 modifier = Modifier.fillMaxWidth(),
             )
+        }
+    }
+}
+
+/**
+ * Полоса «разрешите работу в фоне» (Промпт 117) — в потоке экрана НАД списками (не модальное окно). Янтарь
+ * (важно, но не ошибка). Появляется при подключённом прокси, пока приложение не исключено из энергосбережения
+ * и пользователь полосу не закрыл. Короткое объяснение по делу + кнопка в системный диалог + крестик (навсегда).
+ */
+@Composable
+private fun BatteryOptBanner(onEnable: () -> Unit, onDismiss: () -> Unit) {
+    val bg = Color(0xFFE8710A)   // янтарь: важно, но не тревога (в отличие от красного «сбоя»)
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(bg)
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.Top,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(
+                "Разрешите работу в фоне",
+                style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold, color = Color.White,
+            )
+            Text(
+                "Без этого разрешения телефон отключает приложение в фоне, и прокси перестаёт работать для Телеграма и браузера.",
+                style = MaterialTheme.typography.bodySmall, color = Color(0xFFFFE0B2),
+            )
+            Button(
+                onClick = onEnable,
+                colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = bg),
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
+            ) { Text("Разрешить") }
+        }
+        Text("✕", color = Color.White, fontWeight = FontWeight.Bold,
+            modifier = Modifier.clip(RoundedCornerShape(6.dp)).clickable { onDismiss() }.padding(8.dp))
+    }
+}
+
+/**
+ * Секция «Работа в фоне» (Промпт 117) в настройках: честный индикатор готовности (исключено ли приложение из
+ * энергосбережения) + кнопка в системный диалог. На Samsung — инструкция про три вещи (оптимизация без
+ * ограничений, убрать из «спящих» и «глубоко спящих») с кнопками в нужные системные экраны. resumeTick →
+ * перечитать факт после возврата с системного экрана.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun BackgroundWorkSection() {
+    val context = LocalContext.current
+    val resumeTick by MainActivity.resumeTick.collectAsState()
+    val ignored = remember(resumeTick) { BatteryOptimization.isIgnored(context) }
+
+    fun openRequest() {
+        runCatching { context.startActivity(BatteryOptimization.requestIntent(context)) }
+            .onFailure { runCatching { context.startActivity(BatteryOptimization.settingsListIntent()) } }
+    }
+    fun openAppDetails() {
+        runCatching { context.startActivity(BatteryOptimization.appDetailsIntent(context)) }
+    }
+    fun openVendor() {
+        val vendor = BatteryOptimization.vendorBackgroundIntent()
+        val ok = vendor != null && runCatching { context.startActivity(vendor) }.isSuccess
+        if (!ok) openAppDetails()   // экран производителя неизвестен на этой версии One UI → «О приложении»
+    }
+
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        // Индикатор готовности — честно, по факту isIgnoringBatteryOptimizations.
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(if (ignored) "✓" else "✗",
+                color = if (ignored) Color(0xFF2E7D32) else Color(0xFFE8710A),
+                fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+            Text(
+                if (ignored) "Исключено из энергосбережения" else "Не исключено из энергосбережения",
+                style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold,
+                color = if (ignored) Color(0xFF2E7D32) else MaterialTheme.colorScheme.onSurface,
+            )
+        }
+        Text(
+            if (ignored)
+                "Приложение может работать в фоне без ограничений — прокси остаётся доступным для Телеграма и браузера, даже когда экран выключен."
+            else
+                "Без исключения телефон отключает приложение в фоне, и прокси перестаёт работать для Телеграма и браузера. Перезапуск после убийства помогает только когда система согласна перезапустить — из «спящих» она не поднимает вовсе.",
+            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+        )
+        if (!ignored) {
+            Button(onClick = { openRequest() }, modifier = Modifier.fillMaxWidth()) {
+                Text("Разрешить работу в фоне")
+            }
+        }
+        if (BatteryOptimization.isSamsung) {
+            Text(
+                "На Samsung важны три вещи:\n" +
+                    "1. Оптимизация батареи — «Без ограничений» (кнопка выше).\n" +
+                    "2. Убрать приложение из «Спящих приложений».\n" +
+                    "3. Убрать приложение из «Глубоко спящих приложений».\n" +
+                    "Пункты 2–3: «Уход за устройством» → «Батарея» → «Ограничения фоновой активности».",
+                style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+            )
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                val pad = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                OutlinedButton(onClick = { openVendor() }, contentPadding = pad) { Text("Уход за устройством") }
+                OutlinedButton(onClick = { openAppDetails() }, contentPadding = pad) { Text("Настройки приложения") }
+            }
         }
     }
 }
