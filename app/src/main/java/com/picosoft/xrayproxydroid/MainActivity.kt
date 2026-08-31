@@ -3421,10 +3421,11 @@ private fun BatteryOptBanner(onEnable: () -> Unit, onDismiss: () -> Unit) {
 }
 
 /**
- * Секция «Работа в фоне» (Промпт 117) в настройках: честный индикатор готовности (исключено ли приложение из
- * энергосбережения) + кнопка в системный диалог. На Samsung — инструкция про три вещи (оптимизация без
- * ограничений, убрать из «спящих» и «глубоко спящих») с кнопками в нужные системные экраны. resumeTick →
- * перечитать факт после возврата с системного экрана.
+ * Секция «Работа в фоне» (Промпт 117 + 120) в настройках: честный индикатор готовности (исключено ли
+ * приложение из энергосбережения) + кнопка в системный диалог + ГАРМОШКА подсказок по вендорам (10 марок +
+ * общий пункт). Оболочка текущего устройства (по Build.MANUFACTURER) стоит первой и раскрыта, остальные
+ * свёрнуты; общий пункт всегда последний (и запасной для опознанных). resumeTick → перечитать факт после
+ * возврата с системного экрана.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -3437,14 +3438,25 @@ private fun BackgroundWorkSection() {
         runCatching { context.startActivity(BatteryOptimization.requestIntent(context)) }
             .onFailure { runCatching { context.startActivity(BatteryOptimization.settingsListIntent()) } }
     }
+    // «Сведения о приложении» — ЕДИНСТВЕННОЕ намерение, резолвящееся на любой прошивке (Промпт 120.C).
     fun openAppDetails() {
         runCatching { context.startActivity(BatteryOptimization.appDetailsIntent(context)) }
     }
-    fun openVendor() {
+    // Samsung Device Care (проверен вживую, Промпт 118); компонент может отсутствовать → откат на «Сведения».
+    fun openSamsungCare() {
         val vendor = BatteryOptimization.vendorBackgroundIntent()
         val ok = vendor != null && runCatching { context.startActivity(vendor) }.isSuccess
-        if (!ok) openAppDetails()   // экран производителя неизвестен на этой версии One UI → «О приложении»
+        if (!ok) openAppDetails()
     }
+
+    // Порядок гармошки: своя оболочка первой, остальные — в порядке Промпта 120, общий пункт всегда последним.
+    val detectedId = remember { BatteryOptimization.detectVendorId() }
+    val ordered = remember(detectedId) {
+        val gs = BatteryOptimization.vendorGuides
+        val head = detectedId?.let { id -> gs.filter { it.id == id } } ?: emptyList()
+        head + gs.filter { it.id != detectedId } + BatteryOptimization.generalGuide
+    }
+    var expandedId by rememberSaveable { mutableStateOf(detectedId ?: "") }   // своя раскрыта; неопознан → ничего
 
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         // Индикатор готовности — честно, по факту isIgnoringBatteryOptimizations.
@@ -3470,21 +3482,74 @@ private fun BackgroundWorkSection() {
                 Text("Разрешить работу в фоне")
             }
         }
-        if (BatteryOptimization.isSamsung) {
-            Text(
-                "На Samsung важны три вещи:\n" +
-                    "1. Оптимизация батареи — «Без ограничений» (кнопка выше).\n" +
-                    "2. Убрать приложение из «Спящих приложений».\n" +
-                    "3. Убрать приложение из «Глубоко спящих приложений».\n" +
-                    "Пункты 2–3: «Уход за устройством» → «Батарея» → «Ограничения фоновой активности».",
-                style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+
+        // ── Гармошка подсказок по производителям ──
+        Spacer(Modifier.height(2.dp))
+        Text("Подсказки по производителю", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+        Text(
+            "Названия пунктов зависят от версии прошивки. Если точного названия нет — ищите по смыслу (автозапуск, фон, энергосбережение).",
+            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+        )
+        for (g in ordered) {
+            VendorGuideRow(
+                guide = g,
+                expanded = expandedId == g.id,
+                isCurrent = g.id == detectedId,
+                onToggle = { expandedId = if (expandedId == g.id) "" else g.id },
+                onAppDetails = { openAppDetails() },
+                onSamsungCare = { openSamsungCare() },
             )
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                val pad = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                OutlinedButton(onClick = { openVendor() }, contentPadding = pad) { Text("Уход за устройством") }
-                OutlinedButton(onClick = { openAppDetails() }, contentPadding = pad) { Text("Настройки приложения") }
+        }
+    }
+}
+
+/**
+ * Один пункт гармошки «Работа в фоне» (Промпт 120): заголовок (марки + оболочка, метка «ваш телефон» для
+ * текущего) раскрывается по нажатию, внутри — шаги и кнопки. Кнопки: «Сведения о приложении» (единственное
+ * намерение на любой прошивке) у всех; у Samsung дополнительно «Уход за устройством» (Device Care, с откатом).
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun VendorGuideRow(
+    guide: BatteryOptimization.VendorGuide,
+    expanded: Boolean,
+    isCurrent: Boolean,
+    onToggle: () -> Unit,
+    onAppDetails: () -> Unit,
+    onSamsungCare: () -> Unit,
+) {
+    val divCol = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.10f)
+    Column(Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().clickable { onToggle() }.padding(vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(if (expanded) "▾" else "▸", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+            Column(Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(guide.title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+                    if (isCurrent) Text("· ваш телефон", style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                }
+                if (guide.os.isNotEmpty())
+                    Text(guide.os, style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
             }
         }
+        if (expanded) {
+            Text(guide.steps, style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.padding(start = 20.dp, bottom = 6.dp))
+            FlowRow(
+                modifier = Modifier.padding(start = 20.dp, bottom = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                val pad = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                if (guide.id == "samsung")
+                    OutlinedButton(onClick = onSamsungCare, contentPadding = pad) { Text("Уход за устройством") }
+                OutlinedButton(onClick = onAppDetails, contentPadding = pad) { Text("Сведения о приложении") }
+            }
+        }
+        Box(Modifier.fillMaxWidth().height(1.dp).background(divCol))
     }
 }
 
