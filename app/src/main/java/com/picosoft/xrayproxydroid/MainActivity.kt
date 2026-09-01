@@ -2477,6 +2477,26 @@ private fun SettingsSection(
         DoubleSettingRow("Держать лучший: во сколько раз быстрее", "×", settings.keepBestMultiplier, d.keepBestMultiplier, 1.0, 100.0) {
             onChange(settings.copy(keepBestMultiplier = it))
         }
+        // Пр.126: периодический перемер «держать лучший» в фоне. ДЕФОЛТ ВЫКЛ (0) — замеры активного и кандидата
+        // пока несопоставимы (шум), а трафик дорогой (факт: ~2.7 ГБ/сут «Тест»). Включать осознанно.
+        Text(
+            "Периодический перемер кандидатов в фоне ищет сервер быстрее текущего. Дорого по трафику (по факту около 2.7 ГБ/сутки) и сейчас решает по неточным замерам — поэтому ВЫКЛючен по умолчанию. Включите числом часов на свой риск; ниже — предохранители.",
+            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+        )
+        IntSettingRow("Перемер «держать лучший»: раз в", "ч (0=выкл)", settings.monitorOptimizeSec / 3600, d.monitorOptimizeSec / 3600, 0, 24) {
+            onChange(settings.copy(monitorOptimizeSec = it * 3600))
+        }
+        if (settings.monitorOptimizeSec > 0) {
+            BoolSettingRow("Перемер только по Wi-Fi", settings.monitorOptimizeWifiOnly, d.monitorOptimizeWifiOnly) {
+                onChange(settings.copy(monitorOptimizeWifiOnly = it))
+            }
+            IntSettingRow("Не перемерять при простое дольше", "мин (0=всегда)", settings.monitorOptimizeIdleSkipSec / 60, d.monitorOptimizeIdleSkipSec / 60, 0, 240) {
+                onChange(settings.copy(monitorOptimizeIdleSkipSec = it * 60))
+            }
+            DoubleSettingRow("Не перемерять, если текущий быстрее", "Мбит/с (0=всегда)", settings.monitorOptimizeSkipAboveMbps, d.monitorOptimizeSkipAboveMbps, 0.0, 1000.0) {
+                onChange(settings.copy(monitorOptimizeSkipAboveMbps = it))
+            }
+        }
 
         SettingsGroupLabel("Соединение и отдача")
         IntSettingRow("Интервал проверки соединения", "с", settings.connectionCheckIntervalSec, d.connectionCheckIntervalSec, 30, 3600) {
