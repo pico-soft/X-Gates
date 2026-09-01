@@ -1085,13 +1085,15 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
     }
 
     fun onCancelFull() {
-        fullHandle?.cancel(); fullHandle = null
+        fullHandle?.cancel(); fullHandle = null   // Промпт 123.D: cancel() теперь рвёт и ИДУЩИЙ замер (abortCurrentMeasure)
         fullTesting = false
         MonitorCoordinator.fullTestRunning = false   // отмена теста — монитор снова может работать
         MonitorCoordinator.fullTestCancel = null
         TestProgress.finish("отменено")
         val pSnap = pingResults; val sSnap = speedResults
         Thread {
+            Thread.sleep(1200)                       // дать прерванному замеру закрыть соединение
+            ServerSpeedTester.resetMeasureAbort()    // Промпт 123.D: вернуть замеры — иначе монитор остаётся «нем»
             SubscriptionManager.applyPingResults(context, pSnap)
             SubscriptionManager.applySpeedResults(context, sSnap)
             activity.runOnUiThread { reloadServers() }

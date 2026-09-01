@@ -63,6 +63,7 @@ object FullTestRunner {
         onDone: (Result) -> Unit,
     ): Handle {
         val appCtx = context.applicationContext
+        ServerSpeedTester.resetMeasureAbort()   // Промпт 123.D: снять флаг отмены прошлого теста — иначе замеры «немы»
         val cancelled = AtomicBoolean(false)
         // Промпт 103: терминальное состояние прогресса — РОВНО ОДИН раз. Сторож фазы и штатное завершение
         // могут прийти оба; второй вызов onDone игнорируем, чтобы не дёргать флаги/персист/UI дважды.
@@ -287,6 +288,10 @@ object FullTestRunner {
             override fun cancel() {
                 cancelled.set(true)
                 pingHandle?.cancel()
+                // Промпт 123.D: флаг cancelled проверяется лишь МЕЖДУ замерами — идущий замер скорости
+                // (measureSpeed активного/кандидата, приоритетный замер) висел бы до своего таймаута.
+                // Рвём ИДУЩЕЕ соединение замера немедленно → «Прервать» действует за секунды, а не за минуты.
+                runCatching { ServerSpeedTester.abortCurrentMeasure() }
             }
         }
     }
