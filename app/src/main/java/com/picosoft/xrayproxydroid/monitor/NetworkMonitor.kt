@@ -1,6 +1,7 @@
 package com.picosoft.xrayproxydroid.monitor
 
 import android.content.Context
+import android.net.ConnectivityManager
 import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
@@ -88,6 +89,11 @@ object NetworkMonitor {
         var cycles = 0
         var lastSwitchMs = 0L
         var lastOptimizeMs = now()
+        // Пр.126.A: «через туннель давно нет трафика» — предохранитель перемера. Считаем ФАКТ трафика по
+        // приросту туннельных байт между циклами (temp-инстансы кандидатов сюда НЕ попадают; активная проба
+        // плашки попадает, но она под screenInteractive — при выключенном экране ночью пула нет → детектор чист).
+        var lastUserTrafficMs = now()
+        var lastTunnelBytes = 0L
         var lastSpeedSampleMs = 0L      // живая скорость плашки: когда последний раз сэмплировали
         var lastActiveProbeMs = 0L      // когда последний раз делали АКТИВНУЮ пробу (в простое)
         var lastExactAlarm = false      // Промпт 118: последний тик поставлен ТОЧНЫМ будильником? (для лога/диагностики)
@@ -130,6 +136,10 @@ object NetworkMonitor {
             }
             cycles++
             Log.i(TAG, "cycle $cycles (exactAlarm=$lastExactAlarm, wait=${waitMs / 1000}s, phase=$ph)")
+            // Пр.126.A: отметить факт трафика через туннель (прирост байт с прошлого цикла > порога).
+            val bytesNow = TrafficTracker.state.value.let { it.sessionRx + it.sessionTx }
+            if (lastTunnelBytes in 1..bytesNow && bytesNow - lastTunnelBytes > OPTIMIZE_IDLE_TRAFFIC_MIN_BYTES) lastUserTrafficMs = now()
+            lastTunnelBytes = bytesNow
 
             // ── СИГНАЛ A: есть ли интернет ВООБЩЕ (прямой канал) — отличаем «нет интернета» от «нет серверов» ──
             // Нет интернета → туннель чинить БЕССМЫСЛЕННО (ядро НЕ трогаем): честно «нет связи» + переспрос
@@ -157,11 +167,18 @@ object NetworkMonitor {
                         .onFailure { MonitorLog.event(app, "error", "Ошибка замера скорости", it.message ?: "") }
                         .getOrDefault(lastActiveProbeMs)
                 }
-                // Вторичное: «держать лучший» — ТОЛЬКО если monitorEnabled, в норме, раз в monitorOptimizeSec, без живого трафика.
-                // Пр.125.E: в режиме экономии периодический перемер кандидатов ОТКЛЮЧЁН полностью (главный фоновый расход).
-                if (!cur.trafficSaveMode && cur.monitorEnabled && cur.monitorOptimizeSec > 0 && now() - lastOptimizeMs >= cur.monitorOptimizeSec * 1000L && !userTrafficActive()) {
+                // Вторичное: «держать лучший». Пр.126.B: ДЕФОЛТ ВЫКЛ (monitorOptimizeSec=0) — замеры активного и
+                // кандидата несопоставимы, решения шли бы по шуму. Пр.125.E: в экономии тоже выкл. Когда пользователь
+                // включил — предохранители Пр.126.A (Wi-Fi / давно-нет-трафика / текущий-уже-быстрый) + не во время
+                // активной загрузки (чтобы не делить канал и не портить замер).
+                if (!cur.trafficSaveMode && cur.monitorEnabled && cur.monitorOptimizeSec > 0 && now() - lastOptimizeMs >= cur.monitorOptimizeSec * 1000L) {
                     lastOptimizeMs = now()
-                    runCatching { optimizeToFastest(app, cur) }.onFailure { MonitorLog.event(app, "error", "Ошибка оптимизации", it.message ?: "") }
+                    val skip = optimizeSkipReason(app, cur, lastUserTrafficMs)
+                    when {
+                        skip != null -> MonitorLog.event(app, "monitor", "Перемер пропущен (Пр.126)", skip)
+                        userTrafficActive() -> { /* идёт загрузка — не мешаем и не портим замер */ }
+                        else -> runCatching { optimizeToFastest(app, cur) }.onFailure { MonitorLog.event(app, "error", "Ошибка оптимизации", it.message ?: "") }
+                    }
                 }
                 continue
             }
@@ -221,6 +238,8 @@ object NetworkMonitor {
     }
 
     private const val CYCLE_WAKELOCK_TIMEOUT_MS = 10 * 60_000L   // страховка от утечки; нормальный цикл — секунды
+    // Пр.126.A: прирост туннельных байт за цикл выше этого = «шёл трафик» (не keepalive). 1 МБ — заведомо реальный.
+    private const val OPTIMIZE_IDLE_TRAFFIC_MIN_BYTES = 1_048_576L
     private fun acquireCycleLock(wl: PowerManager.WakeLock?) {
         runCatching { if (wl != null && !wl.isHeld) wl.acquire(CYCLE_WAKELOCK_TIMEOUT_MS) }
     }
@@ -382,6 +401,29 @@ object NetworkMonitor {
             MonitorLog.event(app, "monitor", "Нет живых серверов",
                 if (disabled.isEmpty()) "все источники включены" else "пользователь отказался включать")
         }
+    }
+
+    /** Активная сеть — платная (мобильная/лимитный хотспот)? Гейт «только Wi-Fi» для дорогого перемера (Пр.126.A). */
+    private fun isMeteredNetwork(app: Context): Boolean =
+        (app.getSystemService(ConnectivityManager::class.java))?.isActiveNetworkMetered ?: false
+
+    /**
+     * Пр.126.A: причина ПРОПУСТИТЬ периодический перемер «держать лучший» (null — можно мерить). Предохранители
+     * против дорогого трафика в фоне: платная сеть, давно нет трафика через туннель, текущий сервер уже быстрый.
+     */
+    private fun optimizeSkipReason(app: Context, s: AppSettings, lastUserTrafficMs: Long): String? {
+        if (s.monitorOptimizeWifiOnly && isMeteredNetwork(app)) return "мобильная/платная сеть — только по Wi-Fi"
+        if (s.monitorOptimizeIdleSkipSec > 0 && now() - lastUserTrafficMs > s.monitorOptimizeIdleSkipSec * 1000L)
+            return "через туннель давно нет трафика (${humanDur(now() - lastUserTrafficMs)}) — нечего оптимизировать"
+        if (s.monitorOptimizeSkipAboveMbps > 0) {
+            val curKey = ProxyState.state.value.serverKey
+            val curSpeed = curKey?.let { k ->
+                SubscriptionManager.allServers(app).firstOrNull { SubscriptionManager.serverKey(it) == k }?.speedMbps
+            } ?: 0.0
+            if (curSpeed >= s.monitorOptimizeSkipAboveMbps)
+                return "текущий уже быстрый (${fmt(curSpeed)} ≥ ${fmt(s.monitorOptimizeSkipAboveMbps)}) — улучшать нечего"
+        }
+        return null
     }
 
     /**
