@@ -29,21 +29,23 @@ object TunnelSpeed {
         val tunnelUpMbps: Double? = null,     // В ТУННЕЛЕ ↑; null = не замерено
         val measuredAtMs: Long = 0L,          // wall-clock последнего замера (0 = не было)
         val source: Source = Source.NONE,
+        // Промпт 123.B: serverKey сервера, чья это скорость. Сменился активный — числа НЕ его, UI их не показывает.
+        val serverKey: String = "",
     )
 
     private val _state = MutableStateFlow(Speed())
     val state: StateFlow<Speed> = _state.asStateFlow()
 
-    /** Активная проба: свежие прямой канал + туннель ↓/↑. */
-    fun setProbe(directDownMbps: Double?, tunnelDownMbps: Double?, tunnelUpMbps: Double?, nowMs: Long) {
-        _state.value = Speed(directDownMbps, tunnelDownMbps, tunnelUpMbps, nowMs, Source.PROBE)
+    /** Активная проба: свежие прямой канал + туннель ↓/↑ для сервера [serverKey]. */
+    fun setProbe(directDownMbps: Double?, tunnelDownMbps: Double?, tunnelUpMbps: Double?, nowMs: Long, serverKey: String) {
+        _state.value = Speed(directDownMbps, tunnelDownMbps, tunnelUpMbps, nowMs, Source.PROBE, serverKey)
     }
 
-    /** Живой трафик: обновляем только ТУННЕЛЬ, прямую скорость сохраняем от прошлой пробы (её пассивно не измерить). */
-    fun setLive(tunnelDownMbps: Double?, tunnelUpMbps: Double?, nowMs: Long) {
+    /** Живой трафик: обновляем только ТУННЕЛЬ для сервера [serverKey], прямую сохраняем от прошлой пробы. */
+    fun setLive(tunnelDownMbps: Double?, tunnelUpMbps: Double?, nowMs: Long, serverKey: String) {
         _state.value = _state.value.copy(
             tunnelDownMbps = tunnelDownMbps, tunnelUpMbps = tunnelUpMbps,
-            measuredAtMs = nowMs, source = Source.LIVE,
+            measuredAtMs = nowMs, source = Source.LIVE, serverKey = serverKey,
         )
     }
 

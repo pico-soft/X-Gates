@@ -146,7 +146,7 @@ object NetworkMonitor {
             val ip = ExternalIpChecker.fetch()
             if (ip != null) {
                 onRecovered(app)
-                TunnelHealth.ok(ip, now())
+                TunnelHealth.ok(ip, now(), ProxyState.state.value.serverKey ?: "")   // Пр.123.B: подтверждение принадлежит активному серверу
                 failures = 0; backoffMs = 0; restartedKeySinceOk = null   // Промпт 102: связь ок — сбросить «уже перезапускали»
                 MonitorStatus.update(true, "ок", now(), cycles)
                 // ЖИВАЯ скорость плашки (гибрид): раз в цикл сэмплируем — реальный трафик даёт скорость
@@ -168,7 +168,7 @@ object NetworkMonitor {
             // Живой трафик пользователя — тоже ФАКТ работы туннеля (сигнал B мог мигнуть).
             if (userTrafficActive()) {
                 onRecovered(app)
-                TunnelHealth.ok(TunnelHealth.snapshot().ip, now())
+                TunnelHealth.ok(TunnelHealth.snapshot().ip, now(), ProxyState.state.value.serverKey ?: "")
                 failures = 0; backoffMs = 0; restartedKeySinceOk = null   // Промпт 102
                 MonitorStatus.update(true, "ок (активный трафик)", now(), cycles)
                 continue
@@ -193,7 +193,7 @@ object NetworkMonitor {
                 SwitchResult.SWITCHED -> {
                     lastSwitchMs = now(); failures = 0; backoffMs = 0
                     val ip2 = ExternalIpChecker.fetch()   // подтвердить ФАКТОМ сразу
-                    if (ip2 != null) { TunnelHealth.ok(ip2, now()); onRecovered(app) }
+                    if (ip2 != null) { TunnelHealth.ok(ip2, now(), ProxyState.state.value.serverKey ?: ""); onRecovered(app) }
                     else TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "проверяю после переключения…")
                 }
                 SwitchResult.ABORTED -> { /* пользователь вмешался — оставляем как есть */ }
@@ -364,7 +364,7 @@ object NetworkMonitor {
         val mbps = ServerSpeedTester.measureActiveDownloadMbps(app)   // сопоставимо с кандидатами (Промпт 90.A)
         if (mbps > 0) {
             SubscriptionManager.applySpeedResults(app, mapOf(key to mbps))
-            TunnelSpeed.setProbe(null, mbps, null, now())   // начальная туннельная ↓ (прямую/↑ доберёт проба в простое)
+            TunnelSpeed.setProbe(null, mbps, null, now(), key)   // начальная туннельная ↓ (прямую/↑ доберёт проба в простое)
             MonitorLog.event(app, "monitor", "Скорость нового сервера", "${fmt(mbps)}")
         }
     }
@@ -458,7 +458,7 @@ object NetworkMonitor {
         if (dtSec > 0 && dRx + dTx > SPEED_PASSIVE_MIN_BYTES) {
             val down = dRx * 8.0 / dtSec / 1_000_000.0
             val up = dTx * 8.0 / dtSec / 1_000_000.0
-            TunnelSpeed.setLive(down, up, now())   // прямую скорость сохраняем от прошлой пробы
+            TunnelSpeed.setLive(down, up, now(), curKey)   // прямую скорость сохраняем от прошлой пробы
             return lastActiveProbeMs
         }
 
@@ -488,7 +488,7 @@ object NetworkMonitor {
         val down = ServerSpeedTester.measureActiveDownloadMbps(app)                          // В ТУННЕЛЕ ↓
         if (ProxyState.state.value.serverKey != curKey) return -1.0   // сервер сменили во время замера — не приписываем чужое
         val up = if (includeUpload) ServerSpeedTester.measureActiveUploadMbps(app) else -1.0 // В ТУННЕЛЕ ↑
-        TunnelSpeed.setProbe(direct, down.takeIf { it >= 0.0 }, up.takeIf { it >= 0.0 }, now())
+        TunnelSpeed.setProbe(direct, down.takeIf { it >= 0.0 }, up.takeIf { it >= 0.0 }, now(), curKey)
         if (down > 0) SubscriptionManager.applySpeedResults(app, mapOf(curKey to down))      // обновить «Живые»
         return down
     }

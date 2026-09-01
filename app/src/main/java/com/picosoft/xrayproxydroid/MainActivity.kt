@@ -880,8 +880,8 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
     val batteryIgnored = remember(resumeTick) { BatteryOptimization.isIgnored(context) }
     var batteryBannerClosed by remember { mutableStateOf(BatteryOptimization.isBannerDismissed(context)) }
 
-    // Внешний IP через активный туннель. "" = не запрашивался, "…" = идёт запрос, ip, "нет ответа".
-    var externalIp by remember { mutableStateOf("") }
+    // Промпт 123.B: внешний адрес НЕ хранится отдельной копией на экране — он живёт в TunnelHealth и
+    // принадлежит серверу (serverKey). Экран читает только его.
     // Промпт 95: единый ФАКТ-статус туннеля (движется монитором в сервисе; один процесс — общий синглтон).
     val health by TunnelHealth.state.collectAsState()
     // Живая скорость активного туннеля для плашки (гибрид: реальный трафик / проба в простое) — источник монитор.
@@ -939,17 +939,17 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
 
     // Внешний IP ЧЕРЕЗ активный SOCKS — реальная живость туннеля (не просто «сокет слушает»).
     fun refreshIp() {
+        val sk = ProxyState.state.value.serverKey ?: return   // Пр.123.B: подтверждение — ДЛЯ этого сервера
         if (!ProxyState.state.value.running) return
-        externalIp = "…"
         Thread {
             val ip = ExternalIpChecker.fetch()
             val nowMs = System.currentTimeMillis()
-            // Промпт 95: результат — в единый ФАКТ-статус. Успех = OK (зелёный); провал = связь не подтверждена
-            // (монитор запустит лестницу восстановления). Не оставляем «зелёный + прочерк».
-            if (ip != null) TunnelHealth.ok(ip, nowMs)
+            // Промпт 95/123: результат — в единый ФАКТ-статус, привязанный к серверу sk. Успех = OK (зелёный
+            // ТОЛЬКО для sk); провал = связь не подтверждена (монитор запустит лестницу). Внешний адрес НЕ храним
+            // отдельной копией — он живёт в TunnelHealth и принадлежит серверу.
+            if (ip != null) TunnelHealth.ok(ip, nowMs, sk)
             else if (TunnelHealth.snapshot().phase == TunnelHealth.Phase.OK)
                 TunnelHealth.setPhase(TunnelHealth.Phase.VERIFYING, nowMs, "связь не подтверждена — проверяю")
-            activity.runOnUiThread { externalIp = ip ?: "нет ответа" }
             MonitorCoordinator.wake()   // разбудить монитор для немедленной проверки/восстановления
         }.start()
     }
@@ -1053,10 +1053,14 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                             MonitorCoordinator.fullTestCancel = null; CrashContext.set("простой")
                             // «Готово» БЕЗ числа скорости: единый источник правды по скорости — ЖИВАЯ плашка
                             // (иначе «готово: 47» из temp-инстанса конфликтует с живым замером туннеля на плашке).
+                            // Промпт 123.B: НЕ захватываем имя сервера в итог (это была отдельная копия, расходившаяся
+                            // с плашкой). Имя активного сервера показывает ПЛАШКА (единый источник). Здесь — только исход.
                             TestProgress.finish(                             // бар гаснет, итог остаётся текстом
-                                if (r.cancelled) "Отменено"
-                                else r.connected?.let { "Готово · подключён к ${it.remarks.ifBlank { it.address }}" }
-                                    ?: "Готово · рабочих серверов не нашлось"
+                                when {
+                                    r.cancelled -> "Отменено"
+                                    r.connected != null -> "Готово"
+                                    else -> "Готово · рабочих серверов не нашлось"
+                                }
                             )
                             reloadServers()
                             // A (обратная связь после 0.23): активный сервер ПРИОРИТЕТНО — реальную скорость на
@@ -1305,12 +1309,12 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
     // Внешний IP запрашиваем при появлении подключения / смене активного сервера (даём туннелю осесть).
     LaunchedEffect(proxy.running, proxy.serverKey) {
         if (proxy.running) {
+            activeUploadMbps = null   // Пр.123.B: сменился сервер — прежняя отдача не его, обнуляем
             TunnelHealth.setPhase(TunnelHealth.Phase.VERIFYING, System.currentTimeMillis(), "проверяю связь…")
             MonitorCoordinator.wake()      // немедленная проверка (не ждать цикла)
             kotlinx.coroutines.delay(800)
             refreshIp()
         } else {
-            externalIp = ""
             activeUploadMbps = null         // прокси стоит → отдачи нет
         }
     }
@@ -1322,8 +1326,10 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
             if (ProxyState.state.value.running && !checking) refreshIp()
         }
     }
-    // Промпт 95.D: «зелёный» — ТОЛЬКО при факте OK (прошедший запрос). Никаких «зелёный + прочерк».
-    val ipVerified = proxy.running && health.phase == TunnelHealth.Phase.OK
+    // Промпт 95.D/123.C: «зелёный» — ТОЛЬКО когда запрос ФАКТИЧЕСКИ прошёл через туннель ИМЕННО активного
+    // сервера И подтверждение не старше HEALTH_FRESH_MS. Сменился сервер / устарело подтверждение → не зелёный,
+    // даже если ничего «не сломалось». Один источник: TunnelHealth (адрес принадлежит подтверждению).
+    val ipVerified = proxy.running && TunnelHealth.isConfirmedFor(proxy.serverKey, System.currentTimeMillis(), HEALTH_FRESH_MS)
 
     // Автозапуск при старте (по умолчанию, отключаемо в Настройках). Один раз за процесс. Два шага:
     //  1) МГНОВЕННАЯ СВЯЗЬ — сразу подключиться к последнему успешному серверу (если он ещё в списке),
@@ -1446,21 +1452,26 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                         "Рабочих серверов нет" + (if (health.lastCheckMs > 0) " · последняя попытка ${monitorTimeFmt.format(Date(health.lastCheckMs))}" else "")
                     else -> "Проверяю связь…"
                 }
+                // Промпт 123.B: адрес и живая скорость ПРИНАДЛЕЖАТ активному серверу. Совпадает ли ключ TunnelHealth/
+                // TunnelSpeed с активным serverKey — иначе это данные ПРЕЖНЕГО сервера, не показываем (ни адрес, ни числа).
+                val ipForActive = if (health.serverKey == proxy.serverKey) health.ip else ""
+                val ts = if (tunnelSpeed.serverKey == proxy.serverKey) tunnelSpeed else TunnelSpeed.Speed()
                 StatusBox(
                     running = proxy.running, verified = ipVerified,
-                    ipText = if (health.ip.isNotEmpty()) health.ip else externalIp,
+                    ipText = ipForActive,
                     statusLine = healthLine,
                     onRefreshIp = { refreshIp() },
                     serverName = activeServer?.let { displayName(it, blocklist) } ?: proxy.label,
                     subtitle = activeServer?.let { protoNetSec(it) },
                     speedMbps = activeServer?.let { effSpeed(it) },
                     uploadMbps = activeUploadMbps,
-                    // Живая скорость (гибрид) + время замера. Показываем ТОЛЬКО при OK; при обрыве говорит statusLine.
-                    directDownMbps = tunnelSpeed.directDownMbps,
-                    tunnelDownMbps = tunnelSpeed.tunnelDownMbps,
-                    tunnelUpMbps = tunnelSpeed.tunnelUpMbps,
-                    liveMeasuredAtMs = tunnelSpeed.measuredAtMs,
-                    tunnelOk = health.phase == TunnelHealth.Phase.OK,
+                    // Живая скорость (гибрид) + время замера — активного сервера. Показываем ТОЛЬКО при подтверждённой
+                    // свежей связи (ipVerified); при обрыве/устаревании говорит statusLine.
+                    directDownMbps = ts.directDownMbps,
+                    tunnelDownMbps = ts.tunnelDownMbps,
+                    tunnelUpMbps = ts.tunnelUpMbps,
+                    liveMeasuredAtMs = ts.measuredAtMs,
+                    tunnelOk = ipVerified,
                     hidden = activeHidden, blocked = activeBlocked,
                     problem = proxy.running && (
                         health.phase == TunnelHealth.Phase.NO_INTERNET ||
@@ -1721,14 +1732,17 @@ private fun StatusBox(
     val (bg, fg) = when {
         !running -> Color(0xFF3A3A3A) to Color(0xFFBDBDBD)             // серый — выключен
         problem -> Color(0xFF7F1D1D) to Color(0xFFFFCDD2)             // тёмно-красный — полный обрыв связи
+        // Промпт 123.C: зелёный/цвет-по-скорости — ТОЛЬКО когда связь ПОДТВЕРЖДЕНА фактом (verified). Пока не
+        // подтверждена (переключаемся/проверяем) — ЯНТАРНЫЙ, даже если у сервера есть скорость в списке. Раньше
+        // цвет брался от speedMbps (из реестра) РАНЬШЕ verified → «зелёный без туннеля» (тот самый дефект).
+        !verified -> Color(0xFF6D4C00) to Color(0xFFFFE082)          // подключаемся/проверяем — янтарный
         speedMbps != null && speedMbps > 0.0 -> when {
             speedMbps > 5.0  -> Color(0xFF1B5E20) to Color(0xFFA5D6A7) // зелёный — быстро
             speedMbps >= 1.0 -> Color(0xFF37474F) to Color(0xFFB0BEC5) // сине-серый — средне
             speedMbps >= 0.2 -> Color(0xFF5D4037) to Color(0xFFD7CCC8) // коричневый — медленно
             else             -> Color(0xFF5D2A2A) to Color(0xFFEF9A9A) // красно-коричневый — очень медленно
         }
-        verified -> Color(0xFF1B5E20) to Color(0xFFA5D6A7)           // подтверждён, скорость ещё не мерена — зелёный
-        else -> Color(0xFF6D4C00) to Color(0xFFFFE082)               // подключаемся/проверяем — янтарный
+        else -> Color(0xFF1B5E20) to Color(0xFFA5D6A7)               // подтверждён, скорость ещё не мерена — зелёный
     }
     Column(
         modifier = Modifier
@@ -2601,6 +2615,10 @@ private fun WordChip(word: String, count: Int, onRemove: () -> Unit) {
 
 // Формат времени для журнала монитора (только main-поток композиции → один экземпляр безопасен).
 private val monitorTimeFmt = SimpleDateFormat("dd.MM HH:mm:ss", Locale.getDefault())
+
+// Промпт 123.C: «зелёный» = подтверждение связи не старше этого. Монитор/12с-цикл подтверждают ~раз в 60с;
+// 3 мин = несколько пропущенных подтверждений → устарело, цвет меняем (даже если ничего не «сломалось»).
+private const val HEALTH_FRESH_MS = 180_000L
 
 /** «Сколько времени назад», объективно (Промпт 122): «12 сек» / «5 мин» / «2 ч 10 мин». Без «дня/ночи». */
 private fun humanAgo(ms: Long): String {
