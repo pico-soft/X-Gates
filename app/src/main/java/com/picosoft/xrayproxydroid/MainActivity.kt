@@ -1428,15 +1428,21 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                         )
                     }
                 }
-                // Промпт 95.D: явный текст, когда связь НЕ подтверждена фактом (не «зелёный молча»).
+                // Промпт 95.D/122: ОБЪЕКТИВНЫЙ статус (не «зелёный молча»). Только факты и время (без «дня/ночи»):
+                // нет интернета — так и пишем; туннель упал — «связь прервалась N назад» + что делаем сейчас.
                 val healthLine = when {
                     !proxy.running -> ""
                     health.phase == TunnelHealth.Phase.OK -> ""
-                    health.phase == TunnelHealth.Phase.NO_INTERNET -> "Нет интернета — проверьте сеть"
-                    health.phase == TunnelHealth.Phase.RECOVERING -> "Восстановление связи: ${health.detail.ifBlank { "перебор серверов" }}"
+                    health.phase == TunnelHealth.Phase.NO_INTERNET -> "Нет интернета"
+                    health.phase == TunnelHealth.Phase.RECOVERING -> {
+                        val ago = if (health.lastOkMs > 0)
+                            "Связь с сервером прервалась ${humanAgo(System.currentTimeMillis() - health.lastOkMs)} назад"
+                        else "Связь с сервером ещё не установлена"
+                        "$ago · ${health.detail.ifBlank { "подключаюсь к живому серверу" }}"
+                    }
                     health.phase == TunnelHealth.Phase.NO_SERVERS ->
-                        "Рабочих серверов сейчас нет" + (if (health.lastCheckMs > 0) " · посл. попытка ${monitorTimeFmt.format(Date(health.lastCheckMs))}" else "")
-                    else -> "Проверяется связь…"
+                        "Рабочих серверов нет" + (if (health.lastCheckMs > 0) " · последняя попытка ${monitorTimeFmt.format(Date(health.lastCheckMs))}" else "")
+                    else -> "Проверяю связь…"
                 }
                 StatusBox(
                     running = proxy.running, verified = ipVerified,
@@ -2593,6 +2599,16 @@ private fun WordChip(word: String, count: Int, onRemove: () -> Unit) {
 
 // Формат времени для журнала монитора (только main-поток композиции → один экземпляр безопасен).
 private val monitorTimeFmt = SimpleDateFormat("dd.MM HH:mm:ss", Locale.getDefault())
+
+/** «Сколько времени назад», объективно (Промпт 122): «12 сек» / «5 мин» / «2 ч 10 мин». Без «дня/ночи». */
+private fun humanAgo(ms: Long): String {
+    val sec = (ms / 1000).coerceAtLeast(0)
+    return when {
+        sec < 60 -> "$sec сек"
+        sec < 3600 -> "${sec / 60} мин"
+        else -> "${sec / 3600} ч ${(sec % 3600) / 60} мин"
+    }
+}
 
 /**
  * Секция «🛡️ Автомониторинг». Признак жизни в шапке (обновляется на месте, не в журнал) + настройки +

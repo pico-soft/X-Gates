@@ -268,7 +268,7 @@ object NetworkMonitor {
                     // пересоздаётся, код НИЖЕ может не выполниться; флаг object'а переживёт рестарт.
                     restartedKeySinceOk = startKey
                     MonitorLog.event(app, "monitor", "Восстановление 1: перезапуск ядра", ServerLabels.display(curSrv))
-                    TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "перезапуск ядра…")
+                    TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "пробую переподключиться к серверу")
                     XrayProxyService.start(app, cfg, ServerLabels.full(curSrv), startKey)
                     var waited = 0
                     while (waited < 8000 && (!ProxyState.state.value.running || ProxyState.state.value.serverKey != startKey)) { delay(500); waited += 500 }
@@ -305,6 +305,7 @@ object NetworkMonitor {
         if (aborted(startKey)) return SwitchResult.ABORTED
         MonitorLog.event(app, "monitor", "Никто не подошёл — обновляю подписки", "")
         MonitorStatus.update(true, "обновляю подписки", now(), 0)
+        TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "обновляю список серверов")
         runCatching { SubscriptionManager.refreshAllEnabled(app, cancelled = { aborted(startKey) }, onEach = { _, _ -> }) }
             .onFailure { MonitorLog.event(app, "error", "Ошибка обновления подписок", it.message ?: "") }
         if (aborted(startKey)) return SwitchResult.ABORTED
@@ -336,6 +337,8 @@ object NetworkMonitor {
         for ((i, c) in candidates.withIndex()) {
             if (aborted(startKey)) return SwitchResult.ABORTED
             MonitorStatus.update(true, "перебор $round: ${i + 1}/$total · ${ServerLabels.display(c)}", now(), 0)
+            // Промпт 122: тот же объективный текст — в плашку статуса связи (что делаем сейчас).
+            TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "перебираю живые серверы: ${i + 1}/$total")
             // Дешёвая проверка (Промпт 52): temp-инстанс + РЕАЛЬНАЯ передача нескольких КБ (байты пришли),
             // НЕ пинг/задержка — иначе «не пингуется, но работает» серверы отбрасывались бы молча. НЕ полный замер.
             if (!ServerSpeedTester.probeAlive(app, c)) continue
