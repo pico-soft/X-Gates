@@ -48,6 +48,11 @@ data class UpdateManifest(
     val versionName: String = "",
     val notes: String = "",                       // краткое описание изменений
     val artifacts: List<UpdateArtifact> = emptyList(),
+    // Промпт 121.C: имя пакета НАШЕГО приложения. Проверяем ДО скачивания APK, что найденный релиз наш
+    // (при переименованиях/редиректах легко попасть не туда). Пустое = старый манифест без поля —
+    // проверку ПРОПУСКАЕМ (не считаем чужим релизом), полагаемся на подпись. Пустая строка по умолчанию
+    // именно ради обратной совместимости со старыми update.json.
+    val packageName: String = "",
 )
 
 // ─────────────────────── типизированные исходы (как у подписок) ───────────────────────
@@ -63,6 +68,9 @@ enum class UpdateErrorKind(val text: String) {
     MANIFEST_PARSE("файл update.json повреждён или в неизвестном формате"),
     NO_ARTIFACT("в update.json нет сборки под вашу архитектуру и нет универсальной"),
     ASSET_MISSING("сборка указана в update.json, но отсутствует среди вложений релиза"),
+    // Промпт 121.C: манифест указывает ЧУЖОЙ пакет — не наш релиз (редирект/смена имени завёл не туда).
+    // Не скачиваем; пробуем следующий адрес из списка.
+    FOREIGN_RELEASE("найден релиз другого приложения (не наш пакет) — пропускаю этот адрес"),
     DOWNLOAD_FAILED("не удалось скачать файл обновления"),
     CHECKSUM_MISMATCH("контрольная сумма не совпала — файл повреждён или подменён"),
     SIGNATURE_MISMATCH("подпись файла не совпадает с установленным приложением"),
@@ -84,11 +92,15 @@ sealed interface UpdateCheckResult {
         val versionName: String,
         val notes: String,
         val artifact: UpdateArtifact,
-        val downloadUrl: String,
+        // Промпт 121.B: адреса скачивания APK по порядку (текущий адрес → запасные). Скачивание пробует по
+        // очереди; каждый идёт через полный каскад. Первый — [downloadUrl] для совместимости/лога.
+        val downloadUrls: List<String>,
         val sizeBytes: Long,
         val usingUniversal: Boolean,   // точной сборки под ABI нет → универсальная
-        val via: String = "",          // каким путём получены сведения (API / запасной)
-    ) : UpdateCheckResult
+        val via: String = "",          // каким путём и каким адресом получены сведения (API / запасной · repo)
+    ) : UpdateCheckResult {
+        val downloadUrl: String get() = downloadUrls.first()
+    }
 
     /**
      * По метке релиза (v0.11) версия НОВЕЕ, но update.json нет → скачать/проверить надёжно нельзя

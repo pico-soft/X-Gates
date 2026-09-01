@@ -59,31 +59,44 @@ object UpdateInstaller {
         val directT = s.subTimeoutSec * 1000
         val proxyT = s.subTimeoutSec * 1000 + 10_000
 
-        val res = CascadeFetch.download(
-            context, available.downloadUrl, UpdateChecker.UA, dest,
-            directTimeoutMs = directT, proxyTimeoutMs = proxyT, totalTimeoutMs = DOWNLOAD_TOTAL_TIMEOUT_MS,
-            expectedSize = available.sizeBytes, isCancelled = isCancelled, onProgress = onProgress,
-        )
-        if (res.bytes > 0) TrafficTracker.addTest(res.bytes)   // трафик скачивания — в поток «Тест»
-
-        if (res.cancelled) { dest.delete(); return DownloadOutcome.Fail(UpdateErrorKind.CANCELLED) }
-        if (!res.ok || !dest.exists()) {
-            dest.delete()
-            val detail = res.attempts.filterNot { it.skipped }.joinToString("; ") { "${it.stage.label}: ${it.note}" }
-            return DownloadOutcome.Fail(UpdateErrorKind.DOWNLOAD_FAILED, detail)
-        }
-
-        // 1 — контрольная сумма.
-        val actual = sha256Hex(dest)
-        if (!actual.equals(available.artifact.sha256, ignoreCase = true)) {
-            dest.delete()
-            return DownloadOutcome.Fail(
-                UpdateErrorKind.CHECKSUM_MISMATCH,
-                "ожидали ${available.artifact.sha256.take(16)}…, получили ${actual.take(16)}…",
+        // Промпт 121.B: адреса APK по порядку (текущий → запасные), каждый через полный каскад. Провал
+        // скачивания или несовпадение суммы — пробуем следующий адрес; успех с верной суммой — выходим.
+        val urls = available.downloadUrls.ifEmpty { listOf(available.downloadUrl) }
+        var lastFail: DownloadOutcome.Fail? = null
+        var downloaded = false
+        for (url in urls) {
+            if (isCancelled()) { dest.delete(); return DownloadOutcome.Fail(UpdateErrorKind.CANCELLED) }
+            val res = CascadeFetch.download(
+                context, url, UpdateChecker.UA, dest,
+                directTimeoutMs = directT, proxyTimeoutMs = proxyT, totalTimeoutMs = DOWNLOAD_TOTAL_TIMEOUT_MS,
+                expectedSize = available.sizeBytes, isCancelled = isCancelled, onProgress = onProgress,
             )
+            if (res.bytes > 0) TrafficTracker.addTest(res.bytes)   // трафик скачивания — в поток «Тест»
+            if (res.cancelled) { dest.delete(); return DownloadOutcome.Fail(UpdateErrorKind.CANCELLED) }
+            if (!res.ok || !dest.exists()) {
+                dest.delete()
+                val detail = res.attempts.filterNot { it.skipped }.joinToString("; ") { "${it.stage.label}: ${it.note}" }
+                lastFail = DownloadOutcome.Fail(UpdateErrorKind.DOWNLOAD_FAILED, "${hostOf(url)}: $detail")
+                continue
+            }
+            // 1 — контрольная сумма (тот же приём, что для чужого зеркала: не совпало — следующий адрес).
+            val actual = sha256Hex(dest)
+            if (!actual.equals(available.artifact.sha256, ignoreCase = true)) {
+                dest.delete()
+                lastFail = DownloadOutcome.Fail(
+                    UpdateErrorKind.CHECKSUM_MISMATCH,
+                    "${hostOf(url)}: ожидали ${available.artifact.sha256.take(16)}…, получили ${actual.take(16)}…",
+                )
+                continue
+            }
+            downloaded = true
+            break
         }
+        if (!downloaded) return lastFail ?: DownloadOutcome.Fail(UpdateErrorKind.DOWNLOAD_FAILED)
 
-        // 2 — сертификат подписи против установленного приложения.
+        // 2 — сертификат подписи против установленного приложения. ТЕРМИНАЛЬНО (адреса не перебираем):
+        // SHA-256 уже совпал с манифестом, значит файл тот; расхождение подписи = реальная подмена (Пр.121.C —
+        // подпись остаётся последним рубежом).
         when (verifySignature(context, dest)) {
             SignatureVerdict.OK -> {}
             SignatureVerdict.DEBUG_INSTALLED -> {
@@ -139,6 +152,8 @@ object UpdateInstaller {
     }
 
     // ─────────────────────── проверки ───────────────────────
+
+    private fun hostOf(url: String): String = runCatching { java.net.URL(url).host }.getOrNull() ?: url
 
     private fun sha256Hex(file: File): String {
         val md = MessageDigest.getInstance("SHA-256")

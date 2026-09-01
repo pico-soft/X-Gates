@@ -33,12 +33,26 @@ object UpdateChecker {
 
     private const val TAG = "UpdateChecker"
     const val OWNER = "pico-soft"
-    const val REPO = "XrayProxyDroid"
-    private const val API_LATEST = "https://api.github.com/repos/pico-soft/XrayProxyDroid/releases/latest"
-    // Запасной адрес без API: всегда ведёт на последний релиз (github.com → редирект на CDN вложения).
-    private const val LATEST_DOWNLOAD = "https://github.com/pico-soft/XrayProxyDroid/releases/latest/download"
     const val UA = "X-Gates-Updater"
     private const val MANIFEST_NAME = "update.json"
+
+    /** Один адрес репозитория и его URL-ы (API / запасной без API). Промпт 121.B. */
+    data class Repo(val owner: String, val repo: String) {
+        val slug: String get() = "$owner/$repo"
+        val apiLatest: String get() = "https://api.github.com/repos/$owner/$repo/releases/latest"
+        val latestDownload: String get() = "https://github.com/$owner/$repo/releases/latest/download"
+    }
+
+    /**
+     * СПИСОК АДРЕСОВ (Промпт 121.B): сначала НОВЫЙ (репозиторий переименован в X-Gates), при неудаче —
+     * СТАРЫЙ. Старый через редирект GitHub тоже ведёт на новый; держим его ЗАПАСНЫМ, пока у всех не будет
+     * версии со списком (уберём отдельной задачей). Неудача первого адреса — НЕ ошибка, просто переходим
+     * ко второму; каждый идёт через полный каскад. Касается всех трёх путей: API, манифест, APK.
+     */
+    val REPOS = listOf(
+        Repo("pico-soft", "X-Gates"),
+        Repo("pico-soft", "XrayProxyDroid"),
+    )
 
     /**
      * Сколько ждать подъёма СВОЕГО SOCKS перед АВТО-проверкой на холодном старте (Промпт 80.B). Автозапуск
@@ -52,7 +66,7 @@ object UpdateChecker {
     // говорит про остальные, поэтому в подробностях показываем результат по каждому отдельно.
     private const val NODE_API = "https://api.github.com/"
     private const val NODE_WEB = "https://github.com/robots.txt"
-    private const val NODE_CDN = "$LATEST_DOWNLOAD/$MANIFEST_NAME"   // github.com → редирект на release-assets.githubusercontent.com
+    private val NODE_CDN = "${REPOS.first().latestDownload}/$MANIFEST_NAME"   // github.com → редирект на release-assets.githubusercontent.com
     private const val NODE_PROBE_TIMEOUT_MS = 4000   // короткий: проба узла для диагностики, не тянем контент
 
     private val json = Json { ignoreUnknownKeys = true }
@@ -105,10 +119,11 @@ object UpdateChecker {
 
         if (verbose) Log.i(TAG, "──────── проверка обновления ────────")
 
-        val result: UpdateCheckResult = run {
+        // Проверка ОДНОГО адреса: API → вложение update.json → запасной адрес без API. Repo-aware.
+        fun checkRepo(repo: Repo): UpdateCheckResult {
             // ── 1. API releases/latest ──
-            val rel = request("API $API_LATEST (UA=$UA)", API_LATEST)
-            if (rel.attempts.any { it.result?.httpCode == 404 }) return@run UpdateCheckResult.NoReleases
+            val rel = request("API ${repo.apiLatest} (UA=$UA)", repo.apiLatest)
+            if (rel.attempts.any { it.result?.httpCode == 404 }) return UpdateCheckResult.NoReleases
 
             if (rel.ok) {
                 val release = runCatching { json.decodeFromString<GithubRelease>(rel.result!!.body) }.getOrNull()
@@ -116,13 +131,13 @@ object UpdateChecker {
                     val manifestAsset = release.assets.firstOrNull { it.name.equals(MANIFEST_NAME, ignoreCase = true) }
                     if (manifestAsset == null || manifestAsset.browserDownloadUrl.isBlank()) {
                         det.append("В релизе нет вложения update.json → путь по метке ${release.tagName}\n\n")
-                        return@run fallbackByTag(release)
+                        return fallbackByTag(release)
                     }
                     val mf = request("update.json ЧЕРЕЗ API: ${manifestAsset.browserDownloadUrl}", manifestAsset.browserDownloadUrl)
                     if (mf.ok) {
                         val manifest = runCatching { json.decodeFromString<UpdateManifest>(mf.result!!.body) }.getOrNull()
-                            ?: return@run UpdateCheckResult.Error(UpdateErrorKind.MANIFEST_PARSE, "вложение скачано, но JSON не разобран")
-                        return@run compareByManifest(manifest, release, via = "через API",
+                            ?: return UpdateCheckResult.Error(UpdateErrorKind.MANIFEST_PARSE, "вложение скачано, но JSON не разобран")
+                        return compareByManifest(manifest, release, repo, via = "через API · ${repo.slug}",
                             assetUrl = { fn -> release.assets.firstOrNull { it.name == fn }?.browserDownloadUrl })
                     }
                     // вложение не скачалось → пробуем запасной адрес ниже
@@ -130,18 +145,18 @@ object UpdateChecker {
             }
 
             // ── 2. ЗАПАСНОЙ адрес (76.E/77.C): update.json напрямую, БЕЗ API (тот же CDN — не панацея) ──
-            val fbUrl = "$LATEST_DOWNLOAD/$MANIFEST_NAME"
+            val fbUrl = "${repo.latestDownload}/$MANIFEST_NAME"
             val fb = request("update.json ЗАПАСНОЙ (без API): $fbUrl", fbUrl)
-            if (fb.attempts.any { it.result?.httpCode == 404 }) return@run UpdateCheckResult.NoReleases
+            if (fb.attempts.any { it.result?.httpCode == 404 }) return UpdateCheckResult.NoReleases
             if (fb.ok) {
                 val manifest = runCatching { json.decodeFromString<UpdateManifest>(fb.result!!.body) }.getOrNull()
-                    ?: return@run UpdateCheckResult.Error(UpdateErrorKind.MANIFEST_PARSE, "запасной скачан, но JSON не разобран")
-                return@run compareByManifest(manifest, release = null, via = "через запасной адрес",
-                    assetUrl = { fn -> "$LATEST_DOWNLOAD/$fn" })
+                    ?: return UpdateCheckResult.Error(UpdateErrorKind.MANIFEST_PARSE, "запасной скачан, но JSON не разобран")
+                return compareByManifest(manifest, release = null, repo, via = "через запасной адрес · ${repo.slug}",
+                    assetUrl = { fn -> "${repo.latestDownload}/$fn" })
             }
 
             // ── всё не вышло → типизированная ошибка (77.C / 80.C) ──
-            when {
+            return when {
                 // Прямой путь к GitHub заблокирован, а свой SOCKS не слушает = НЕ «GitHub недоступен»
                 // (узел жив, недоступен ПУТЬ). Нормально для приложения, которое туннель и даёт: подключить
                 // и повторить. Условие проверяем по факту порта, не по флагу (77.A). В деталь берём узел,
@@ -155,6 +170,22 @@ object UpdateChecker {
                 else ->
                     UpdateCheckResult.Error(UpdateErrorKind.MANIFEST_DOWNLOAD_FAILED, "не дошли: вложение=${lastHost(fb)}")
             }
+        }
+
+        // ── СПИСОК АДРЕСОВ (121.B): по очереди новый → старый. Available/UpToDate/AvailableUnverified —
+        // определённый НАШ ответ (стоп). NoReleases/Error (в т.ч. чужой релиз) — не ошибка, пробуем следующий.
+        val result: UpdateCheckResult = run {
+            var last: UpdateCheckResult = UpdateCheckResult.Error(UpdateErrorKind.API_UNAVAILABLE, "адреса не пробованы")
+            for ((idx, repo) in REPOS.withIndex()) {
+                if (REPOS.size > 1) det.append("═══ Адрес ${idx + 1}/${REPOS.size}: ${repo.slug} ═══\n")
+                val r = checkRepo(repo)
+                if (r is UpdateCheckResult.Available || r is UpdateCheckResult.UpToDate || r is UpdateCheckResult.AvailableUnverified)
+                    return@run r
+                last = r
+                val why = (r as? UpdateCheckResult.Error)?.kind?.name ?: r::class.simpleName ?: "нет результата"
+                if (idx < REPOS.lastIndex) det.append("→ адрес ${repo.slug}: $why — пробую следующий\n\n")
+            }
+            last
         }
 
         // Разбор по ТРЁМ узлам GitHub раздельно (80.C) — только на неуспехе (диагностика; happy-path не грузим).
@@ -204,11 +235,21 @@ object UpdateChecker {
     private fun compareByManifest(
         manifest: UpdateManifest,
         release: GithubRelease?,
+        repo: Repo,
         via: String,
         assetUrl: (String) -> String?,
     ): UpdateCheckResult {
+        // Промпт 121.C: релиз НАШ? Имя пакета из манифеста сверяем ДО скачивания APK (при редиректах/смене
+        // имени легко попасть не туда). Пусто = старый манифест без поля → проверку ПРОПУСКАЕМ (полагаемся
+        // на подпись — последний рубеж), чтобы не сломать переход.
+        if (manifest.packageName.isNotBlank() && manifest.packageName != BuildConfig.APPLICATION_ID)
+            return UpdateCheckResult.Error(UpdateErrorKind.FOREIGN_RELEASE,
+                "манифест указывает ${manifest.packageName}, наш ${BuildConfig.APPLICATION_ID}")
+
         val current = BuildConfig.VERSION_CODE
         val latestName = manifest.versionName.ifBlank { release?.let { it.name.ifBlank { it.tagName } } ?: "" }
+        // Промпт 121.C: строго БОЛЬШЕ установленного (не «отличается») — иначе редирект на старый репозиторий
+        // мог бы предложить ОТКАТ на прежнюю версию. versionCode == current и < current → «последняя».
         if (manifest.versionCode <= current) return UpdateCheckResult.UpToDate(current, latestName, via)
 
         val exact = Build.SUPPORTED_ABIS?.firstNotNullOfOrNull { abi ->
@@ -219,8 +260,13 @@ object UpdateChecker {
         if (artifact == null || artifact.fileName.isBlank())
             return UpdateCheckResult.Error(UpdateErrorKind.NO_ARTIFACT)
 
-        val url = assetUrl(artifact.fileName)
-        if (url.isNullOrBlank())
+        // Промпт 121.B: адреса скачивания APK по порядку — сначала с текущего адреса (API browser_download_url
+        // или releases/latest/download этого repo), затем releases/latest/download каждого адреса из списка.
+        val urls = buildList {
+            assetUrl(artifact.fileName)?.takeIf { it.isNotBlank() }?.let { add(it) }
+            for (r in REPOS) add("${r.latestDownload}/${artifact.fileName}")
+        }.distinct()
+        if (urls.isEmpty())
             return UpdateCheckResult.Error(UpdateErrorKind.ASSET_MISSING, artifact.fileName)
         val size = release?.assets?.firstOrNull { it.name == artifact.fileName }?.size?.takeIf { it > 0 } ?: -1
 
@@ -229,7 +275,7 @@ object UpdateChecker {
             versionName = latestName,
             notes = manifest.notes.ifBlank { release?.body ?: "" },
             artifact = artifact,
-            downloadUrl = url,
+            downloadUrls = urls,
             sizeBytes = size,
             usingUniversal = exact == null,
             via = via,

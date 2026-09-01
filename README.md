@@ -1,5 +1,8 @@
 # X-Gates
 
+> Ранее репозиторий назывался **XrayProxyDroid**. Старые ссылки продолжают работать через
+> перенаправление GitHub, установленные версии обновляются автоматически.
+
 Android-приложение для обхода блокировок: поднимает **локальный SOCKS/HTTP-прокси** на движке
 **xray-core** и гоняет трафик через зарубежные серверы (`vless` / `vmess` / `trojan` / `shadowsocks`)
 из ваших подписок. **Без VpnService** — работает как локальный прокси (модель Termux), поэтому
@@ -24,7 +27,7 @@ Android-приложение для обхода блокировок: подн�
 
 ## Установка
 
-Скачайте APK со страницы [**Releases**](https://github.com/pico-soft/XrayProxyDroid/releases/latest):
+Скачайте APK со страницы [**Releases**](https://github.com/pico-soft/X-Gates/releases/latest):
 
 - большинству телефонов — `…-arm64-v8a.apk`;
 - очень старые устройства — `…-armeabi-v7a.apk`; эмулятор — `…-x86_64.apk`;
