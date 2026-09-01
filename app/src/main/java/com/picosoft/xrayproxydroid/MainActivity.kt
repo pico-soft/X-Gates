@@ -814,6 +814,21 @@ private fun buildDiscriminators(servers: List<ServerProfile>, bl: Blocklist): Ma
     return result
 }
 
+// Промпт 123.E: давность замера скорости в списке — «24 Мбит/с минутной давности» ≠ «двухдневной».
+private val speedTsFmt = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
+private fun speedAgeText(ts: String?): String {
+    if (ts.isNullOrBlank()) return ""
+    val t = runCatching { speedTsFmt.parse(ts)?.time }.getOrNull() ?: return ""
+    val min = (System.currentTimeMillis() - t) / 60_000
+    return when {
+        min < 0 -> ""
+        min < 1 -> "сейчас"
+        min < 60 -> "$min мин"
+        min < 1440 -> "${min / 60} ч"
+        else -> "${min / 1440} дн"
+    }
+}
+
 /** Компактная ячейка скорости (число: ≥10 → целое, <10 → 1 знак; единица «Мбит/с» — в шапке). */
 private fun speedCell(mbps: Double?): String = when {
     mbps == null -> "—"
@@ -2145,15 +2160,22 @@ private fun ServerRow(
                     )
                 }
             }
-            Text(
-                speedCell(speedMbps),
-                modifier = Modifier.width(COL_SPEED),
-                fontSize = TABLE_FONT,
-                fontWeight = FontWeight.Bold,
-                color = speedColor(speedMbps),
-                textAlign = TextAlign.End,
-                maxLines = 1,
-            )
+            // Скорость + под ней ДАВНОСТЬ замера тем же мелким шрифтом (Промпт 123.E): цифра без давности
+            // вводит в заблуждение (24 Мбит/с минутной и двухдневной давности выглядят одинаково).
+            Column(modifier = Modifier.width(COL_SPEED), horizontalAlignment = Alignment.End) {
+                Text(
+                    speedCell(speedMbps),
+                    fontSize = TABLE_FONT,
+                    fontWeight = FontWeight.Bold,
+                    color = speedColor(speedMbps),
+                    textAlign = TextAlign.End,
+                    maxLines = 1,
+                )
+                val age = speedAgeText(profile.speedTestedTs)
+                if (age.isNotEmpty() && speedMbps != null && speedMbps > 0.0) {
+                    Text(age, fontSize = TABLE_FONT_SUB, color = TABLE_GRAY, maxLines = 1)
+                }
+            }
             // Запуск сервера — ЗАМЕТНАЯ залитая круглая кнопка (Промпт 93): треугольник Play на фоне primary;
             // активный — точка (подключён). ЕДИНСТВЕННЫЙ элемент, по которому тап подключает.
             Box(
