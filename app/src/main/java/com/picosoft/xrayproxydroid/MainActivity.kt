@@ -1886,9 +1886,9 @@ private fun StatusBox(
 }
 
 /**
- * Блок «Трафик замеров» (Промпт 77) — в САМОМ НИЗУ «Настроек»: КРАТКОЕ предупреждение на зелёном поле +
- * переключатель РЕЖИМА ЭКОНОМИИ и его редактируемые параметры (размер батча, минимум живых, авто-обновление).
- * Замер = скачивание пробника (до 13 МБ/сервер), режим экономии мерит батчами до нескольких живых.
+ * Блок «Трафик замеров» (Промпт 77; ПЕРЕРАБОТАНО Пр.125) — в САМОМ НИЗУ «Настроек»: КРАТКОЕ предупреждение на
+ * зелёном поле + переключатель РЕЖИМА ЭКОНОМИИ с честным описанием, что именно он меняет (Пр.125.F), и одно
+ * поле — сколько кандидатов мерить, когда прошлых замеров нет. Замер = скачивание пробника (до 13 МБ/сервер).
  */
 @Composable
 private fun TrafficBlock() {
@@ -1906,7 +1906,7 @@ private fun TrafficBlock() {
                 Text("Замер тратит трафик", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, color = fg)
             }
             Text(
-                "Замер скорости = скачивание пробника, до 13 МБ на сервер. Полный тест при старте, ~50 адресов ≈ 300–650 МБ (меряются все живые). Режим экономии ниже мерит батчами и останавливается на нескольких живых.",
+                "Замер скорости = скачивание пробника, до 13 МБ на сервер. Полный тест при старте, ~50 адресов ≈ 300–650 МБ (меряются все живые). Режим экономии ниже мерит только ОДИН выбранный сервер.",
                 style = MaterialTheme.typography.bodySmall, color = fg,
             )
         }
@@ -1915,18 +1915,20 @@ private fun TrafficBlock() {
             SettingsStore.update(context, settings.copy(trafficSaveMode = it))
         }
         if (settings.trafficSaveMode) {
+            // Пр.125.F: честно сказать, за что человек платит и на чём экономит.
             Text(
-                "Мерим лучших по пингу батчами; набрали нужное число живых — стоп. Полный тест при старте больше не гоняет всех.",
+                "Что меняется: пинг живых — как обычно (дёшев). Замер скорости — только у ВЫБРАННОГО сервера, " +
+                    "не у всех. Выбор — по прошлым замерам (от быстрых к медленным); ниже порога — берём следующий. " +
+                    "Фоновая оптимизация «держать лучший» и плановые пробы плашки — отключены; остаются только " +
+                    "дешёвые проверки связи. Переключение — при реальной потере связи, не ради лучшей скорости.",
+                style = MaterialTheme.typography.bodySmall, color = fg,
+            )
+            Text(
+                "Когда прошлых замеров нет (первый запуск / список только обновлён), выбирать не по чему — тогда мерим несколько первых по пингу и берём лучшего.",
                 style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
             )
-            IntSettingRow("Мерить за шаг (top по пингу)", "", settings.trafficSaveBatch, d.trafficSaveBatch, 1, 50) {
-                SettingsStore.update(context, settings.copy(trafficSaveBatch = it))
-            }
-            IntSettingRow("Достаточно живых — стоп", "", settings.trafficSaveMinAlive, d.trafficSaveMinAlive, 1, 20) {
-                SettingsStore.update(context, settings.copy(trafficSaveMinAlive = it))
-            }
-            IntSettingRow("Авто-обновление подписок", "ч", settings.trafficSaveRefreshSec / 3600, d.trafficSaveRefreshSec / 3600, 1, 24) {
-                SettingsStore.update(context, settings.copy(trafficSaveRefreshSec = it * 3600))
+            IntSettingRow("Мерить кандидатов, когда данных нет", "", settings.trafficSaveBlindProbe, d.trafficSaveBlindProbe, 1, 10) {
+                SettingsStore.update(context, settings.copy(trafficSaveBlindProbe = it))
             }
         }
     }
