@@ -23,9 +23,12 @@ import kotlin.math.roundToInt
  *
  * РУЧНОЙ ЗАПУСК = мерим ВСЕХ живых по очереди (Промпт 82: пользователь ждёт полной картины), но не дольше
  * общего БЮДЖЕТА времени [fullTestBudgetSec] (защита от зависания на медленных). Ступенчатый top-N по
- * скорости — НЕ здесь: это забота монитора «держать самый быстрый» (NetworkMonitor). Единственное сокращение
- * ручного теста — РЕЖИМ ЭКОНОМИИ ([trafficSaveMode], явный опт-ин): кандидаты по ПИНГУ, батчами по
- * [trafficSaveBatch], стоп по [trafficSaveMinAlive] живых.
+ * скорости — НЕ здесь: это забота монитора «держать самый быстрый» (NetworkMonitor).
+ *
+ * РЕЖИМ ЭКОНОМИИ ([trafficSaveMode], Пр.125) — совсем ДРУГОЙ путь ([startEconomyPhase]): пинг живых остаётся,
+ * но фазу скорости НЕ гоняем по всем. Кандидаты упорядочены по СОХРАНЁННОЙ скорости [speedMbps]; подключаемся
+ * к первому и мерим ТОЛЬКО активного (Пр.125.D — скорость показываем всегда); ниже порога — следующий; стоп на
+ * первом годном. Нет прошлых замеров — честный текст + замер первых [trafficSaveBlindProbe] по пингу.
  *
  * proxy-check НЕ нужен — real-ping уже проходит весь протокол до бэкенда и тянет URL через туннель.
  */
@@ -81,7 +84,140 @@ object FullTestRunner {
         fun label(p: ServerProfile) = p.remarks.ifBlank { p.address }
         fun fmt(v: Double) = "${(v * 10).roundToInt() / 10.0}"
 
-        // --- Этап 2: speed + early-connect, ПОСЛЕДОВАТЕЛЬНО с батч-остановкой ---
+        // --- Этап 2 в РЕЖИМЕ ЭКОНОМИИ (Пр.125): опираемся на СОХРАНЁННЫЕ замеры, мерим ТОЛЬКО выбранного ---
+        // Режим НЕ отсеивает серверы — меняет СПОСОБ ВЫБОРА. Пинг живых уже сделан (дёшев). Здесь:
+        //  • есть прошлые замеры → упорядочить кандидатов по ИЗВЕСТНОЙ скорости (быстрые первыми), подключаться
+        //    по одному и мерить ТОЛЬКО активного; первый ≥ порога — стоп. Массового замера НЕТ.
+        //  • прошлых замеров нет (первый запуск / список обновлён) → честно сказать и померить первых
+        //    [trafficSaveBlindProbe] по пингу temp-инстансом, выбрать лучшего.
+        // Скорость активного ВСЕГДА измеряется и показывается (Пр.125.D). Сторож завершения — как в обычном режиме.
+        fun startEconomyPhase(aliveByPing: List<ServerProfile>) {
+            val s = SettingsStore.current()
+            val threshold = s.monitorTunnelThreshold
+            val budgetMs = s.fullTestBudgetSec.coerceAtLeast(30) * 1000L
+            val known = aliveByPing.filter { (it.speedMbps ?: 0.0) > 0.0 }
+                .sortedByDescending { it.speedMbps ?: 0.0 }
+            val blind = known.isEmpty()
+            // Порядок: известные по скорости (быстрые первыми) + остальные живые по пингу хвостом (запас, если
+            // все известные не пройдут). Вслепую — первые N по пингу (из чего выбрать).
+            val order: List<ServerProfile> =
+                if (!blind) known + aliveByPing.filter { (it.speedMbps ?: 0.0) <= 0.0 }
+                else aliveByPing.take(s.trafficSaveBlindProbe.coerceAtLeast(1))
+
+            onPhase(
+                if (blind) "Экономия: нет данных о скорости — выбор вслепую, мерю первых ${order.size} по пингу"
+                else "Экономия: выбор по прошлым замерам (${known.size}) — мерю только выбранного"
+            )
+            emitProgress(0, order.size)
+
+            val hbConnected = AtomicReference<ServerProfile?>(null)
+            val hbBest = AtomicReference<ServerProfile?>(null)
+            val lastMoveMs = AtomicLong(System.currentTimeMillis())
+            val phaseStartWall = System.currentTimeMillis()
+            fun beat() { lastMoveMs.set(System.currentTimeMillis()) }
+
+            Thread {
+                while (!doneFired.get()) {
+                    try { Thread.sleep(3_000) } catch (e: InterruptedException) { break }
+                    if (doneFired.get()) break
+                    val nowMs = System.currentTimeMillis()
+                    val overBudget = nowMs - phaseStartWall > budgetMs + 60_000
+                    val stalled = nowMs - lastMoveMs.get() > STALL_LIMIT_MS
+                    if (overBudget || stalled) {
+                        cancelled.set(true)
+                        runCatching {
+                            onPhase(
+                                if (overBudget) "Бюджет теста (${s.fullTestBudgetSec / 60} мин) исчерпан — завершаю"
+                                else "Замер завис (${STALL_LIMIT_MS / 1000}с без движения) — завершаю"
+                            )
+                        }
+                        finishOnce(Result(hbConnected.get() ?: hbBest.get(), hbBest.get(), 0.0, order.size, false))
+                        break
+                    }
+                }
+            }.apply { isDaemon = true }.start()
+
+            Thread {
+                var connected: ServerProfile? = null
+                var connectedSpeed = 0.0
+                var best: ServerProfile? = null
+                var bestSpeed = 0.0
+                var measured = 0
+                // Подключиться к серверу, дождаться что активен ИМЕННО он, затем измерить ЖИВОЙ туннель (Пр.125.D).
+                fun connectAndMeasureActive(p: ServerProfile): Double {
+                    connect(p)
+                    val k = key(p)
+                    var waited = 0
+                    while (waited < 8000 && (!ProxyState.state.value.running || ProxyState.state.value.serverKey != k)) {
+                        if (cancelled.get()) return -1.0
+                        try { Thread.sleep(500) } catch (e: InterruptedException) {}
+                        waited += 500
+                    }
+                    try { Thread.sleep(1000) } catch (e: InterruptedException) {}   // дать туннелю осесть
+                    if (cancelled.get() || ProxyState.state.value.serverKey != k) return -1.0
+                    return ServerSpeedTester.measureActiveDownloadMbps(appCtx)
+                }
+                try {
+                    if (blind) {
+                        // Пр.125.C: замерить первых N temp-инстансом (сопоставимо), выбрать лучшего, подключиться.
+                        for ((i, p) in order.withIndex()) {
+                            if (cancelled.get()) break
+                            if ((System.currentTimeMillis() - phaseStartWall) > budgetMs) break
+                            onPhase("Экономия (вслепую): замер ${i + 1}/${order.size} · ${label(p)}")
+                            val mbps = ServerSpeedTester.measureSpeed(appCtx, p)
+                            if (cancelled.get()) break
+                            measured++
+                            onSpeedResult(p, mbps)
+                            if (mbps > bestSpeed) { bestSpeed = mbps; best = p; hbBest.set(p) }
+                            emitProgress(measured, order.size); beat()
+                        }
+                        val pick = best
+                        if (pick != null && !cancelled.get()) {
+                            onPhase("Экономия: подключаю лучшего из проб — ${label(pick)} (${fmt(bestSpeed)} Мбит/с)")
+                            val from = ServerLabels.displayForKey(appCtx, ProxyState.state.value.serverKey)
+                            MonitorLog.switch(appCtx, from, ServerLabels.display(pick), "экономия: лучший из проб вслепую", "${fmt(bestSpeed)} Мбит/с")
+                            val act = connectAndMeasureActive(pick)
+                            connected = pick; connectedSpeed = if (act > 0) act else bestSpeed; hbConnected.set(pick)
+                            if (act > 0) onSpeedResult(pick, act)
+                        }
+                    } else {
+                        // Пр.125.B: по одному, от быстрых по ПРОШЛЫМ замерам; первый ≥ порога — стоп.
+                        for ((i, p) in order.withIndex()) {
+                            if (cancelled.get()) break
+                            if ((System.currentTimeMillis() - phaseStartWall) > budgetMs) {
+                                onPhase("Бюджет теста исчерпан на $i/${order.size} — стоп"); break
+                            }
+                            val known0 = p.speedMbps ?: 0.0
+                            onPhase("Экономия: пробую ${i + 1}/${order.size} · ${label(p)} (было ${fmt(known0)} Мбит/с)")
+                            val from = ServerLabels.displayForKey(appCtx, ProxyState.state.value.serverKey)
+                            MonitorLog.switch(appCtx, from, ServerLabels.display(p), "экономия: кандидат по прошлым замерам", "было ${fmt(known0)} Мбит/с")
+                            val mbps = connectAndMeasureActive(p)
+                            if (cancelled.get()) break
+                            measured++
+                            onSpeedResult(p, mbps)
+                            connected = p; connectedSpeed = mbps; hbConnected.set(p)
+                            if (mbps > bestSpeed) { bestSpeed = mbps; best = p; hbBest.set(p) }
+                            emitProgress(measured, order.size); beat()
+                            if (mbps >= threshold) { onPhase("Годный: ${label(p)} ↓${fmt(mbps)} ≥ ${fmt(threshold)} Мбит/с — стоп"); break }
+                            onPhase("${label(p)} ↓${fmt(mbps)} < порога ${fmt(threshold)} — следующий по списку")
+                        }
+                        // Никто не прошёл порог → остаться на ЛУЧШЕМ измеренном (связь любой ценой, Пр.95),
+                        // если подключены сейчас не к нему.
+                        val pick = best
+                        if (!cancelled.get() && pick != null && connected != null && key(pick) != key(connected!!) && bestSpeed > connectedSpeed) {
+                            onPhase("Порог никто не прошёл — держу лучший: ${label(pick)} (${fmt(bestSpeed)} Мбит/с)")
+                            connectAndMeasureActive(pick)
+                            connected = pick; connectedSpeed = bestSpeed; hbConnected.set(pick)
+                        }
+                    }
+                } catch (e: Throwable) {
+                    runCatching { onPhase("Ошибка теста: ${e.javaClass.simpleName}: ${e.message}") }
+                }
+                finishOnce(Result(connected ?: best, best, bestSpeed, order.size, cancelled.get()))
+            }.start()
+        }
+
+        // --- Этап 2: speed + early-connect, ПОСЛЕДОВАТЕЛЬНО (обычный режим — мерим всех живых) ---
         fun startSpeedPhase(aliveByPing: List<ServerProfile>) {
             if (cancelled.get()) { finishOnce(Result(null, null, 0.0, aliveByPing.size, true)); return }
             if (aliveByPing.isEmpty()) {
@@ -90,23 +226,14 @@ object FullTestRunner {
                 return
             }
             val s = SettingsStore.current()
-            // План кандидатов. Ручной тест (Промпт 82): мерим ВСЕХ живых (без ранней остановки), но с общим
-            // бюджетом времени. Экономия — единственное сокращение (явный опт-ин): батчами, стоп по живым.
-            val candidates: List<ServerProfile>
-            val batch: Int
-            val minAlive: Int
-            val modeStr: String
+            // Пр.125: РЕЖИМ ЭКОНОМИИ — отдельный путь (выбор по прошлым замерам, мерим только выбранного).
+            if (s.trafficSaveMode) { startEconomyPhase(aliveByPing); return }
+            // Ручной тест (Промпт 82): мерим ВСЕХ живых по очереди (без ранней остановки), но с общим бюджетом времени.
+            val candidates = aliveByPing
+            val batch = Int.MAX_VALUE          // без батч-остановки (у экономии теперь свой путь, Пр.125)
+            val minAlive = 0
+            val modeStr = "все живые (${aliveByPing.size}), бюджет ${s.fullTestBudgetSec / 60} мин"
             val budgetMs = s.fullTestBudgetSec.coerceAtLeast(30) * 1000L
-            if (s.trafficSaveMode) {
-                candidates = aliveByPing                                   // лучшие по пингу
-                batch = s.trafficSaveBatch.coerceAtLeast(1)
-                minAlive = s.trafficSaveMinAlive.coerceAtLeast(1)
-                modeStr = "экономия ${batch}×, до ${minAlive} живых"
-            } else {
-                candidates = aliveByPing                                   // ВСЕ живые
-                batch = Int.MAX_VALUE; minAlive = 0                        // без ранней остановки
-                modeStr = "все живые (${aliveByPing.size}), бюджет ${s.fullTestBudgetSec / 60} мин"
-            }
             onPhase("Этап 2: скорость — $modeStr…")
             emitProgress(0, candidates.size)
 
