@@ -158,7 +158,8 @@ object NetworkMonitor {
                         .getOrDefault(lastActiveProbeMs)
                 }
                 // Вторичное: «держать лучший» — ТОЛЬКО если monitorEnabled, в норме, раз в monitorOptimizeSec, без живого трафика.
-                if (cur.monitorEnabled && cur.monitorOptimizeSec > 0 && now() - lastOptimizeMs >= cur.monitorOptimizeSec * 1000L && !userTrafficActive()) {
+                // Пр.125.E: в режиме экономии периодический перемер кандидатов ОТКЛЮЧЁН полностью (главный фоновый расход).
+                if (!cur.trafficSaveMode && cur.monitorEnabled && cur.monitorOptimizeSec > 0 && now() - lastOptimizeMs >= cur.monitorOptimizeSec * 1000L && !userTrafficActive()) {
                     lastOptimizeMs = now()
                     runCatching { optimizeToFastest(app, cur) }.onFailure { MonitorLog.event(app, "error", "Ошибка оптимизации", it.message ?: "") }
                 }
@@ -463,6 +464,9 @@ object NetworkMonitor {
         }
 
         // (2) Простой: активная проба — только если пришло время И экран включён (иначе не тратим трафик).
+        // Пр.125.E: в режиме экономии ПЛАНОВАЯ проба плашки в простое ОТКЛЮЧЕНА — замер активного туннеля только
+        // по подозрению (лестница восстановления), не по расписанию. Пассивный сэмпл (шаг 1) бесплатен — он остаётся.
+        if (cur.trafficSaveMode) return lastActiveProbeMs
         if (now() - lastActiveProbeMs < cur.liveSpeedActiveProbeSec * 1000L) return lastActiveProbeMs
         if (!screenInteractive(app)) return lastActiveProbeMs
         if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey != curKey) return lastActiveProbeMs
