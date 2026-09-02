@@ -116,7 +116,7 @@ object ServerSpeedTester {
 
         val name = profile.remarks.ifBlank { profile.address }
         val warmupBudget = SettingsStore.current().speedWarmupBudgetBytes
-        val measureBudget = SettingsStore.current().speedMeasureBudgetBytes
+        val measureBudget = SettingsStore.current().activeMeasureBudgetBytes   // Пр.131: бюджет per-mode (активный набор)
         val concurrent = concurrentMeasures.incrementAndGet()
         log("── measure START «$name» ${profile.address}:${profile.port} net=${profile.network} sec=${profile.security} · параллельно=$concurrent · warmup=${warmupMs}мс/${warmupBudget}Б окно=${measureMs}мс/${measureBudget}Б")
         val t0 = System.nanoTime()
@@ -510,7 +510,7 @@ object ServerSpeedTester {
         for (probe in probes) {
             if (measureAborted) break   // Промпт 101.B: отмена — не перебираем оставшиеся пробники
             val m = downloadMbps(probe, Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", XrayConfig.SOCKS_PORT)),
-                s.speedWarmupMs, s.speedWindowMs, s.speedWarmupBudgetBytes, s.speedMeasureBudgetBytes, "активный↓", s.verboseLogs)
+                s.speedWarmupMs, s.speedWindowMs, s.speedWarmupBudgetBytes, s.activeMeasureBudgetBytes, "активный↓", s.verboseLogs)
             testBytes += m.bytes
             if (m.ok) { TrafficTracker.addTest(testBytes); return m.mbps }
         }
@@ -526,7 +526,7 @@ object ServerSpeedTester {
     fun measureDirectDownloadMbps(context: Context): Double {
         val s = SettingsStore.current()
         val m = downloadMbps(s.directProbeUrl, null, s.speedWarmupMs, s.speedWindowMs,
-            s.speedWarmupBudgetBytes, s.speedMeasureBudgetBytes, "напрямую↓", s.verboseLogs)
+            s.speedWarmupBudgetBytes, s.activeMeasureBudgetBytes, "напрямую↓", s.verboseLogs)
         if (m.bytes > 0) TrafficTracker.addTest(m.bytes)
         return if (m.ok) m.mbps else -1.0
     }

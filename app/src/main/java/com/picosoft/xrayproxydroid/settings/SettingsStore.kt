@@ -29,7 +29,7 @@ data class AppSettings(
     val speedWindowSec: Double = 2.0,   // предел измерения ПО ВРЕМЕНИ (что раньше — время ИЛИ объём)
     // Бюджеты ПО ОБЪЁМУ (что раньше — время ИЛИ объём): на быстром сервере фаза кончается по МБ, не по времени.
     val speedWarmupMb: Int = 3,         // объём прогрева, МБ (без него прогрев-по-времени тянул бы больше всего лимита)
-    val speedMeasureMb: Int = 10,       // объём замера, МБ
+    val speedMeasureMb: Int = 10,       // УСТАРЕЛО (Пр.131): не читается — бюджет замера теперь per-mode (measureMb*/activeMeasureMb)
     val speedPool: Int = 1,             // одновременных замеров скорости; ОТ 1 (1 = строго последовательно)
     val speedProbeUrl: String = "http://speedtest.tele2.net/1GB.zip", // 1 ГБ: заведомо больше окна (нет eof); редактируемый (Cloudflare 403 / Hetzner TLS)
 
@@ -70,14 +70,19 @@ data class AppSettings(
     val monitorIntervalSec: Int = 120,          // период цикла в ЗДОРОВОМ состоянии, с (мин 60)
     // Промпт 82: при ПАДЕНИИ туннеля проверять чаще (раз в минуту), чтобы быстрее переключиться на рабочий.
     val monitorProblemIntervalSec: Int = 60,
-    // «Держать самый быстрый» — раз в [monitorOptimizeSec] перемерять top-[normalTopBatch] и переключаться
-    // на быстрейший. Трафик перемера ДОРОГОЙ (факт с устройства, Пр.126: корзина «Тест» = 2.7 ГБ/сут).
-    // Пр.126.B: ДЕФОЛТ 0 (ВЫКЛ). ПОЧЕМУ: замер активного (живой SOCKS, measureActiveDownloadMbps) и замер
-    // кандидата (temp-инстанс, measureSpeed) в optimizeToFastest — РАЗНЫЕ пути и НЕсопоставимы (Пр.108/109:
-    // тот же сервер 68.99 кандидат vs 2.67 активный). Пока не сопоставимы — «держать лучший» переключал бы по
-    // ШУМУ. Лучше не оптимизировать, чем дёргать на шуме. Включается вручную; тогда действуют предохранители ниже.
-    val monitorOptimizeSec: Int = 0,
-    // Пр.126.A: предохранители перемера (работают, когда пользователь включил monitorOptimizeSec>0).
+    // Пр.131: интервал перемера / число кандидатов / бюджет замера — РАЗДЕЛЬНЫЕ наборы по режимам (обычный/
+    // экономия), активный выбирается по [trafficSaveMode] (см. active* ниже). Старое одиночное monitorOptimizeSec
+    // УСТАРЕЛО (оставлено для совместимости старого JSON; код читает activeOptimizeSec).
+    // Пр.131.D: сопоставимость замеров ДОКАЗАНА (Пр.130 — активный меряем тем же temp-инстансом, что кандидатов;
+    // числами temp≈живой в пределах шума) → дефолт ОБЫЧНОГО режима «раз в час». Экономия — ВЫКЛ.
+    val monitorOptimizeSec: Int = 0,   // УСТАРЕЛО (Пр.131): не читается, см. optimizeSecNormal/Save + activeOptimizeSec
+    val optimizeSecNormal: Int = 3600,   // обычный режим: раз в час (Пр.131.D)
+    val optimizeSecSave: Int = 0,        // экономия: перемер ВЫКЛ
+    val topBatchNormal: Int = 5,         // обычный: сколько кандидатов перемерять за цикл
+    val topBatchSave: Int = 3,           // экономия: меньше кандидатов
+    val measureMbNormal: Int = 10,       // обычный: бюджет ОДНОГО замера, МБ (без прогрева)
+    val measureMbSave: Int = 5,          // экономия: скромнее
+    // Пр.126.A: предохранители перемера (работают, когда активный интервал > 0). ОБЩИЕ для обоих режимов.
     val monitorOptimizeWifiOnly: Boolean = true,      // не перемерять на мобильной/платной сети — только Wi-Fi
     val monitorOptimizeIdleSkipSec: Int = 1800,       // не перемерять, если через туннель давно нет трафика, с (0=не пропускать)
     val monitorOptimizeSkipAboveMbps: Double = 10.0,  // не перемерять, если текущий уже быстрый (≥), Мбит/с (0=не пропускать)
@@ -111,7 +116,7 @@ data class AppSettings(
     val trafficSaveRefreshSec: Int = 3600,     // УСТАРЕЛО (Пр.125): не используется
     // top-N по скорости: для ОПТИМИЗАЦИИ монитора «держать самый быстрый» (Промпт 82). Ручной тест
     // мерит ВСЕХ (Промпт 82: ступенчатый top-N — только монитор/экономия, не ручной запуск).
-    val normalTopBatch: Int = 5,   // Пр.126.A: сокращён 10→5 — меньше кандидатов на перемер = меньше трафика
+    val normalTopBatch: Int = 5,   // УСТАРЕЛО (Пр.131): не читается — число кандидатов теперь per-mode (topBatch*/activeTopBatch)
     // Промпт 82: общий БЮДЖЕТ ВРЕМЕНИ ручного полного теста, с. Мерим всех живых по очереди, но не дольше
     // этого (на ~100 серверах ×2с ≈ 3–4 мин; лимит защищает от зависания на медленных). Дефолт 10 мин.
     val fullTestBudgetSec: Int = 600,
@@ -164,6 +169,12 @@ data class AppSettings(
     val speedMeasureBudgetBytes: Long get() = speedMeasureMb * 1_048_576L
     val uploadMeasureBudgetBytes: Long get() = uploadMeasureMb * 1_048_576L
     val marginRatio: Double get() = upgradeMarginPercent / 100.0
+
+    // Пр.131: АКТИВНЫЙ набор (обычный/экономия) по [trafficSaveMode] — его читают все потребители.
+    val activeOptimizeSec: Int get() = if (trafficSaveMode) optimizeSecSave else optimizeSecNormal
+    val activeTopBatch: Int get() = if (trafficSaveMode) topBatchSave else topBatchNormal
+    val activeMeasureMb: Int get() = if (trafficSaveMode) measureMbSave else measureMbNormal
+    val activeMeasureBudgetBytes: Long get() = activeMeasureMb * 1_048_576L
 }
 
 object SettingsStore {

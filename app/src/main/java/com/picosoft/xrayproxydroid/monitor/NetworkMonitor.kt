@@ -178,7 +178,7 @@ object NetworkMonitor {
                 // кандидата несопоставимы, решения шли бы по шуму. Пр.125.E: в экономии тоже выкл. Когда пользователь
                 // включил — предохранители Пр.126.A (Wi-Fi / давно-нет-трафика / текущий-уже-быстрый) + не во время
                 // активной загрузки (чтобы не делить канал и не портить замер).
-                if (!cur.trafficSaveMode && cur.monitorEnabled && cur.monitorOptimizeSec > 0 && now() - lastOptimizeMs >= cur.monitorOptimizeSec * 1000L) {
+                if (!cur.trafficSaveMode && cur.monitorEnabled && cur.activeOptimizeSec > 0 && now() - lastOptimizeMs >= cur.activeOptimizeSec * 1000L) {
                     lastOptimizeMs = now()
                     val skip = optimizeSkipReason(app, cur, lastUserTrafficMs)
                     when {
@@ -448,7 +448,7 @@ object NetworkMonitor {
         val topN = SubscriptionManager.allServers(app)
             .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl) && !ServerFilter.isPaused(it, bl) }
             .sortedByDescending { it.speedMbps ?: 0.0 }
-            .take(s.normalTopBatch.coerceAtLeast(1))
+            .take(s.activeTopBatch.coerceAtLeast(1))
         if (topN.size <= 1) return
         MonitorLog.event(app, "monitor", "Оптимизация: перемер top-${topN.size} по скорости", "правило «держать лучший» ×${s.keepBestMultiplier}")
         MonitorStatus.update(true, "оптимизация: перемер top-${topN.size}", now(), 0)
