@@ -74,6 +74,9 @@ object NetworkMonitor {
     // делает шаг 1 → ВЕЧНЫЙ ЦИКЛ на мёртвом сервере (подтверждено логами P102). Поле object'а переживает рестарт
     // монитора: один и тот же сервер повторно НЕ перезапускаем — сразу к перебору живых. Сбрасывается при OK.
     @Volatile private var restartedKeySinceOk: String? = null
+    // Пр.127.C: когда последний раз делали ШАГ по деградации (throttle между шагами). Object-поле — переживает
+    // пересоздание корутины монитора (как restartedKeySinceOk), чтобы throttle не сбрасывался при рестарте.
+    @Volatile private var lastDegradationMs = 0L
 
     /**
      * Промпт 95 — ФАКТ-ПЕРВЫЙ цикл непрерывности связи. Работает ВСЕГДА, пока прокси активен (НЕ гейтится
@@ -141,6 +144,10 @@ object NetworkMonitor {
             if (lastTunnelBytes in 1..bytesNow && bytesNow - lastTunnelBytes > OPTIMIZE_IDLE_TRAFFIC_MIN_BYTES) lastUserTrafficMs = now()
             lastTunnelBytes = bytesNow
 
+            // ⭐ ПРИНЦИП (Пр.127.A): проверка живости туннеля (СИГНАЛ A directAlive + СИГНАЛ B внешний IP через SOCKS)
+            // идёт КАЖДЫЙ цикл с интервалом [connectionCheckIntervalSec] — ОДИНАКОВО в обоих режимах. Режим экономии
+            // (trafficSaveMode) её НЕ касается и НЕ разрежает: проверка стоит килобайты, ради неё приложение и живёт.
+            // Экономия трогает ТОЛЬКО замеры СКОРОСТИ (мегабайты). Не вздумать «экономить» на проверке живости.
             // ── СИГНАЛ A: есть ли интернет ВООБЩЕ (прямой канал) — отличаем «нет интернета» от «нет серверов» ──
             // Нет интернета → туннель чинить БЕССМЫСЛЕННО (ядро НЕ трогаем): честно «нет связи» + переспрос
             // прямого канала по экспоненте (пауза берётся вверху по фазе NO_INTERNET). Интернет вернётся → ниже
@@ -240,6 +247,9 @@ object NetworkMonitor {
     private const val CYCLE_WAKELOCK_TIMEOUT_MS = 10 * 60_000L   // страховка от утечки; нормальный цикл — секунды
     // Пр.126.A: прирост туннельных байт за цикл выше этого = «шёл трафик» (не keepalive). 1 МБ — заведомо реальный.
     private const val OPTIMIZE_IDLE_TRAFFIC_MIN_BYTES = 1_048_576L
+    // Пр.127.C: минимум трафика в окне пассивного замера, чтобы наблюдаемая скорость была ОСМЫСЛЕННОЙ признаком
+    // капасити (а не «мало качали»). 512 КБ за окно 6с ≈ ≥0.7 Мбит/с реально прошло — только тогда судим о деградации.
+    private const val DEGRADATION_MIN_TRAFFIC_BYTES = 512L * 1024L
     private fun acquireCycleLock(wl: PowerManager.WakeLock?) {
         runCatching { if (wl != null && !wl.isHeld) wl.acquire(CYCLE_WAKELOCK_TIMEOUT_MS) }
     }
@@ -502,6 +512,9 @@ object NetworkMonitor {
             val down = dRx * 8.0 / dtSec / 1_000_000.0
             val up = dTx * 8.0 / dtSec / 1_000_000.0
             TunnelSpeed.setLive(down, up, now(), curKey)   // прямую скорость сохраняем от прошлой пробы
+            // Пр.127.C: деградация по УЖЕ идущему трафику (бесплатно). Только при СУЩЕСТВЕННОМ трафике — иначе
+            // низкая скорость = «мало качали», а не медленный туннель. Тишину (иначе — ниже порога байт) НЕ трактуем.
+            if (dRx + dTx >= DEGRADATION_MIN_TRAFFIC_BYTES) maybeStepFromDegraded(app, cur, curKey, down)
             return lastActiveProbeMs
         }
 
@@ -514,6 +527,48 @@ object NetworkMonitor {
         if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey != curKey) return lastActiveProbeMs
         probeActiveSpeedNow(app)
         return now()
+    }
+
+    /**
+     * Пр.127.C: «живой, но медленный». Наблюдаемая по ПАССИВНОМУ трафику скорость [passiveDown] ниже порога
+     * полезности → сделать ОДИН шаг: замерить ЛУЧШЕГО по СОХРАНЁННОЙ скорости кандидата (не текущего) и перейти,
+     * если он приемлемо быстрее того, что человек реально получает сейчас. Один кандидат, один замер, не перебор.
+     * Не чаще [degradationCheckSec]. Работает в ОБОИХ режимах (в экономии — «приемлемый», не «лучший»). Вызывается
+     * ТОЛЬКО когда трафик был существенным (см. вызов), поэтому passiveDown — осмысленный признак капасити.
+     */
+    private suspend fun maybeStepFromDegraded(app: Context, cur: AppSettings, curKey: String, passiveDown: Double) {
+        if (cur.degradationMinMbps <= 0.0) return                        // фича выключена
+        if (passiveDown >= cur.degradationMinMbps) return                // не деградация — туннель тянет
+        if (now() - lastDegradationMs < cur.degradationCheckSec * 1000L) return   // не чаще интервала
+        if (MonitorCoordinator.fullTestRunning || MonitorCoordinator.monitorSearchRunning) return
+        lastDegradationMs = now()
+        val bl = BlocklistStore.current()
+        // ОДИН кандидат: лучший по СОХРАНЁННОЙ скорости, не текущий, годный (протокол/стоп-лист/пауза).
+        val cand = SubscriptionManager.allServers(app)
+            .filter { SubscriptionManager.serverKey(it) != curKey }
+            .filter { ServerFilter.protocolAllowed(it, cur) && !ServerFilter.isBlocked(it, bl) && !ServerFilter.isPaused(it, bl) }
+            .maxByOrNull { it.speedMbps ?: 0.0 } ?: return
+        if ((cand.speedMbps ?: 0.0) <= 0.0) return                       // о кандидатах нет данных — судить не по чему
+        MonitorLog.event(app, "monitor", "Туннель медленный (${fmt(passiveDown)}) — проверяю кандидата", ServerLabels.display(cand))
+        MonitorCoordinator.monitorSearchRunning = true
+        try {
+            val candMbps = ServerSpeedTester.measureSpeed(app, cand)     // ОДИН замер (temp-инстанс)
+            SubscriptionManager.applySpeedResults(app, mapOf(SubscriptionManager.serverKey(cand) to candMbps))
+            if (ProxyState.state.value.serverKey != curKey) return       // пользователь/лестница сменили — не вмешиваемся
+            if (candMbps >= cur.degradationMinMbps && candMbps > passiveDown) {
+                val cfg = runCatching { XrayConfigBuilder.build(cand) }.getOrNull() ?: return
+                val from = ServerLabels.displayForKey(app, curKey)
+                XrayProxyService.start(app, cfg, ServerLabels.full(cand), SubscriptionManager.serverKey(cand))
+                MonitorLog.switch(app, from, ServerLabels.display(cand), "деградация: кандидат приемлемо быстрее",
+                    "${fmt(passiveDown)} → ${fmt(candMbps)}")
+                measureAfterConnect(app, cand)
+            } else {
+                MonitorLog.event(app, "monitor", "Кандидат не лучше (${fmt(candMbps)}) — остаюсь",
+                    "порог ${fmt(cur.degradationMinMbps)}, сейчас ${fmt(passiveDown)}")
+            }
+        } finally {
+            MonitorCoordinator.monitorSearchRunning = false
+        }
     }
 
     /**
