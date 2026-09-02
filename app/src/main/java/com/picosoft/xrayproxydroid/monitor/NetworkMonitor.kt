@@ -437,53 +437,79 @@ object NetworkMonitor {
     }
 
     /**
-     * «Держать самый быстрый» (Промпт 82): в здоровом состоянии перемерять top-[normalTopBatch] по известной
-     * скорости и переключиться на быстрейший, если он БЫСТРЕЕ текущего на >margin. Пр.130: активный и кандидатов
-     * меряем ОДНИМ способом — temp-инстансом (measureSpeed), чтобы числа были СОПОСТАВИМЫ (активный прокси не
-     * трогаем). Трафик заметный — потому по умолчанию выключено (Пр.126). Уступаем ручному тесту и ручной смене.
+     * ПОДДЕРЖАНИЕ ТОПА (Пр.132): не мерить всех подряд, а держать актуальным небольшой топ быстрых серверов.
+     * Меряем ТОЛЬКО кандидатов в топ и ТОЛЬКО по поводам (Пр.132.C): ни разу не измерен / замер устарел (Пр.132.D:
+     * старее topFreshSec — скорость НЕ действующая) / прошлый замер провалился. Плюс подмешиваем несколько ещё не
+     * измеренных (Пр.132.B: пинг плохо предсказывает скорость под DPI — иначе быстрый сервер с плохим пингом не
+     * найдётся). Топ свежий → НЕ мерим. Пинг — только для первого приближения/сортировки неизмеренных. Замеры
+     * сопоставимы (Пр.130: и активный, и кандидатов — temp-инстансом). Массового замера всех живых в фоне НЕТ.
      */
     private suspend fun optimizeToFastest(app: Context, s: AppSettings) {
         val curKey = ProxyState.state.value.serverKey ?: return
         val bl = BlocklistStore.current()
-        val topN = SubscriptionManager.allServers(app)
+        fun key(p: com.picosoft.xrayproxydroid.xray.link.ServerProfile) = SubscriptionManager.serverKey(p)
+        val topN = s.activeTopBatch.coerceAtLeast(1)
+        val all = SubscriptionManager.allServers(app)
             .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl) && !ServerFilter.isPaused(it, bl) }
+        if (all.size <= 1) return
+        // СВЕЖИЙ топ: измерены (speed>0) и НЕ старее предела давности (Пр.132.D). Их перемерять не нужно.
+        val freshHours = (s.topFreshSec.coerceAtLeast(600) / 3600).coerceAtLeast(1)
+        val freshTop = SubscriptionManager.recentWorkingServers(app, freshHours).take(topN)
+        val freshKeys = freshTop.map { key(it) }.toSet()
+        // КОГО МЕРИТЬ (только поводы Пр.132.C): добираем топ до N из НЕсвежих. Сначала известные-но-устаревшие по
+        // скорости (были в топе, пора обновить), затем неизмеренные/провальные по пингу (первое приближение).
+        val toMeasure = LinkedHashMap<String, com.picosoft.xrayproxydroid.xray.link.ServerProfile>()
+        val byPing = all.sortedBy { it.pingMs ?: Int.MAX_VALUE }
+        val staleByKnown = all.filter { (it.speedMbps ?: 0.0) > 0.0 && key(it) !in freshKeys }
             .sortedByDescending { it.speedMbps ?: 0.0 }
-            .take(s.activeTopBatch.coerceAtLeast(1))
-        if (topN.size <= 1) return
-        MonitorLog.event(app, "monitor", "Оптимизация: перемер top-${topN.size} по скорости", "правило «держать лучший» ×${s.keepBestMultiplier}")
-        MonitorStatus.update(true, "оптимизация: перемер top-${topN.size}", now(), 0)
+        for (p in staleByKnown) { if (toMeasure.size + freshKeys.size >= topN) break; toMeasure[key(p)] = p }
+        for (p in byPing) { if (toMeasure.size + freshKeys.size >= topN) break; val k = key(p); if (k !in freshKeys && k !in toMeasure) toMeasure[k] = p }
+        // Пр.132.B: подмешать неизмеренных живых (иначе быстрый-с-плохим-пингом не найдём).
+        var mixed = 0
+        for (p in byPing) { if (mixed >= s.topMixUnmeasured) break; val k = key(p); if (p.speedMbps == null && k !in freshKeys && k !in toMeasure) { toMeasure[k] = p; mixed++ } }
+        if (toMeasure.isEmpty()) {                                          // топ свежий — повода мерить нет
+            MonitorLog.event(app, "monitor", "Топ свежий — перемер не нужен", "в топе ${freshKeys.size}/$topN, все ≤ ${freshHours}ч")
+            return
+        }
+        MonitorLog.event(app, "monitor", "Поддержание топа: мерю ${toMeasure.size} (топ $topN)", "свежих ${freshKeys.size}, подмешано $mixed · правило ×${s.keepBestMultiplier}")
+        MonitorStatus.update(true, "поддержание топа: ${toMeasure.size} замер(ов)", now(), 0)
         MonitorCoordinator.monitorSearchRunning = true
         try {
             // Пр.130: активный меряем ТЕМ ЖЕ способом, что кандидатов — temp-инстансом (measureSpeed), а НЕ живым
-            // SOCKS (measureActiveDownloadMbps систематически занижает, Пр.108/109: 68.99 temp vs 2.67 живой). Иначе
-            // «держать лучший» решал бы по шуму (кандидат всегда «кратно быстрее»). Живой замер — только для плашки.
-            val curProfile = SubscriptionManager.allServers(app).firstOrNull { SubscriptionManager.serverKey(it) == curKey }
-            val curMbps = if (curProfile != null) ServerSpeedTester.measureSpeed(app, curProfile) else -1.0
+            // SOCKS (measureActiveDownloadMbps систематически занижает, Пр.108/109). Живой замер — только для плашки.
+            // Пр.133.B: мерим на ДОСТАТОЧНОСТЬ (стоп при подтверждении порога) — не точное число. Достаточные
+            // читаются как ~порог, поэтому правило «держать лучший ×N» между ними НЕ дёргает (нет churn/расхода);
+            // переключимся, лишь когда текущий перестал быть достаточным (порог/низкий → ×N сработает).
+            val enough = s.sufficientMbps.coerceAtLeast(0.1)
+            val curProfile = all.firstOrNull { key(it) == curKey }
+            val curMbps = if (curProfile != null) ServerSpeedTester.measureSufficiency(app, curProfile, enough) else -1.0
             val results = HashMap<String, Double>()
             if (curMbps > 0) results[curKey] = curMbps
             var bestKey: String? = null; var bestMbps = 0.0
-            for (c in topN) {
+            for (c in toMeasure.values) {
                 if (MonitorCoordinator.fullTestRunning) return               // ручной тест — уступаем
                 if (ProxyState.state.value.serverKey != curKey) return       // пользователь сменил — уступаем
-                val key = SubscriptionManager.serverKey(c)
-                if (key == curKey) continue
-                val mbps = ServerSpeedTester.measureSpeed(app, c)            // temp-инстанс
-                results[key] = mbps
-                if (mbps > bestMbps) { bestMbps = mbps; bestKey = key }
+                val k = key(c)
+                if (k == curKey) continue
+                val mbps = ServerSpeedTester.measureSufficiency(app, c, enough)   // temp-инстанс, стоп на пороге
+                results[k] = mbps
+                if (mbps > bestMbps) { bestMbps = mbps; bestKey = k }
             }
+            // лучший из СВЕЖЕГО топа тоже участвует в решении (его не перемеряли — он свежий)
+            for (p in freshTop) { val sp = p.speedMbps ?: 0.0; if (sp > bestMbps) { bestMbps = sp; bestKey = key(p) } }
             SubscriptionManager.applySpeedResults(app, results)
             // ПРАВИЛО «ДЕРЖАТЬ ЛУЧШИЙ» (Промпт 90.A): переключаемся, если лучший быстрее текущего КРАТНО
             // (в keepBestMultiplier раз), даже когда текущий выше порога. Кратно — чтобы шум не дёргал.
-            if (bestKey != null && curMbps > 0 && bestMbps >= curMbps * s.keepBestMultiplier) {
-                val target = topN.first { SubscriptionManager.serverKey(it) == bestKey }
+            if (bestKey != null && bestKey != curKey && curMbps > 0 && bestMbps >= curMbps * s.keepBestMultiplier) {
+                val target = all.firstOrNull { key(it) == bestKey } ?: return
                 val cfg = runCatching { XrayConfigBuilder.build(target) }.getOrNull() ?: return
                 val from = ServerLabels.displayForKey(app, curKey)
                 XrayProxyService.start(app, cfg, ServerLabels.full(target), bestKey!!)
                 MonitorLog.switch(app, from, ServerLabels.display(target), "монитор: держать лучший",
                     "было ${fmt(curMbps)} → стало ${fmt(bestMbps)} (×${s.keepBestMultiplier})")
             } else {
-                MonitorLog.event(app, "monitor", "Оптимизация: смены нет",
-                    "текущий ${fmt(curMbps)}, лучший из top ${fmt(bestMbps)} (нужно ×${s.keepBestMultiplier})")
+                MonitorLog.event(app, "monitor", "Топ обновлён, смены нет",
+                    "текущий ${fmt(curMbps)}, лучший ${fmt(bestMbps)} (нужно ×${s.keepBestMultiplier})")
             }
         } finally {
             MonitorCoordinator.monitorSearchRunning = false
