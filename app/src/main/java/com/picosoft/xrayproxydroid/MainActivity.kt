@@ -61,6 +61,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -2462,9 +2463,7 @@ private fun SettingsSection(
         IntSettingRow("Объём прогрева", "МБ", settings.speedWarmupMb, d.speedWarmupMb, 1, 500) {
             onChange(settings.copy(speedWarmupMb = it))
         }
-        IntSettingRow("Объём замера", "МБ", settings.speedMeasureMb, d.speedMeasureMb, 1, 1000) {
-            onChange(settings.copy(speedMeasureMb = it))
-        }
+        // Пр.131: «Объём замера» (бюджет одного замера) теперь per-mode — в секции «Автомониторинг» (ползунки набора режима).
         IntSettingRow("Одновременных замеров (пул)", "", settings.speedPool, d.speedPool, 1, 32) {
             onChange(settings.copy(speedPool = it))
         }
@@ -2495,39 +2494,14 @@ private fun SettingsSection(
         IntSettingRow("Запас для апгрейда", "%", settings.upgradeMarginPercent, d.upgradeMarginPercent, 0, 100) {
             onChange(settings.copy(upgradeMarginPercent = it))
         }
-        // Ступенчатый повтор (Промпт 77): после ПЕРВОГО полного топа замеряем только top-N по скорости.
-        IntSettingRow("Повторный замер: top-N по скорости", "", settings.normalTopBatch, d.normalTopBatch, 1, 100) {
-            onChange(settings.copy(normalTopBatch = it))
-        }
         // Правило «держать лучший» (Промпт 90): переключаться, если лучший быстрее текущего КРАТНО (в разы).
         DoubleSettingRow("Держать лучший: во сколько раз быстрее", "×", settings.keepBestMultiplier, d.keepBestMultiplier, 1.0, 100.0) {
             onChange(settings.copy(keepBestMultiplier = it))
         }
-        // Пр.126: периодический перемер «держать лучший» в фоне. ДЕФОЛТ ВЫКЛ (0) — замеры активного и кандидата
-        // пока несопоставимы (шум), а трафик дорогой (факт: ~2.7 ГБ/сут «Тест»). Включать осознанно.
-        Text(
-            "Периодический перемер кандидатов в фоне ищет сервер быстрее текущего. Дорого по трафику (по факту около 2.7 ГБ/сутки) и сейчас решает по неточным замерам — поэтому ВЫКЛючен по умолчанию. Включите числом часов на свой риск; ниже — предохранители.",
-            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
-        )
-        IntSettingRow("Перемер «держать лучший»: раз в", "ч (0=выкл)", settings.monitorOptimizeSec / 3600, d.monitorOptimizeSec / 3600, 0, 24) {
-            onChange(settings.copy(monitorOptimizeSec = it * 3600))
-        }
-        if (settings.monitorOptimizeSec > 0) {
-            BoolSettingRow("Перемер только по Wi-Fi", settings.monitorOptimizeWifiOnly, d.monitorOptimizeWifiOnly) {
-                onChange(settings.copy(monitorOptimizeWifiOnly = it))
-            }
-            IntSettingRow("Не перемерять при простое дольше", "мин (0=всегда)", settings.monitorOptimizeIdleSkipSec / 60, d.monitorOptimizeIdleSkipSec / 60, 0, 240) {
-                onChange(settings.copy(monitorOptimizeIdleSkipSec = it * 60))
-            }
-            DoubleSettingRow("Не перемерять, если текущий быстрее", "Мбит/с (0=всегда)", settings.monitorOptimizeSkipAboveMbps, d.monitorOptimizeSkipAboveMbps, 0.0, 1000.0) {
-                onChange(settings.copy(monitorOptimizeSkipAboveMbps = it))
-            }
-        }
+        // Пр.131: интервал перемера, число кандидатов, бюджет замера и предохранители переехали ползунками с ценой
+        // в секцию «Автомониторинг» (раздельные наборы обычный/экономия). Интервал проверки связи — там же.
 
         SettingsGroupLabel("Соединение и отдача")
-        IntSettingRow("Интервал проверки соединения", "с", settings.connectionCheckIntervalSec, d.connectionCheckIntervalSec, 30, 3600) {
-            onChange(settings.copy(connectionCheckIntervalSec = it))
-        }
         // Пр.127.C: «живой, но медленный» — деградация по УЖЕ идущему трафику (бесплатно, из счётчиков). Ниже порога
         // → один замер лучшего кандидата по сохранённым данным и переход, если он приемлемо быстрее. Работает в обоих режимах.
         Text(
@@ -2751,14 +2725,6 @@ private fun MonitorSection(
                 "● Проверка связи каждые $interval с · последняя: $t ($ago) · циклов: ${heartbeat.cycles} · ${heartbeat.state}",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary,
             )
-            val checksPerMonth = 2_592_000L / interval
-            val checkMbPerMonth = checksPerMonth * EST_CHECK_BYTES / 1_048_576.0
-            val oneMeasureMb = settings.speedWarmupMb + settings.speedMeasureMb
-            Text(
-                "Расход проверок ≈ %.0f МБ/мес (стоят килобайты). Замер скорости — до %d МБ за ОДИН сервер. Поэтому экономим на замерах, а на проверках связи — никогда."
-                    .format(checkMbPerMonth, oneMeasureMb),
-                style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
-            )
         }
 
         BoolSettingRow("Автомониторинг", settings.monitorEnabled, d.monitorEnabled) {
@@ -2776,6 +2742,9 @@ private fun MonitorSection(
         IntSettingRow("Неудач подряд = падение", "", settings.monitorFailuresToVerdict, d.monitorFailuresToVerdict, 1, 10) {
             onChange(settings.copy(monitorFailuresToVerdict = it))
         }
+
+        // Пр.131: ползунки интервалов с ценой в ГБ + раздельные наборы по режимам + проверки живости.
+        if (settings.monitorEnabled) OptimizeChecksBlock(settings, onChange)
 
         Spacer(Modifier.height(4.dp))
         Row(
@@ -2795,6 +2764,124 @@ private fun MonitorSection(
             log.asReversed().forEach { MonitorLogRow(it) }   // свежие сверху
         }
     }
+}
+
+// Пр.131: значения ползунков (слева→направо). Перемер: 15м…сутки; крайнее ПРАВОЕ — «Выкл» (0).
+private val OPT_SECS = listOf(900, 1800, 3600, 10800, 21600, 43200, 86400, 0)
+private val OPT_LABELS = listOf("15 мин", "30 мин", "1 час", "3 часа", "6 часов", "12 часов", "сутки", "Выкл")
+// Проверки живости: 30с…15м, БЕЗ «Выкл» — проверка не отключается никогда (Пр.127).
+private val CHK_SECS = listOf(30, 60, 120, 300, 600, 900)
+private val CHK_LABELS = listOf("30 сек", "1 мин", "2 мин", "5 мин", "10 мин", "15 мин")
+
+private fun nearestIndex(values: List<Int>, cur: Int): Int {
+    val i = values.indexOf(cur)
+    if (i >= 0) return i
+    if (cur <= 0 && values.last() == 0) return values.lastIndex   // 0 = «Выкл» справа
+    return values.indices.minByOrNull { kotlin.math.abs(values[it] - cur) } ?: 0
+}
+
+/** Пр.131.E: расход перемера, МБ/мес (оценка СВЕРХУ: активный + topBatch кандидатов каждый цикл). */
+private fun optimizeMbPerMonth(optSec: Int, topBatch: Int, measureMb: Int, warmupMb: Int): Double {
+    if (optSec <= 0) return 0.0
+    val cyclesPerMonth = 2_592_000.0 / optSec
+    return cyclesPerMonth * (topBatch + 1) * (warmupMb + measureMb)
+}
+private fun fmtData(mb: Double): String =
+    if (mb >= 1024.0) "≈ %.1f ГБ/мес".format(mb / 1024.0) else "≈ %.0f МБ/мес".format(mb)
+
+/** Пр.131.A: ползунок с делениями. Заголовок с ЖИВОЙ меткой при перетаскивании; фиксируем на отпускании. */
+@Composable
+private fun TickSlider(title: String, labels: List<String>, index: Int, onPick: (Int) -> Unit) {
+    val last = labels.size - 1
+    var pos by remember(index) { mutableStateOf(index.toFloat()) }
+    val liveIdx = pos.roundToInt().coerceIn(0, last)
+    Text("$title: ${labels[liveIdx]}", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+    Slider(
+        value = pos, onValueChange = { pos = it },
+        valueRange = 0f..last.toFloat(), steps = (labels.size - 2).coerceAtLeast(0),
+        onValueChangeFinished = { onPick(pos.roundToInt().coerceIn(0, last)) },
+    )
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Text(labels.first(), style = MaterialTheme.typography.labelSmall, color = TABLE_GRAY)
+        Text(labels.last(), style = MaterialTheme.typography.labelSmall, color = TABLE_GRAY)
+    }
+}
+
+/**
+ * Пр.131: интервалы ползунками с ЦЕНОЙ, раздельные наборы обычный/экономия, проверки живости (общие).
+ * Правки идут в АКТИВНЫЙ набор (по trafficSaveMode); видно, чей набор правится; авто-смена набора — с причиной.
+ */
+@Composable
+private fun OptimizeChecksBlock(settings: AppSettings, onChange: (AppSettings) -> Unit) {
+    val dd = SettingsStore.DEFAULTS
+    val save = settings.trafficSaveMode
+    val warmup = settings.speedWarmupMb
+    val optSec = settings.activeOptimizeSec
+    val topBatch = settings.activeTopBatch
+    val measureMb = settings.activeMeasureMb
+
+    Spacer(Modifier.height(6.dp))
+    SettingsGroupLabel("Периодический перемер и проверки")
+
+    val modeName = if (save) "Экономия" else "Обычный"
+    val modeReason = when {
+        !settings.trafficSaveAutoByNetwork -> "выбран вручную"
+        settings.trafficSaveManualUntilNetChange -> "вручную до смены сети"
+        save -> "мобильная сеть"
+        else -> "Wi-Fi"
+    }
+    Text(
+        "⚙ Правите набор режима: $modeName ($modeReason). Смена сети подставит другой набор — цифры изменятся сами (это не сбой).",
+        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary,
+    )
+
+    // — Перемер «держать лучший» (per-mode) —
+    TickSlider("Перемер «держать лучший»", OPT_LABELS, nearestIndex(OPT_SECS, optSec)) { i ->
+        val sec = OPT_SECS[i]
+        onChange(if (save) settings.copy(optimizeSecSave = sec) else settings.copy(optimizeSecNormal = sec))
+    }
+    if (optSec > 0) {
+        IntSettingRow("Кандидатов за цикл", "", topBatch, if (save) dd.topBatchSave else dd.topBatchNormal, 1, 30) { v ->
+            onChange(if (save) settings.copy(topBatchSave = v) else settings.copy(topBatchNormal = v))
+        }
+        IntSettingRow("Бюджет замера (без прогрева)", "МБ", measureMb, if (save) dd.measureMbSave else dd.measureMbNormal, 1, 100) { v ->
+            onChange(if (save) settings.copy(measureMbSave = v) else settings.copy(measureMbNormal = v))
+        }
+        Text(
+            "Расход перемера: ${fmtData(optimizeMbPerMonth(optSec, topBatch, measureMb, warmup))} — ОЦЕНКА СВЕРХУ. Предохранители (только Wi-Fi / простой туннеля / текущий выше порога) пропускают часть циклов — реально меньше.",
+            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+        )
+        BoolSettingRow("Перемер только по Wi-Fi", settings.monitorOptimizeWifiOnly, dd.monitorOptimizeWifiOnly) {
+            onChange(settings.copy(monitorOptimizeWifiOnly = it))
+        }
+        IntSettingRow("Не перемерять при простое дольше", "мин (0=всегда)", settings.monitorOptimizeIdleSkipSec / 60, dd.monitorOptimizeIdleSkipSec / 60, 0, 240) {
+            onChange(settings.copy(monitorOptimizeIdleSkipSec = it * 60))
+        }
+        DoubleSettingRow("Не перемерять, если текущий быстрее", "Мбит/с (0=всегда)", settings.monitorOptimizeSkipAboveMbps, dd.monitorOptimizeSkipAboveMbps, 0.0, 1000.0) {
+            onChange(settings.copy(monitorOptimizeSkipAboveMbps = it))
+        }
+    } else {
+        Text("Перемер выключен — на замеры скорости в фоне трафик не тратится.", style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
+    }
+
+    // — Проверки живости (ОБЩИЕ для обоих режимов, Пр.127: на проверках не экономим никогда) —
+    Spacer(Modifier.height(4.dp))
+    TickSlider("Проверка связи (оба режима)", CHK_LABELS, nearestIndex(CHK_SECS, settings.connectionCheckIntervalSec)) { i ->
+        onChange(settings.copy(connectionCheckIntervalSec = CHK_SECS[i]))
+    }
+    val chkSec = CHK_SECS[nearestIndex(CHK_SECS, settings.connectionCheckIntervalSec)].coerceAtLeast(15)
+    val chkMb = (2_592_000.0 / chkSec) * EST_CHECK_BYTES / 1_048_576.0
+    Text(
+        "Расход проверок: ${fmtData(chkMb)} — копейки. Реже проверка — ДОЛЬШЕ сидишь с мёртвым туннелем, если он упадёт; поэтому её не отключаем.",
+        style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+    )
+
+    // — ИТОГ (Пр.131.H): всего на замеры в месяц при настройках активного режима + контраст с проверками —
+    Spacer(Modifier.height(4.dp))
+    Text(
+        "ИТОГО на замеры в фоне ($modeName): ${if (optSec > 0) fmtData(optimizeMbPerMonth(optSec, topBatch, measureMb, warmup)) else "≈ 0 (перемер выкл)"}. Проверки связи: ${fmtData(chkMb)}. Контраст копеек и гигабайтов и объясняет, почему экономим на замерах, а на проверках — нет.",
+        style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.primary,
+    )
 }
 
 /** Одна запись журнала: время + заголовок (цвет по виду), под ним — детали/числа/причина. */
