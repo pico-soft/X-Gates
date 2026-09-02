@@ -119,6 +119,7 @@ import com.picosoft.xrayproxydroid.service.ProxyState
 import com.picosoft.xrayproxydroid.service.SystemVpnState
 import com.picosoft.xrayproxydroid.service.VpnStatus
 import com.picosoft.xrayproxydroid.service.XrayProxyService
+import com.picosoft.xrayproxydroid.monitor.EconomyNet
 import com.picosoft.xrayproxydroid.monitor.LogEvent
 import com.picosoft.xrayproxydroid.monitor.MonitorCoordinator
 import com.picosoft.xrayproxydroid.monitor.MonitorHeartbeat
@@ -1911,8 +1912,29 @@ private fun TrafficBlock() {
             )
         }
         SettingsGroupLabel("Экономия трафика")
+        // Пр.129.A: авто-переключение по типу сети. Включение — применяем по ТЕКУЩЕЙ сети сразу (не ждём смены).
+        BoolSettingRow("Экономить только на мобильной сети", settings.trafficSaveAutoByNetwork, d.trafficSaveAutoByNetwork) {
+            SettingsStore.update(context, settings.copy(trafficSaveAutoByNetwork = it))
+            if (it) EconomyNet.applyNow(context)
+        }
+        Text(
+            "На Wi-Fi — обычный режим, на мобильной — экономия. Переключается САМО при смене сети. Выключите — режим ниже действует всегда, как выбрали вручную.",
+            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+        )
+        // Пр.129.B: текущее состояние и ПРИЧИНА — чтобы смена режима не выглядела сбоем.
+        Text(
+            when {
+                !settings.trafficSaveAutoByNetwork -> "● Режим выбран вручную (авто по сети выключено)."
+                settings.trafficSaveManualUntilNetChange -> "● Сейчас вручную — до следующей смены сети, потом снова по сети."
+                settings.trafficSaveMode -> "● Экономия активна: мобильная сеть."
+                else -> "● Экономия выключена: Wi-Fi."
+            },
+            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary,
+        )
         BoolSettingRow("Режим экономии трафика", settings.trafficSaveMode, d.trafficSaveMode) {
-            SettingsStore.update(context, settings.copy(trafficSaveMode = it))
+            // Пр.129.C: ручное переключение при активной автоматике держится до следующей смены сети.
+            val s = SettingsStore.current()
+            SettingsStore.update(context, s.copy(trafficSaveMode = it, trafficSaveManualUntilNetChange = s.trafficSaveAutoByNetwork))
         }
         if (settings.trafficSaveMode) {
             // Пр.125.F: честно сказать, за что человек платит и на чём экономит.
