@@ -833,8 +833,11 @@ private fun speedAgeText(ts: String?): String {
 
 /** Компактная ячейка скорости (число: ≥10 → целое, <10 → 1 знак; единица «Мбит/с» — в шапке). */
 private fun speedCell(mbps: Double?): String = when {
-    mbps == null -> "—"
+    mbps == null -> "не изм."   // Пр.132.A: НЕ измерялась ≠ «0» ≠ «✗» (провал) — разные вещи
     mbps <= 0 -> "✗"
+    // Пр.133.D: держит порог достаточности → показываем «хватает» вместо цифры (человеку важнее «будет ли видео»,
+    // чем сорок там мегабит или восемьдесят). Точное число нужно лишь для сравнения внутри топа.
+    mbps >= SettingsStore.current().sufficientMbps -> "хватает"
     mbps >= 10 -> mbps.roundToInt().toString()
     else -> ((mbps * 10).roundToInt() / 10.0).toString()
 }
@@ -2049,7 +2052,7 @@ private fun ActionsBar(
 
 // Ширины колонок таблицы серверов — общие для шапки и строк (чтобы колонки совпадали).
 // Колонки: Сервер | Мбит/с | ▶ (#, Пров., Пинг убраны по решению — на телефоне зажимали имя).
-private val COL_SPEED = 58.dp
+private val COL_SPEED = 76.dp   // Пр.133.D: вмещает слово «хватает» (не только цифру)
 private val COL_BTN = 28.dp
 private val TABLE_FONT = 14.sp     // базовый шрифт таблицы (плотный)
 private val TABLE_FONT_SUB = 12.sp // шрифт шапки
@@ -2780,11 +2783,16 @@ private fun nearestIndex(values: List<Int>, cur: Int): Int {
     return values.indices.minByOrNull { kotlin.math.abs(values[it] - cur) } ?: 0
 }
 
-/** Пр.131.E: расход перемера, МБ/мес (оценка СВЕРХУ: активный + topBatch кандидатов каждый цикл). */
-private fun optimizeMbPerMonth(optSec: Int, topBatch: Int, measureMb: Int, warmupMb: Int): Double {
+/**
+ * Пр.133.B: расход поддержания топа, МБ/мес. Фон мерит на ДОСТАТОЧНОСТЬ (стоп при подтверждении порога),
+ * поэтому на замер уходит не весь бюджет, а ~короткий прогрев (0.5 МБ) + прокачка на подтверждение порога
+ * (порог×~1.2с). Для 8 Мбит/с ≈ 0.5 + 1.2 = 1.7 МБ на замер — на порядок меньше полного (было ~8-13 МБ).
+ */
+private fun optimizeMbPerMonth(optSec: Int, topBatch: Int, mix: Int, sufficientMbps: Double): Double {
     if (optSec <= 0) return 0.0
     val cyclesPerMonth = 2_592_000.0 / optSec
-    return cyclesPerMonth * (topBatch + 1) * (warmupMb + measureMb)
+    val perMeasureMb = 0.5 + (sufficientMbps / 8.0) * 1.2
+    return cyclesPerMonth * (topBatch + mix) * perMeasureMb
 }
 private fun fmtData(mb: Double): String =
     if (mb >= 1024.0) "≈ %.1f ГБ/мес".format(mb / 1024.0) else "≈ %.0f МБ/мес".format(mb)
@@ -2794,12 +2802,16 @@ private fun fmtData(mb: Double): String =
 private fun TickSlider(title: String, labels: List<String>, index: Int, onPick: (Int) -> Unit) {
     val last = labels.size - 1
     var pos by remember(index) { mutableStateOf(index.toFloat()) }
+    var committed by remember(index) { mutableStateOf(index) }
     val liveIdx = pos.roundToInt().coerceIn(0, last)
     Text("$title: ${labels[liveIdx]}", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
     Slider(
-        value = pos, onValueChange = { pos = it },
+        // Пр.133.A: коммитим при СМЕНЕ деления (и тап, и перетаскивание), а не только на onValueChangeFinished
+        // (тап по треку его не всегда вызывает → значение не сохранялось). Пишем раз на каждое новое деление.
+        value = pos,
+        onValueChange = { pos = it; val i = it.roundToInt().coerceIn(0, last); if (i != committed) { committed = i; onPick(i) } },
         valueRange = 0f..last.toFloat(), steps = (labels.size - 2).coerceAtLeast(0),
-        onValueChangeFinished = { onPick(pos.roundToInt().coerceIn(0, last)) },
+        onValueChangeFinished = { val i = pos.roundToInt().coerceIn(0, last); if (i != committed) { committed = i; onPick(i) } },
     )
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
         Text(labels.first(), style = MaterialTheme.typography.labelSmall, color = TABLE_GRAY)
@@ -2815,7 +2827,6 @@ private fun TickSlider(title: String, labels: List<String>, index: Int, onPick: 
 private fun OptimizeChecksBlock(settings: AppSettings, onChange: (AppSettings) -> Unit) {
     val dd = SettingsStore.DEFAULTS
     val save = settings.trafficSaveMode
-    val warmup = settings.speedWarmupMb
     val optSec = settings.activeOptimizeSec
     val topBatch = settings.activeTopBatch
     val measureMb = settings.activeMeasureMb
@@ -2841,14 +2852,27 @@ private fun OptimizeChecksBlock(settings: AppSettings, onChange: (AppSettings) -
         onChange(if (save) settings.copy(optimizeSecSave = sec) else settings.copy(optimizeSecNormal = sec))
     }
     if (optSec > 0) {
-        IntSettingRow("Кандидатов за цикл", "", topBatch, if (save) dd.topBatchSave else dd.topBatchNormal, 1, 30) { v ->
+        IntSettingRow("Размер топа (быстрых серверов)", "", topBatch, if (save) dd.topBatchSave else dd.topBatchNormal, 1, 50) { v ->
             onChange(if (save) settings.copy(topBatchSave = v) else settings.copy(topBatchNormal = v))
         }
-        IntSettingRow("Бюджет замера (без прогрева)", "МБ", measureMb, if (save) dd.measureMbSave else dd.measureMbNormal, 1, 100) { v ->
+        DoubleSettingRow("Порог достаточности (видео)", "Мбит/с", settings.sufficientMbps, dd.sufficientMbps, 1.0, 100.0) {
+            onChange(settings.copy(sufficientMbps = it))
+        }
+        IntSettingRow("Бюджет ТОЧНОГО замера", "МБ", measureMb, if (save) dd.measureMbSave else dd.measureMbNormal, 1, 100) { v ->
             onChange(if (save) settings.copy(measureMbSave = v) else settings.copy(measureMbNormal = v))
         }
+        IntSettingRow("Предел давности замера", "ч", settings.topFreshSec / 3600, dd.topFreshSec / 3600, 1, 168) {
+            onChange(settings.copy(topFreshSec = it * 3600))
+        }
+        IntSettingRow("Подмешивать неизмеренных", "", settings.topMixUnmeasured, dd.topMixUnmeasured, 0, 5) {
+            onChange(settings.copy(topMixUnmeasured = it))
+        }
         Text(
-            "Расход перемера: ${fmtData(optimizeMbPerMonth(optSec, topBatch, measureMb, warmup))} — ОЦЕНКА СВЕРХУ. Предохранители (только Wi-Fi / простой туннеля / текущий выше порога) пропускают часть циклов — реально меньше.",
+            "Держим актуальным ТОП быстрых. Мерим только кандидатов и по поводам: не измерян / замер старше предела давности / провал. Замер идёт на ДОСТАТОЧНОСТЬ — качаем, пока не подтвердится порог видео, и стоп (точное число не нужно). Пинг — лишь первое приближение (под DPI низкий пинг ≠ высокая скорость), поэтому подмешиваем неизмеренных. Массового замера всех НЕТ. «Бюджет точного замера» — для ручного полного теста.",
+            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+        )
+        Text(
+            "Расход поддержания топа: ${fmtData(optimizeMbPerMonth(optSec, topBatch, settings.topMixUnmeasured, settings.sufficientMbps))} — ОЦЕНКА СВЕРХУ (замер на достаточность стоит доли полного; предохранители и свежий топ пропускают перемеры — реально меньше).",
             style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
         )
         BoolSettingRow("Перемер только по Wi-Fi", settings.monitorOptimizeWifiOnly, dd.monitorOptimizeWifiOnly) {
@@ -2879,7 +2903,7 @@ private fun OptimizeChecksBlock(settings: AppSettings, onChange: (AppSettings) -
     // — ИТОГ (Пр.131.H): всего на замеры в месяц при настройках активного режима + контраст с проверками —
     Spacer(Modifier.height(4.dp))
     Text(
-        "ИТОГО на замеры в фоне ($modeName): ${if (optSec > 0) fmtData(optimizeMbPerMonth(optSec, topBatch, measureMb, warmup)) else "≈ 0 (перемер выкл)"}. Проверки связи: ${fmtData(chkMb)}. Контраст копеек и гигабайтов и объясняет, почему экономим на замерах, а на проверках — нет.",
+        "ИТОГО на замеры в фоне ($modeName): ${if (optSec > 0) fmtData(optimizeMbPerMonth(optSec, topBatch, settings.topMixUnmeasured, settings.sufficientMbps)) else "≈ 0 (перемер выкл — только реактивно при потере связи)"}. Проверки связи: ${fmtData(chkMb)}. Контраст копеек и гигабайтов и объясняет, почему экономим на замерах, а на проверках — нет.",
         style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.primary,
     )
 }
