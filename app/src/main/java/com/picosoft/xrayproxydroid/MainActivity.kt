@@ -1205,16 +1205,20 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                     ui { activeUploadMbps = if (curUp > 0) curUp else null }
 
                     if (curDown >= threshold) {
-                        // «В норме». «Держать лучший»: только если ПОДТВЕРЖДЁННЫЙ (temp-замер) лучший кратно быстрее.
-                        val bestKnown = candidatesTopDown().firstOrNull { (effSpeed(it) ?: 0.0) >= curDown * multiplier }
+                        // «В норме» по ЖИВОМУ ↓ (реальный опыт — оставляем для порога/показа). Пр.130: но РЕШЕНИЕ
+                        // «держать лучший» считаем по СОПОСТАВИМЫМ числам — активный меряем ТЕМ ЖЕ temp-инстансом,
+                        // что кандидатов (живой SOCKS занижает → кандидат всегда «кратно быстрее», Пр.108/109).
+                        val curTemp = ServerSpeedTester.measureSpeed(context, originalProfile)   // temp — сопоставимо с кандидатом
+                        val cmpBase = if (curTemp > 0) curTemp else curDown                       // фолбэк на живой, если temp не удался
+                        val bestKnown = candidatesTopDown().firstOrNull { (effSpeed(it) ?: 0.0) >= cmpBase * multiplier }
                         if (bestKnown == null) {
                             ui { checkStatus = "Соединение в норме: ↓${fmt(curDown)} / ↑${fmt(curUp)} Мбит/с" }; return@Thread
                         }
                         ui { checkStatus = "Проверяю более быстрый: ${nm(bestKnown)}…" }
-                        val m = ServerSpeedTester.measureSpeed(context, bestKnown)   // temp — активный не трогаем
+                        val m = ServerSpeedTester.measureSpeed(context, bestKnown)   // temp — сопоставимо с curTemp
                         if (m > 0) { collected[key(bestKnown)] = m; ui { speedResults = speedResults + (key(bestKnown) to m) } }
-                        if (m >= threshold && m >= curDown * multiplier) {
-                            val d = connectAndMeasure(bestKnown, "проверка: держать лучший (${fmt(m)}>${fmt(curDown)})")
+                        if (m >= threshold && m >= cmpBase * multiplier) {
+                            val d = connectAndMeasure(bestKnown, "проверка: держать лучший (${fmt(m)}>${fmt(cmpBase)})")
                             if (d >= threshold) { ui { checkStatus = "Переключён на ${nm(bestKnown)}: ↓${fmt(d)} Мбит/с" }; return@Thread }
                             // не подтвердился на активном → назад к рабочему
                             connectAndMeasure(originalProfile, "проверка: возврат (лучший не подтвердился)")
