@@ -140,7 +140,11 @@ class XrayProxyService : Service() {
             // lockdown — обход должен вернуться сразу, а не по 5-минутному таймеру.
             override fun onAvailable(network: Network) { bypassRetryAfterMs = 0L; MonitorCoordinator.wake(); scheduleVpnBypass() }
             override fun onLost(network: Network) { bypassRetryAfterMs = 0L; scheduleVpnBypass() }
-            override fun onCapabilitiesChanged(network: Network, caps: android.net.NetworkCapabilities) { bypassRetryAfterMs = 0L; scheduleVpnBypass() }
+            override fun onCapabilitiesChanged(network: Network, caps: android.net.NetworkCapabilities) {
+                bypassRetryAfterMs = 0L; scheduleVpnBypass()
+                // Пр.129: авто-переключение экономии по типу сети — по СОБЫТИЮ (default network отдаёт свои капы здесь).
+                com.picosoft.xrayproxydroid.monitor.EconomyNet.onDefaultNetwork(applicationContext, caps)
+            }
         }
         runCatching { cm.registerDefaultNetworkCallback(cb); netCallback = cb }
     }
