@@ -192,7 +192,8 @@ class XrayProxyService : Service() {
         val relation = detectRelation(cm)   // БЕЗ глобального снятия привязки
 
         if (relation != lastRelation) {
-            MonitorLog.event(applicationContext, "net", "Системный VPN: ${relationText(relation)}", "")
+            // Пр.132: рутинный статус системного VPN в журнал НЕ пишем (спамил «есть, но нас не касается» на
+            // каждый реконнект). Состояние VPN и так видно на цветном поле в «Настройках» (VpnStatusCard).
             bypassRetryAfterMs = 0L    // смена состояния → снова можно пробовать обход
             lastRelation = relation
         }
@@ -230,12 +231,6 @@ class XrayProxyService : Service() {
         }
         if (!bypassed && ourBinding != null) { runCatching { cm.bindProcessToNetwork(null) }; ourBinding = null }
         SystemVpnState.update(relation = relation, bypassed = bypassed, bypassFailed = bypassFailed, noExit = noExit)
-    }
-
-    private fun relationText(r: VpnRelation): String = when (r) {
-        VpnRelation.NONE -> "нет"
-        VpnRelation.INSIDE -> "мы внутри него"
-        VpnRelation.EXCLUDED -> "есть, но нас не касается"
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
