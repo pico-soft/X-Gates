@@ -102,12 +102,27 @@ object ServerSpeedTester {
         measureMs: Int = SettingsStore.current().speedWindowMs,
     ): Double = measureSpeedDetailed(context, profile, warmupMs, measureMs).let { if (it.ok) it.mbps else -1.0 }
 
+    /**
+     * Пр.133.B: замер на ДОСТАТОЧНОСТЬ — не точное число, а «держит ли [thresholdMbps]». Бюджет/окно урезаны до
+     * подтверждения порога: сервер быстрее порога упрётся в маленький бюджет за доли секунды → замер оборвётся,
+     * трафика на порядок меньше полного. Возврат — как обычный замер (mbps); достаточность = mbps ≥ порога.
+     * Бюджет замера = порог×~1.2с (сколько нужно прокачать, чтобы подтвердить скорость), прогрев — короткий.
+     */
+    fun measureSufficiency(context: Context, profile: ServerProfile, thresholdMbps: Double): Double {
+        val measureBudget = (thresholdMbps / 8.0 * 1_000_000.0 * 1.2).toLong().coerceIn(256 * 1024L, 4 * 1024 * 1024L)
+        val warmupBudget = 512 * 1024L   // короткий прогрев — точность не нужна, нужен факт «тянет порог»
+        return measureSpeedDetailed(context, profile, warmupMs = 400, measureMs = 1200,
+            warmupBudgetOverride = warmupBudget, measureBudgetOverride = measureBudget).let { if (it.ok) it.mbps else -1.0 }
+    }
+
     /** Как [measureSpeed], но с исходом/причиной (для диалога «Перемерить»). */
     fun measureSpeedDetailed(
         context: Context,
         profile: ServerProfile,
         warmupMs: Int = SettingsStore.current().speedWarmupMs,
         measureMs: Int = SettingsStore.current().speedWindowMs,
+        warmupBudgetOverride: Long? = null,   // Пр.133: урезанный бюджет для замера достаточности
+        measureBudgetOverride: Long? = null,
     ): Measurement {
         XrayController.ensureEnv(context)
         val verbose = SettingsStore.current().verboseLogs
@@ -115,8 +130,8 @@ object ServerSpeedTester {
         val probes = (listOf(SettingsStore.current().speedProbeUrl) + fallbackProbes).distinct()
 
         val name = profile.remarks.ifBlank { profile.address }
-        val warmupBudget = SettingsStore.current().speedWarmupBudgetBytes
-        val measureBudget = SettingsStore.current().activeMeasureBudgetBytes   // Пр.131: бюджет per-mode (активный набор)
+        val warmupBudget = warmupBudgetOverride ?: SettingsStore.current().speedWarmupBudgetBytes
+        val measureBudget = measureBudgetOverride ?: SettingsStore.current().activeMeasureBudgetBytes   // Пр.131: бюджет per-mode
         val concurrent = concurrentMeasures.incrementAndGet()
         log("── measure START «$name» ${profile.address}:${profile.port} net=${profile.network} sec=${profile.security} · параллельно=$concurrent · warmup=${warmupMs}мс/${warmupBudget}Б окно=${measureMs}мс/${measureBudget}Б")
         val t0 = System.nanoTime()
