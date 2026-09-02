@@ -438,9 +438,9 @@ object NetworkMonitor {
 
     /**
      * «Держать самый быстрый» (Промпт 82): в здоровом состоянии перемерять top-[normalTopBatch] по известной
-     * скорости и переключиться на быстрейший, если он БЫСТРЕЕ текущего на >margin. Текущий меряем реальным
-     * туннелем (measureTunnelMbps), остальных — temp-инстансом (активный прокси не трогаем). Трафик заметный —
-     * потому раз в час по умолчанию. Уступаем ручному тесту и ручной смене сервера.
+     * скорости и переключиться на быстрейший, если он БЫСТРЕЕ текущего на >margin. Пр.130: активный и кандидатов
+     * меряем ОДНИМ способом — temp-инстансом (measureSpeed), чтобы числа были СОПОСТАВИМЫ (активный прокси не
+     * трогаем). Трафик заметный — потому по умолчанию выключено (Пр.126). Уступаем ручному тесту и ручной смене.
      */
     private suspend fun optimizeToFastest(app: Context, s: AppSettings) {
         val curKey = ProxyState.state.value.serverKey ?: return
@@ -454,7 +454,11 @@ object NetworkMonitor {
         MonitorStatus.update(true, "оптимизация: перемер top-${topN.size}", now(), 0)
         MonitorCoordinator.monitorSearchRunning = true
         try {
-            val curMbps = ServerSpeedTester.measureActiveDownloadMbps(app)   // сопоставимо с кандидатами (90.A)
+            // Пр.130: активный меряем ТЕМ ЖЕ способом, что кандидатов — temp-инстансом (measureSpeed), а НЕ живым
+            // SOCKS (measureActiveDownloadMbps систематически занижает, Пр.108/109: 68.99 temp vs 2.67 живой). Иначе
+            // «держать лучший» решал бы по шуму (кандидат всегда «кратно быстрее»). Живой замер — только для плашки.
+            val curProfile = SubscriptionManager.allServers(app).firstOrNull { SubscriptionManager.serverKey(it) == curKey }
+            val curMbps = if (curProfile != null) ServerSpeedTester.measureSpeed(app, curProfile) else -1.0
             val results = HashMap<String, Double>()
             if (curMbps > 0) results[curKey] = curMbps
             var bestKey: String? = null; var bestMbps = 0.0
