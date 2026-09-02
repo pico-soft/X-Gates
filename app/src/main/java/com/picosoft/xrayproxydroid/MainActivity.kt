@@ -2502,6 +2502,18 @@ private fun SettingsSection(
         IntSettingRow("Интервал проверки соединения", "с", settings.connectionCheckIntervalSec, d.connectionCheckIntervalSec, 30, 3600) {
             onChange(settings.copy(connectionCheckIntervalSec = it))
         }
+        // Пр.127.C: «живой, но медленный» — деградация по УЖЕ идущему трафику (бесплатно, из счётчиков). Ниже порога
+        // → один замер лучшего кандидата по сохранённым данным и переход, если он приемлемо быстрее. Работает в обоих режимах.
+        Text(
+            "Если через туннель реально что-то качается и скорость ниже порога — приложение бесплатно замечает это по счётчикам и один раз проверяет лучшего кандидата, переходя, если он быстрее. Пингом медленный туннель не выявить. 0 = выключить.",
+            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+        )
+        DoubleSettingRow("Порог «медленный туннель»", "Мбит/с (0=выкл)", settings.degradationMinMbps, d.degradationMinMbps, 0.0, 100.0) {
+            onChange(settings.copy(degradationMinMbps = it))
+        }
+        IntSettingRow("Проверка деградации не чаще", "мин", settings.degradationCheckSec / 60, d.degradationCheckSec / 60, 1, 240) {
+            onChange(settings.copy(degradationCheckSec = it * 60))
+        }
         DoubleSettingRow("Минимальная отдача", "Мбит/с", settings.minUploadMbps, d.minUploadMbps, 0.0, 1000.0) {
             onChange(settings.copy(minUploadMbps = it))
         }
@@ -2664,6 +2676,10 @@ private val monitorTimeFmt = SimpleDateFormat("dd.MM HH:mm:ss", Locale.getDefaul
 // 3 мин = несколько пропущенных подтверждений → устарело, цвет меняем (даже если ничего не «сломалось»).
 private const val HEALTH_FRESH_MS = 180_000L
 
+// Пр.127.B: оценка байт на ОДНУ проверку живости (внешний IP через SOCKS + keepalive ядра). Для расчётной строки
+// «расход проверок за месяц». КАЛИБРОВАНО замером D (Пр.127): 10 мин простоя = 28.6 КБ на 10 циклов ≈ 2.9 КБ/цикл.
+private const val EST_CHECK_BYTES = 3000L
+
 /** «Сколько времени назад», объективно (Промпт 122): «12 сек» / «5 мин» / «2 ч 10 мин». Без «дня/ночи». */
 private fun humanAgo(ms: Long): String {
     val sec = (ms / 1000).coerceAtLeast(0)
@@ -2697,21 +2713,34 @@ private fun MonitorSection(
                 "Выключен — не выполняет ничего (ни проверок, ни замеров), бережём батарею.",
             style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
         )
-        // Признак жизни: время последней проверки, состояние, число циклов.
+        // Признак жизни + ЯВНАЯ частота проверок и их копеечный расход (Пр.127.B): чтобы было видно, как часто
+        // идёт проверка и что она стоит килобайты — в отличие от замеров скорости (мегабайты).
         if (settings.monitorEnabled) {
+            var uiNow by remember { mutableStateOf(System.currentTimeMillis()) }
+            LaunchedEffect(Unit) { while (true) { uiNow = System.currentTimeMillis(); delay(1000) } }
             val t = if (heartbeat.lastCheckMs > 0) monitorTimeFmt.format(Date(heartbeat.lastCheckMs)) else "—"
+            val ago = if (heartbeat.lastCheckMs > 0) "${((uiNow - heartbeat.lastCheckMs) / 1000).coerceAtLeast(0)} с назад" else "—"
+            val interval = settings.connectionCheckIntervalSec.coerceAtLeast(15)
             Text(
-                "● проверка: $t · ${heartbeat.state} · циклов: ${heartbeat.cycles}",
+                "● Проверка связи каждые $interval с · последняя: $t ($ago) · циклов: ${heartbeat.cycles} · ${heartbeat.state}",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary,
+            )
+            val checksPerMonth = 2_592_000L / interval
+            val checkMbPerMonth = checksPerMonth * EST_CHECK_BYTES / 1_048_576.0
+            val oneMeasureMb = settings.speedWarmupMb + settings.speedMeasureMb
+            Text(
+                "Расход проверок ≈ %.0f МБ/мес (стоят килобайты). Замер скорости — до %d МБ за ОДИН сервер. Поэтому экономим на замерах, а на проверках связи — никогда."
+                    .format(checkMbPerMonth, oneMeasureMb),
+                style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
             )
         }
 
         BoolSettingRow("Автомониторинг", settings.monitorEnabled, d.monitorEnabled) {
             onChange(settings.copy(monitorEnabled = it))
         }
-        IntSettingRow("Интервал цикла", "с", settings.monitorIntervalSec, d.monitorIntervalSec, 60, 3600) {
-            onChange(settings.copy(monitorIntervalSec = it))
-        }
+        // Пр.127.B: «Интервал цикла» (monitorIntervalSec) убран — он был МЁРТВЫМ (цикл берёт интервал из
+        // «Интервал проверки соединения» = connectionCheckIntervalSec, секция «Соединение и отдача»). Частота
+        // проверок показана выше строкой «● Проверка связи каждые N с».
         DoubleSettingRow("Порог прямого канала", "Мбит/с", settings.monitorDirectThreshold, d.monitorDirectThreshold, 0.1, 100.0) {
             onChange(settings.copy(monitorDirectThreshold = it))
         }
