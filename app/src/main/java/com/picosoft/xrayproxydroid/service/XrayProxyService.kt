@@ -238,6 +238,7 @@ class XrayProxyService : Service() {
             ACTION_START -> handleStart(intent)
             ACTION_STOP -> handleStop()
             ACTION_RETRY_BYPASS -> { bypassRetryAfterMs = 0L; scheduleVpnBypass() }   // «Повторить» из статус-бокса
+            ACTION_BOOT -> handleRestartAfterKill(boot = true)   // Пр.134: автозапуск после перезагрузки телефона
             // Промпт 115: intent==null при START_STICKY = система ВЕРНУЛА сервис после убийства (данные в
             // намерении не передаются). Поднимаем последний сервер из LastServerStore, а не стопаемся.
             null -> if (intent == null) handleRestartAfterKill() else stopSelfAndForeground()
@@ -273,10 +274,11 @@ class XrayProxyService : Service() {
      * теста: это не открытие человеком). Нет сохранённого сервера/профиля/конфига — ядро вслепую НЕ поднимаем,
      * а завершаем сервис и пишем событие. Записываем и факт восстановления с оценкой простоя (по heartbeat).
      */
-    private fun handleRestartAfterKill() {
+    private fun handleRestartAfterKill(boot: Boolean = false) {
         // Сразу в foreground (иначе ANR/таймаут FGS), затем в фоне поднимаем последний сервер.
-        startForeground(NotificationHelper.NOTIFICATION_ID, NotificationHelper.buildNotification(this, "восстановление…"))
-        ProxyState.update(running = false, label = null, serverKey = null, message = "восстановление после сбоя…")
+        val fgText = if (boot) "автозапуск…" else "восстановление…"
+        startForeground(NotificationHelper.NOTIFICATION_ID, NotificationHelper.buildNotification(this, fgText))
+        ProxyState.update(running = false, label = null, serverKey = null, message = if (boot) "автозапуск после включения…" else "восстановление после сбоя…")
         coreActive = true
         bypassRetryAfterMs = 0L
         val downtimeMs = LastServerStore.lastAlive(applicationContext).let { if (it > 0L) System.currentTimeMillis() - it else -1L }
@@ -287,7 +289,8 @@ class XrayProxyService : Service() {
                 val config = profile?.let { runCatching { XrayConfigBuilder.build(it) }.getOrNull() }
                 if (profile == null || config == null) {
                     MonitorLog.event(
-                        applicationContext, "monitor", "Сервис убит системой — восстановить нечем",
+                        applicationContext, "monitor",
+                        if (boot) "Автозагрузка — поднимать нечем" else "Сервис убит системой — восстановить нечем",
                         if (lastKey == null) "нет сохранённого сервера" else "последнего сервера нет в списке / конфиг не собрался",
                     )
                     runCatching { stopSelfAndForeground() }
@@ -296,7 +299,9 @@ class XrayProxyService : Service() {
                 val label = ServerLabels.full(profile)
                 val serverKey = SubscriptionManager.serverKey(profile)
                 val downtimeStr = if (downtimeMs in 0..(48L * 3600_000L)) "простой ~${downtimeMs / 1000}с" else "простой неизвестен"
-                MonitorLog.event(applicationContext, "monitor", "Сервис был убит системой — восстанавливаюсь", "$downtimeStr · сервер: $label")
+                MonitorLog.event(applicationContext, "monitor",
+                    if (boot) "Автозапуск после включения телефона" else "Сервис был убит системой — восстанавливаюсь",
+                    if (boot) "последний сервер: $label" else "$downtimeStr · сервер: $label")
                 runCoreStart(config, label, serverKey)
             } catch (e: Exception) {
                 Log.w("XrayProxyService", "восстановление после убийства упало (проглочено): ${e.message}", e)
@@ -454,6 +459,7 @@ class XrayProxyService : Service() {
         const val ACTION_START = "com.picosoft.xrayproxydroid.action.START"
         const val ACTION_STOP = "com.picosoft.xrayproxydroid.action.STOP"
         const val ACTION_RETRY_BYPASS = "com.picosoft.xrayproxydroid.action.RETRY_BYPASS"
+        const val ACTION_BOOT = "com.picosoft.xrayproxydroid.action.BOOT"   // Пр.134: автозапуск после перезагрузки
         const val EXTRA_CONFIG = "config"
         const val EXTRA_LABEL = "label"
         const val EXTRA_SERVERKEY = "serverKey"
@@ -471,6 +477,12 @@ class XrayProxyService : Service() {
         fun stop(context: Context) {
             val intent = Intent(context, XrayProxyService::class.java).setAction(ACTION_STOP)
             context.startService(intent)
+        }
+
+        /** Пр.134: старт из BootReceiver — поднять последний сервер (без конфига в intent, как sticky-рестарт). */
+        fun startFromBoot(context: Context) {
+            val intent = Intent(context, XrayProxyService::class.java).setAction(ACTION_BOOT)
+            ContextCompat.startForegroundService(context, intent)
         }
 
         /** «Повторить обход» из статус-бокса (Промпт 62.C): сбросить троттлинг и пере-попробовать сразу. */

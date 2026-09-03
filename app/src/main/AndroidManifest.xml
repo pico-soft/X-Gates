@@ -30,6 +30,11 @@
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
     <!-- Удержать CPU на время одного цикла проверки (иначе после срабатывания будильника CPU уснёт посреди пробы). -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Пр.134: автозапуск после перезагрузки телефона. BOOT_COMPLETED приходит после разблокировки,
+         LOCKED_BOOT_COMPLETED — раньше (наши данные о серверах в credential-storage → реально стартуем на
+         BOOT_COMPLETED; LOCKED объявлен, приёмник читает настройку в try/catch). Запуск FGS из загрузочного
+         бродкаста на Android 12+ — разрешённый случай (не упрёмся в отказ). -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
         android:name=".XrayApp"
@@ -63,6 +68,19 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Local SOCKS/HTTP proxy (xray-core), no VpnService" />
         </service>
+
+        <!-- Пр.134: приёмник загрузки — ТОЛЬКО поднимает сервис (работу делает сервис). directBootAware,
+             чтобы получать и LOCKED_BOOT_COMPLETED; настройку/последний сервер читает в try/catch (до
+             разблокировки credential-storage недоступно → реальный старт на BOOT_COMPLETED после разблокировки). -->
+        <receiver
+            android:name=".service.BootReceiver"
+            android:exported="true"
+            android:directBootAware="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
 
         <!-- Отдаём скачанный APK обновления системному установщику через content:// (Промпт 70).
              Файл лежит в приватном filesDir/updates (не в общих загрузках). -->
