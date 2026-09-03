@@ -115,6 +115,7 @@ import java.util.Date
 import java.util.Locale
 import kotlin.math.roundToInt
 import com.picosoft.xrayproxydroid.service.BatteryOptimization
+import com.picosoft.xrayproxydroid.service.BootPrefs
 import com.picosoft.xrayproxydroid.service.LastServerStore
 import com.picosoft.xrayproxydroid.service.ProxyState
 import com.picosoft.xrayproxydroid.service.SystemVpnState
@@ -165,6 +166,7 @@ class MainActivity : ComponentActivity() {
     companion object {
         const val EXTRA_OPEN = "open"          // Промпт 93.J: интент-навигация из уведомления
         const val OPEN_UPDATE = "update"       // открыть на «О приложении»/экране обновления
+        const val OPEN_SETTINGS = "settings"   // Пр.134: перейти на вкладку «Настройки»
         // Запрос навигации (из уведомления) — StateFlow, чтобы AppRoot среагировал и при onNewIntent (приложение уже открыто).
         val pendingOpen = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
         // Промпт 117: тик возврата на передний план. Системные экраны (исключение из энергосбережения)
@@ -238,7 +240,7 @@ private fun AppRoot() {
     // Навигация по тапу уведомления об обновлении (Промпт 93.J) → вкладка «Настройки» (там «О приложении» + обновление).
     val pendingOpen by MainActivity.pendingOpen.collectAsState()
     LaunchedEffect(pendingOpen) {
-        if (pendingOpen == MainActivity.OPEN_UPDATE) { tab = 2; MainActivity.pendingOpen.value = null }
+        if (pendingOpen == MainActivity.OPEN_UPDATE || pendingOpen == MainActivity.OPEN_SETTINGS) { tab = 2; MainActivity.pendingOpen.value = null }
     }
     val stateHolder = rememberSaveableStateHolder()   // сохраняет состояние вкладки (раскрытые секции) при переключении
     Scaffold(
@@ -899,6 +901,8 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
     val resumeTick by MainActivity.resumeTick.collectAsState()
     val batteryIgnored = remember(resumeTick) { BatteryOptimization.isIgnored(context) }
     var batteryBannerClosed by remember { mutableStateOf(BatteryOptimization.isBannerDismissed(context)) }
+    // Пр.134.C: состояние предложения автозагрузки (закрыто навсегда крестиком).
+    var bootOfferClosed by remember { mutableStateOf(BootPrefs.offerDismissed(context)) }
 
     // Промпт 123.B: внешний адрес НЕ хранится отдельной копией на экране — он живёт в TunnelHealth и
     // принадлежит серверу (serverKey). Экран читает только его.
@@ -1354,6 +1358,9 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
     // сервера И подтверждение не старше HEALTH_FRESH_MS. Сменился сервер / устарело подтверждение → не зелёный,
     // даже если ничего «не сломалось». Один источник: TunnelHealth (адрес принадлежит подтверждению).
     val ipVerified = proxy.running && TunnelHealth.isConfirmedFor(proxy.serverKey, System.currentTimeMillis(), HEALTH_FRESH_MS)
+    // Пр.134.C: отметить первый подтверждённый OK — от него отсчитываем «связь поработала», чтобы предложить
+    // автозагрузку не при первом запуске, а позже.
+    LaunchedEffect(ipVerified) { if (ipVerified) BootPrefs.markHealthyOnce(context) }
 
     // Автозапуск при старте (по умолчанию, отключаемо в Настройках). Один раз за процесс. Два шага:
     //  1) МГНОВЕННАЯ СВЯЗЬ — сразу подключиться к последнему успешному серверу (если он ещё в списке),
@@ -1445,6 +1452,20 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                         onDismiss = { BatteryOptimization.dismissBanner(context); batteryBannerClosed = true },
                     )
                 }
+                // Пр.134.C: предложение автозагрузки — ОДИН РАЗ, ПОСЛЕ того как связь поработала (не при первом
+                // запуске), полосой (не модально). Закрыл → больше не предлагаем (BootPrefs).
+                if (!bootOfferClosed && BootPrefs.shouldOffer(context, settings.startOnBoot)) {
+                    BootOfferBanner(
+                        batteryReady = batteryIgnored,
+                        onEnable = {
+                            SettingsStore.update(context, settings.copy(startOnBoot = true))
+                            BootPrefs.dismissOffer(context); bootOfferClosed = true
+                            if (!batteryIgnored) MainActivity.pendingOpen.value = MainActivity.OPEN_SETTINGS   // → «Работа в фоне»
+                        },
+                        onOpenBackground = { MainActivity.pendingOpen.value = MainActivity.OPEN_SETTINGS },
+                        onDismiss = { BootPrefs.dismissOffer(context); bootOfferClosed = true },
+                    )
+                }
                 // Промпт 74: подписок нет (дефолт не зафетчился при первом запуске или юзер их не добавил) —
                 // зовём добавить свою. Показываем ТОЛЬКО когда список источников пуст.
                 if (sources.isEmpty()) {
@@ -1507,6 +1528,25 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                     onCheck = { onCheck(alive) }, onCancelCheck = { onCancelCheck() },
                     onExclude = { onRemoveCurrent(alive) },
                 )
+                // Пр.134.F: компактный признак режима рядом со статус-боксом (состояние, не тревога). Причина —
+                // когда режим выбран автоматически по сети. Тап ведёт в настройку. Одна тонкая строка.
+                run {
+                    val save = settings.trafficSaveMode
+                    val reason = when {
+                        !settings.trafficSaveAutoByNetwork -> "вручную"
+                        settings.trafficSaveManualUntilNetChange -> "вручную до смены сети"
+                        save -> "моб. сеть"
+                        else -> "Wi-Fi"
+                    }
+                    Text(
+                        "Режим: ${if (save) "экономия" else "обычный"} · $reason ›",
+                        style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .clickable { MainActivity.pendingOpen.value = MainActivity.OPEN_SETTINGS }
+                            .padding(vertical = 3.dp, horizontal = 2.dp),
+                    )
+                }
                 ActionsBar(
                     fullTesting = fullTesting, running = proxy.running, refreshingSubs = refreshingSubs,
                     onFullTest = { onFastest() },
@@ -3666,6 +3706,35 @@ private fun BatteryOptBanner(onEnable: () -> Unit, onDismiss: () -> Unit) {
     }
 }
 
+/** Пр.134.C: ненавязчивое предложение автозагрузки. Сине-серый (состояние/предложение, не тревога). */
+@Composable
+private fun BootOfferBanner(batteryReady: Boolean, onEnable: () -> Unit, onOpenBackground: () -> Unit, onDismiss: () -> Unit) {
+    val bg = Color(0xFF37474F)
+    Row(
+        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(bg).padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("Запускать при включении телефона?", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold, color = Color.White)
+            Text(
+                "Прокси поднимется сам после перезагрузки — последний рабочий сервер, без полного теста." +
+                    (if (!batteryReady) " На вашем телефоне для этого, скорее всего, нужно разрешить работу в фоне." else ""),
+                style = MaterialTheme.typography.bodySmall, color = Color(0xFFB0BEC5),
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Button(
+                    onClick = onEnable,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = bg),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
+                ) { Text("Включить") }
+                if (!batteryReady) TextButton(onClick = onOpenBackground) { Text("Настроить фон", color = Color.White) }
+            }
+        }
+        Text("✕", color = Color.White, fontWeight = FontWeight.Bold,
+            modifier = Modifier.clip(RoundedCornerShape(6.dp)).clickable { onDismiss() }.padding(8.dp))
+    }
+}
+
 /**
  * Секция «Работа в фоне» (Промпт 117 + 120) в настройках: честный индикатор готовности (исключено ли
  * приложение из энергосбережения) + кнопка в системный диалог + ГАРМОШКА подсказок по вендорам (10 марок +
@@ -3704,7 +3773,27 @@ private fun BackgroundWorkSection() {
     }
     var expandedId by rememberSaveable { mutableStateOf(detectedId ?: "") }   // своя раскрыта; неопознан → ничего
 
+    val settings by SettingsStore.state.collectAsState()
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        // Пр.134: автозапуск после перезагрузки телефона + честное состояние готовности.
+        BoolSettingRow("Запускать при включении телефона", settings.startOnBoot, SettingsStore.DEFAULTS.startOnBoot) {
+            SettingsStore.update(context, settings.copy(startOnBoot = it))
+        }
+        Text(
+            when {
+                !settings.startOnBoot -> "Выключено. Включите — после перезагрузки телефона прокси поднимется сам (последний рабочий сервер, без полного теста)."
+                ignored -> "✓ Готово: автозагрузка включена, энергоограничение снято."
+                else -> "⚠ Автозагрузка включена, но энергоограничение НЕ снято — на многих телефонах после перезагрузки не сработает. Снимите ограничение ниже."
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = when {
+                settings.startOnBoot && ignored -> Color(0xFF2E7D32)
+                settings.startOnBoot && !ignored -> Color(0xFFE8710A)
+                else -> TABLE_GRAY
+            },
+        )
+        Spacer(Modifier.height(2.dp))
+
         // Индикатор готовности — честно, по факту isIgnoringBatteryOptimizations.
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(if (ignored) "✓" else "✗",
