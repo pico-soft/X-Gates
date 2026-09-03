@@ -3,12 +3,16 @@ package com.picosoft.xrayproxydroid.subscription
 import android.content.Context
 import android.util.Log
 import com.picosoft.xrayproxydroid.net.CascadeFetch
+import com.picosoft.xrayproxydroid.net.CascadeResult
 import com.picosoft.xrayproxydroid.settings.BlocklistStore
 import com.picosoft.xrayproxydroid.settings.SettingsStore
 import com.picosoft.xrayproxydroid.xray.ServerFilter
 import com.picosoft.xrayproxydroid.xray.link.ParseResult
 import com.picosoft.xrayproxydroid.xray.link.ServerLinkParser
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import java.net.URI
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -49,6 +53,12 @@ object SubscriptionManager {
     const val DEFAULT_SOURCE_URL = "https://raw.githack.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS_mobile.txt"
     const val DEFAULT_SOURCE_NAME = "Обход ограничений в РФ по-умолчанию"
 
+    /** Пр.136: состояние посева дефолтной подписки для UI. [attempted]=пробовали хоть раз; [error] пуст = успех/не
+     *  пробовали, непуст = последняя попытка не удалась (показываем причину + «Повторить», не пустой экран). */
+    data class SeedStatus(val attempted: Boolean = false, val error: String = "")
+    private val _seedStatus = MutableStateFlow(SeedStatus())
+    val seedStatus: StateFlow<SeedStatus> = _seedStatus.asStateFlow()
+
     /**
      * Ключ ПОЛНОЙ идентичности соединения — дедуп внутри источника, склейка МЕЖДУ источниками,
      * привязка pingMs/speed, определение активного сервера. НЕ только addr+port+cred (иначе
@@ -82,6 +92,10 @@ object SubscriptionManager {
         }
         // Промпт 85.E: самопроверка — неполные (осиротевшие) профили пересобрать из сырья + записать в журнал.
         runCatching { verifyAndHeal(context) }
+        // Пр.136: восстановить статус посева для UI (переживает перезапуск) — чтобы карточка «не загрузилось»
+        // и причина были видны сразу после старта, а не только в сессии, где случилась неудача.
+        val ff = SubscriptionStore.load(context)
+        _seedStatus.value = SeedStatus(attempted = ff.seedLastAttemptTs.isNotBlank() || ff.seededDefaultRuBypass, error = ff.seedLastError)
     }
 
     /**
@@ -97,6 +111,7 @@ object SubscriptionManager {
         if (file.seededDefaultRuBypass) return false
         if (file.sources.isNotEmpty()) {                       // у юзера уже есть свои → дефолт не навязываем
             SubscriptionStore.save(context, file.copy(seededDefaultRuBypass = true))
+            _seedStatus.value = SeedStatus(attempted = true, error = "")
             return false
         }
         val settings = SettingsStore.current()
@@ -106,16 +121,37 @@ object SubscriptionManager {
         val totalT = directT + proxyT + 5_000
         val cascade = CascadeFetch.fetch(context, url, settings.subUserAgent, directT, proxyT, totalT,
             acceptBody = { it.ok && hasSupportedLinks(it.body) })
-        if (!cascade.ok) return false                          // не зафетчилось → пусто, флаг НЕ ставим (повтор позже)
+        // Пр.136: НЕУДАЧА не помечается как выполненная (флаг seededDefaultRuBypass НЕ ставим → повторим позже),
+        // но фиксируем ПРИЧИНУ в лог + persist + StateFlow — чтобы человек видел «список не загрузился, почему»,
+        // а не пустой экран. На свежей установке работает только прямая ступень (туннеля и известных серверов ещё нет).
+        if (!cascade.ok) {
+            val reason = seedFailReason(cascade)
+            Log.w(TAG, "посев дефолтной подписки не удался: $reason")
+            SubscriptionStore.save(context, SubscriptionStore.load(context).copy(seedLastError = reason, seedLastAttemptTs = now()))
+            _seedStatus.value = SeedStatus(attempted = true, error = reason)
+            return false
+        }
         val f2 = SubscriptionStore.load(context)               // перечитать (гонка) — вдруг юзер успел добавить
-        if (f2.seededDefaultRuBypass || f2.sources.isNotEmpty()) return false
+        if (f2.seededDefaultRuBypass || f2.sources.isNotEmpty()) { _seedStatus.value = SeedStatus(attempted = true, error = ""); return false }
         val id = newId()
         SubscriptionStore.save(context, f2.copy(
             seededDefaultRuBypass = true,
+            seedLastError = "",                                // успех — чистим прежнюю ошибку
             sources = listOf(SubSource(id = id, name = DEFAULT_SOURCE_NAME, url = url, enabled = true)),
         ))
         importInto(context, id, cascade.result!!.body, "Дефолтная подписка (первый успешный фетч)")
+        _seedStatus.value = SeedStatus(attempted = true, error = "")
         return true
+    }
+
+    /** Пр.136: короткая причина неудачи посева (последняя реальная попытка каскада) — для показа человеку. */
+    private fun seedFailReason(cascade: CascadeResult): String {
+        val r = cascade.attempts.lastOrNull { !it.skipped && it.result != null }?.result
+            ?: return "нет сети или прямой путь к адресу подписки заблокирован (туннеля ещё нет)"
+        return when {
+            r.exceptionClass != null -> "нет связи с адресом подписки (${r.exceptionClass})"
+            else -> "адрес подписки ответил HTTP ${r.httpCode}"
+        }
     }
 
     /** Старые вложенные подписки → источники + реестр (измерения серверов сохраняются). */

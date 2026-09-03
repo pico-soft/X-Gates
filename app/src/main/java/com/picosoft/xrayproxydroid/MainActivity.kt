@@ -184,6 +184,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         UpdateFlowController.appInForeground = true   // Пункт 2: на переднем плане ставим установщик напрямую
+        com.picosoft.xrayproxydroid.subscription.DefaultSeeder.maybeSeed(applicationContext, "resume")   // Пр.136: повтор посева
         MonitorCoordinator.wake()
         resumeTick.value = resumeTick.value + 1   // Промпт 117: перечитать состояние исключения из энергосбережения
     }
@@ -422,8 +423,12 @@ private fun SubscriptionsScreen(modifier: Modifier = Modifier) {
     var renameSource by remember { mutableStateOf<SubSource?>(null) }
     var status by remember { mutableStateOf("") }
     var refreshing by remember { mutableStateOf(false) }
+    // Пр.136: статус посева дефолтной подписки — для карточки «рекомендуемый список не загрузился».
+    val seed by SubscriptionManager.seedStatus.collectAsState()
 
     fun reload() { sources = SubscriptionManager.sources(context) }
+    // Фоновый посев (успех/повтор) меняет статус → перечитать источники, чтобы список появился сам.
+    LaunchedEffect(seed) { sources = SubscriptionManager.sources(context) }
 
     fun onImportFile(uri: android.net.Uri) {
         Thread {
@@ -480,6 +485,34 @@ private fun SubscriptionsScreen(modifier: Modifier = Modifier) {
         contentPadding = PaddingValues(vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
+        // Пр.136: пустой список без объяснения выглядит как поломка. Показываем, что происходит, и куда нажать.
+        if (sources.isEmpty()) item {
+            val err = seed.error
+            Column(
+                modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+                    .background(MaterialTheme.colorScheme.secondaryContainer).padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                val onc = MaterialTheme.colorScheme.onSecondaryContainer
+                if (err.isNotBlank()) {
+                    Text("Рекомендуемый список серверов не загрузился", fontWeight = FontWeight.Bold, color = onc)
+                    Text("Причина: $err. Это бывает, когда сеть закрыта или адрес заблокирован напрямую — на свежей установке туннеля ещё нет, обойти нечем.",
+                        style = MaterialTheme.typography.bodySmall, color = onc)
+                    Button(
+                        onClick = {
+                            status = "Повторяю загрузку рекомендуемого списка…"
+                            com.picosoft.xrayproxydroid.subscription.DefaultSeeder.maybeSeed(context, "manual", force = true)
+                        },
+                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
+                    ) { ButtonLabel(UiIcon.REFRESH, "Повторить") }
+                } else {
+                    Text("Загружаю рекомендуемый список серверов…", fontWeight = FontWeight.Bold, color = onc)
+                }
+                Text("Или вставьте конфигурацию текстом ниже (поле «Вставить ссылки текстом») — её можно принести из мессенджера или от другого устройства. Это единственный способ начать в заблокированной сети.",
+                    style = MaterialTheme.typography.bodySmall, color = onc)
+            }
+        }
+
         // Заголовок КРУПНЕЕ + «Обновить» ИКОНКОЙ справа (Промпт 93).
         item {
             Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -1396,6 +1429,20 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                 }
             }
         }.start()
+    }
+
+    // Пр.136: повтор посева дефолтной подписки при ПОЯВЛЕНИИ СЕТИ, пока приложение открыто. На свежей установке
+    // сервиса ещё нет (нет к чему подключаться), его NetworkCallback не работает — регистрируем свой на время
+    // экрана. maybeSeed сам отсеет, если сеять уже нечего (список не пуст/посеяно); бэкофф внутри.
+    androidx.compose.runtime.DisposableEffect(Unit) {
+        val cm = context.getSystemService(ConnectivityManager::class.java)
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: android.net.Network) {
+                com.picosoft.xrayproxydroid.subscription.DefaultSeeder.maybeSeed(context, "network")
+            }
+        }
+        runCatching { cm?.registerDefaultNetworkCallback(cb) }
+        onDispose { runCatching { cm?.unregisterNetworkCallback(cb) } }
     }
 
     // Основной вид = ЖИВЫЕ — через единый предикат [ServerFilter.isVisible] (стоп-лист+протокол+пинг+мин.скорость).
@@ -3974,7 +4021,7 @@ private fun UpdateCheckSection() {
         if (checking || downloading) return
         checking = true; message = null; readyFile = null
         Thread {
-            val report = runCatching { UpdateChecker.check(context) }
+            val report = runCatching { UpdateChecker.check(context, manual = true) }
                 .getOrElse { com.picosoft.xrayproxydroid.update.CheckReport(
                     UpdateCheckResult.Error(com.picosoft.xrayproxydroid.update.UpdateErrorKind.API_UNAVAILABLE, it.message ?: ""),
                     "исключение: ${it.javaClass.simpleName}: ${it.message}") }
