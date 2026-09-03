@@ -212,6 +212,21 @@ object SubscriptionManager {
     }
 
     /**
+     * Пр.137: ЛУЧШИЙ сервер, пригодный для АВТО-восстановления — НЕ в стоп-листе, НЕ на паузе, протокол разрешён.
+     * Приоритет: по известной скорости (быстрые первыми), затем по пингу (живые первыми). Нужен, когда
+     * «последний сервер» оказался в стоп-листе: авто-подъём (автозапуск / после убийства системой / после
+     * перезагрузки) НЕ должен поднимать заблокированный сервер. null — годной замены нет.
+     */
+    fun bestSavedSelectable(context: Context): ServerProfile? {
+        val s = SettingsStore.current()
+        val bl = BlocklistStore.current()
+        return allServers(context)
+            .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl) && !ServerFilter.isPaused(it, bl) }
+            .sortedWith(compareByDescending<ServerProfile> { it.speedMbps ?: 0.0 }.thenBy { it.pingMs ?: Int.MAX_VALUE })
+            .firstOrNull()
+    }
+
+    /**
      * Серверы, ПОДТВЕРЖДЁННО работавшие за последние [withinHours] часов (speedMbps>0 и свежий
      * speedTestedTs), по убыванию известной скорости, через ЕДИНЫЙ предикат (протокол + стоп-лист).
      * Для ступени 5 каскада ([CascadeFetch]) — обновить подписку через temp-инстанс, когда прямой путь

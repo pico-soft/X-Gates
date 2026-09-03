@@ -14,9 +14,11 @@ import com.picosoft.xrayproxydroid.monitor.NetworkMonitor
 import com.picosoft.xrayproxydroid.monitor.ServerLabels
 import com.picosoft.xrayproxydroid.net.NetworkUtils
 import com.picosoft.xrayproxydroid.net.VpnRelation
+import com.picosoft.xrayproxydroid.settings.BlocklistStore
 import com.picosoft.xrayproxydroid.settings.SettingsStore
 import com.picosoft.xrayproxydroid.subscription.SubscriptionManager
 import com.picosoft.xrayproxydroid.traffic.TrafficTracker
+import com.picosoft.xrayproxydroid.xray.ServerFilter
 import com.picosoft.xrayproxydroid.xray.XrayConfig
 import com.picosoft.xrayproxydroid.xray.XrayConfigBuilder
 import com.picosoft.xrayproxydroid.xray.XrayController
@@ -285,7 +287,17 @@ class XrayProxyService : Service() {
         Thread {
             try {
                 val lastKey = LastServerStore.load(applicationContext)
-                val profile = lastKey?.let { k -> SubscriptionManager.allServers(applicationContext).firstOrNull { SubscriptionManager.serverKey(it) == k } }
+                var profile = lastKey?.let { k -> SubscriptionManager.allServers(applicationContext).firstOrNull { SubscriptionManager.serverKey(it) == k } }
+                // Пр.137: последний сервер оказался в стоп-листе/на паузе — авто-подъём НЕ поднимает заблокированный,
+                // берём лучшую незаблокированную замену по сохранённым данным. Нет замены — ниже «поднимать нечем».
+                if (profile != null) {
+                    val bl = BlocklistStore.current()
+                    if (ServerFilter.isBlocked(profile!!, bl) || ServerFilter.isPaused(profile!!, bl)) {
+                        MonitorLog.event(applicationContext, "monitor", "Последний сервер в стоп-листе — беру замену",
+                            ServerLabels.full(profile!!))
+                        profile = SubscriptionManager.bestSavedSelectable(applicationContext)
+                    }
+                }
                 val config = profile?.let { runCatching { XrayConfigBuilder.build(it) }.getOrNull() }
                 if (profile == null || config == null) {
                     MonitorLog.event(

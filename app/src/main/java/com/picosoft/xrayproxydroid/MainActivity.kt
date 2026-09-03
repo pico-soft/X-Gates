@@ -1413,7 +1413,11 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
         if (!proxy.running) {
             val lastKey = LastServerStore.load(context)
             val last = lastKey?.let { k -> servers.firstOrNull { SubscriptionManager.serverKey(it) == k } }
-            if (last != null) connectServer(last, "автозапуск (последний сервер)")
+            // Пр.137: НЕ поднимаем автозапуском заблокированный/на паузе сервер — ниже пойдёт полный тест
+            // (он исключает стоп-лист) и выберет годного. Иначе автозапуск втягивал в стоп-листовый сервер.
+            val bl = BlocklistStore.current()
+            if (last != null && !ServerFilter.isBlocked(last, bl) && !ServerFilter.isPaused(last, bl))
+                connectServer(last, "автозапуск (последний сервер)")
         }
         Thread {
             // Промпт 74: дефолтную подписку сеем ТОЛЬКО если её URL зафетчился (иначе пусто + «Добавьте вашу
