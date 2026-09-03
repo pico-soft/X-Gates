@@ -120,13 +120,20 @@ data class AppSettings(
     //   (пинг ≠ скорость), а у кого замеров не было — «живых 0». Поля batch/minAlive/refreshSec БОЛЬШЕ НЕ
     //   используются (оставлены только для совместимости старого JSON; refreshSec был мёртв и раньше).
     val trafficSaveMode: Boolean = false,      // ЕДИНЫЙ источник правды режима (его читают все); автоматика ниже пишет в него
-    // Пр.129: авто-переключение экономии по ТИПУ СЕТИ (по событию смены сети, не по опросу). ДЕФОЛТ ВКЛ:
-    // Wi-Fi/Ethernet → экономия ВЫКЛ (обычный режим), мобильная → ВКЛ. Выкл — тип сети ни на что не влияет.
-    val trafficSaveAutoByNetwork: Boolean = true,
+    // Пр.129: авто-переключение экономии по ТИПУ СЕТИ (по событию смены сети, не по опросу). Wi-Fi/Ethernet →
+    // экономия ВЫКЛ (обычный режим), мобильная → ВКЛ. Выкл — тип сети ни на что не влияет.
+    // Пр.137: ДЕФОЛТ ВЫКЛ (было ВКЛ). Экономия НЕ должна включаться сама после обновления/запуска с нуля —
+    // на мобильной она мерила лишь пару серверов, из-за чего живые оставались «не изм.» и выбор был хуже.
+    // Экономия остаётся, но как ЯВНЫЙ выбор пользователя, а не молчаливый дефолт.
+    val trafficSaveAutoByNetwork: Boolean = false,
+    // Пр.137: одноразовая миграция «выключить авто-экономию» на существующих установках (у них persist'нут
+    // прежний дефолт ВКЛ). false → при загрузке один раз сбрасываем auto+режим экономии в ВЫКЛ и ставим true.
+    // Пользователь может снова включить экономию вручную — флаг уже true, повторно не сбросим.
+    val economyAutoResetDone: Boolean = false,
     // Пр.129.C: пользователь переключил режим ВРУЧНУЮ при активной автоматике → его выбор держится ДО следующей
     // смены типа сети, потом автоматика снова берёт своё. Флаг снимается при смене сети (EconomyNet).
     val trafficSaveManualUntilNetChange: Boolean = false,
-    val trafficSaveBlindProbe: Int = 3,        // Пр.125.C: сколько кандидатов мерить, когда прошлых замеров нет
+    val trafficSaveBlindProbe: Int = 10,       // Пр.125.C/Пр.137: сколько кандидатов мерить, когда прошлых замеров нет (≥10 живых)
     val trafficSaveBatch: Int = 5,             // УСТАРЕЛО (Пр.125): не используется
     val trafficSaveMinAlive: Int = 2,          // УСТАРЕЛО (Пр.125): не используется
     val trafficSaveRefreshSec: Int = 3600,     // УСТАРЕЛО (Пр.125): не используется
@@ -222,7 +229,19 @@ object SettingsStore {
         val f = file(context)
         if (!f.exists()) return
         try {
-            _state.value = json.decodeFromString<AppSettings>(f.readText())
+            val loaded = json.decodeFromString<AppSettings>(f.readText())
+            // Пр.137: одноразовая миграция — на существующих установках была persist'нута авто-экономия (ВКЛ).
+            // Elyor: экономия не должна включаться сама после обновления. Один раз выключаем авто+режим экономии.
+            _state.value = if (!loaded.economyAutoResetDone) {
+                val migrated = loaded.copy(
+                    trafficSaveAutoByNetwork = false,
+                    trafficSaveMode = false,
+                    trafficSaveManualUntilNetChange = false,
+                    economyAutoResetDone = true,
+                )
+                runCatching { update(context, migrated) }
+                migrated
+            } else loaded
         } catch (e: Exception) {
             Log.w(TAG, "load failed, keeping defaults", e)
         }
