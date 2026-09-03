@@ -6,6 +6,7 @@ import android.util.Log
 import com.picosoft.xrayproxydroid.BuildConfig
 import com.picosoft.xrayproxydroid.net.CascadeFetch
 import com.picosoft.xrayproxydroid.net.CascadeResult
+import com.picosoft.xrayproxydroid.net.FetchStage
 import com.picosoft.xrayproxydroid.settings.SettingsStore
 import com.picosoft.xrayproxydroid.subscription.SubscriptionFetcher
 import com.picosoft.xrayproxydroid.traffic.TrafficTracker
@@ -62,6 +63,12 @@ object UpdateChecker {
      */
     const val AUTO_CHECK_PROXY_WAIT_MS = 20_000
 
+    // Пр.135: для РУЧНОЙ проверки разрешаем ступень 6 (temp-инстанс) на запрос СВЕДЕНИЙ (API/манифест) —
+    // иначе при заблокированном напрямую api.github.com и невключённом туннеле обновиться нельзя вовсе.
+    // Манифест весит килобайты, полный перебор не нужен: 2 кандидата, короткий таймаут на каждого.
+    private const val UPDATE_TEMP_CANDIDATES = 2
+    private const val UPDATE_TEMP_TIMEOUT_MS = 12_000
+
     // Три РАЗНЫХ узла GitHub, блокируются в РФ раздельно (Промпт 76/80.C). Доступность одного ничего не
     // говорит про остальные, поэтому в подробностях показываем результат по каждому отдельно.
     private const val NODE_API = "https://api.github.com/"
@@ -87,6 +94,10 @@ object UpdateChecker {
         "  • ${a.stage.label}: $body$redir"
     }
 
+    /** Пр.135.C: сведения получены через temp-инстанс (обошли заблокированный напрямую GitHub) — показать это. */
+    private fun tempNote(c: CascadeResult): String =
+        if (c.stage == FetchStage.TEMP_RECENT) " · через запасной сервер (GitHub напрямую недоступен)" else ""
+
     /** КОНЕЧНЫЙ host, до которого не дошли (последняя реальная попытка), + причина — для сводки (77.C). */
     private fun lastHost(cascade: CascadeResult): String {
         val a = cascade.attempts.lastOrNull { !it.skipped && it.result != null } ?: return "нет попыток"
@@ -95,21 +106,26 @@ object UpdateChecker {
         return "${host(r.finalUrl)} ($why)"
     }
 
-    fun check(context: Context): CheckReport {
+    /** [manual] — РУЧНОЕ нажатие «Проверить обновление»/тап баннера: ходим по ВСЕМ ступеням, включая temp-инстанс
+     *  (Пр.135). Авто-проверка на старте — [manual]=false: только дешёвые ступени, при неудаче молча ждём. */
+    fun check(context: Context, manual: Boolean = false): CheckReport {
         val s = SettingsStore.current()
         val verbose = s.verboseLogs
         val directT = s.subTimeoutSec * 1000
         val proxyT = s.subTimeoutSec * 1000 + 10_000
-        val totalT = directT + proxyT + 5_000
+        // При ручной проверке даём бюджет ещё и на temp-ступень (2 кандидата × короткий таймаут).
+        val totalT = directT + proxyT + 5_000 + (if (manual) UPDATE_TEMP_CANDIDATES * UPDATE_TEMP_TIMEOUT_MS else 0)
         val det = StringBuilder()
         fun addTest(c: CascadeResult) { c.result?.let { if (it.bodyBytes > 0) TrafficTracker.addTest(it.bodyBytes.toLong()) } }
         // Один запрос обновления = один блок диагностики (лог + подробности UI). proxyFirst=true (77.B).
         fun request(label: String, url: String): CascadeResult {
-            // Промпт 81.E: temp-инстанс НЕ используем — незачем перебирать временные серверы (по ~15с
-            // каждый) ради килобайтного манифеста; без туннеля и при заблокированном прямом пути это и
-            // давало ~90с. Свой SOCKS первым (77.B); терминальные коды (429/40x) обрывают каскад (81.A).
+            // Пр.135 (отменяет 81.E): для РУЧНОЙ проверки temp-инстанс РАЗРЕШЁН — при заблокированном напрямую
+            // GitHub и невключённом туннеле иначе не обновиться вовсе. Манифест килобайтный → ограничиваем
+            // 2 кандидатами по 12с (не превращаем в минутное ожидание). Свой SOCKS первым (77.B), при
+            // поднятом туннеле порядок не меняем; терминальные коды (429/40x) обрывают каскад (81.A).
             val c = CascadeFetch.fetch(context, url, UA, directT, proxyT, totalT,
-                acceptBody = { it.ok && it.body.isNotBlank() }, proxyFirst = true, allowTempInstance = false)
+                acceptBody = { it.ok && it.body.isNotBlank() }, proxyFirst = true,
+                allowTempInstance = manual, maxTempCandidates = UPDATE_TEMP_CANDIDATES, tempTimeoutMs = UPDATE_TEMP_TIMEOUT_MS)
             addTest(c)
             val d = diag(c)
             det.append(label).append("\n").append(d).append("\n\n")
@@ -137,7 +153,7 @@ object UpdateChecker {
                     if (mf.ok) {
                         val manifest = runCatching { json.decodeFromString<UpdateManifest>(mf.result!!.body) }.getOrNull()
                             ?: return UpdateCheckResult.Error(UpdateErrorKind.MANIFEST_PARSE, "вложение скачано, но JSON не разобран")
-                        return compareByManifest(manifest, release, repo, via = "через API · ${repo.slug}",
+                        return compareByManifest(manifest, release, repo, via = "через API · ${repo.slug}${tempNote(mf)}",
                             assetUrl = { fn -> release.assets.firstOrNull { it.name == fn }?.browserDownloadUrl })
                     }
                     // вложение не скачалось → пробуем запасной адрес ниже
@@ -151,7 +167,7 @@ object UpdateChecker {
             if (fb.ok) {
                 val manifest = runCatching { json.decodeFromString<UpdateManifest>(fb.result!!.body) }.getOrNull()
                     ?: return UpdateCheckResult.Error(UpdateErrorKind.MANIFEST_PARSE, "запасной скачан, но JSON не разобран")
-                return compareByManifest(manifest, release = null, repo, via = "через запасной адрес · ${repo.slug}",
+                return compareByManifest(manifest, release = null, repo, via = "через запасной адрес · ${repo.slug}${tempNote(fb)}",
                     assetUrl = { fn -> "${repo.latestDownload}/$fn" })
             }
 

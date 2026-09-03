@@ -97,7 +97,15 @@ object UpdateInstaller {
             downloaded = true
             break
         }
-        if (!downloaded) return lastFail ?: DownloadOutcome.Fail(UpdateErrorKind.DOWNLOAD_FAILED)
+        if (!downloaded) {
+            // Пр.135: сам APK (~50 МБ) через одноразовый temp-инстанс НЕ тянем (дорого, и стриминг через него
+            // не реализован). Если прямой путь заблокирован, а туннеля нет — честно направляем поднять прокси
+            // (сведения об обновлении при этом уже могли прийти через temp-инстанс, а файл идёт стадией 2/SOCKS).
+            if (!CascadeFetch.isOwnProxyUp())
+                return DownloadOutcome.Fail(UpdateErrorKind.DOWNLOAD_FAILED,
+                    "Прямой доступ к GitHub заблокирован, а прокси не запущен. Запустите прокси на главном экране (▶) и повторите — файл скачается через туннель.")
+            return lastFail ?: DownloadOutcome.Fail(UpdateErrorKind.DOWNLOAD_FAILED)
+        }
 
         // 2 — сертификат подписи против установленного приложения. ТЕРМИНАЛЬНО (адреса не перебираем):
         // SHA-256 уже совпал с манифестом, значит файл тот; расхождение подписи = реальная подмена (Пр.121.C —

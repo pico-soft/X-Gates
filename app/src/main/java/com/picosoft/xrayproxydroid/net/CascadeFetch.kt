@@ -188,6 +188,8 @@ object CascadeFetch {
         acceptBody: (FetchResult) -> Boolean = { it.ok && it.body.isNotBlank() },
         proxyFirst: Boolean = false,
         allowTempInstance: Boolean = true,
+        maxTempCandidates: Int = MAX_TEMP_CANDIDATES,
+        tempTimeoutMs: Int = -1,   // -1 → взять proxyTimeoutMs; для лёгкого манифеста задаём короче (Пр.135)
     ): CascadeResult {
         val app = context.applicationContext
         val cm = app.getSystemService(ConnectivityManager::class.java)
@@ -215,12 +217,13 @@ object CascadeFetch {
         } else if (MonitorCoordinator.fullTestRunning || MonitorCoordinator.monitorSearchRunning) {
             attempts.add(skip(FetchStage.TEMP_RECENT, "идёт полный тест / перебор монитора"))
         } else {
-            val candidates = SubscriptionManager.recentWorkingServers(app).take(MAX_TEMP_CANDIDATES)
+            val tempT = if (tempTimeoutMs > 0) tempTimeoutMs else proxyTimeoutMs
+            val candidates = SubscriptionManager.recentWorkingServers(app).take(maxTempCandidates.coerceAtLeast(0))
             if (candidates.isEmpty()) attempts.add(skip(FetchStage.TEMP_RECENT, "нет недавно рабочих серверов"))
             else for (c in candidates) {
                 if (overBudget()) { attempts.add(skip(FetchStage.TEMP_RECENT, "общий таймаут")); break }
                 val name = c.remarks.ifBlank { c.address }
-                val r = ServerSpeedTester.fetchViaTempInstance(app, c, url, userAgent, proxyTimeoutMs)
+                val r = ServerSpeedTester.fetchViaTempInstance(app, c, url, userAgent, tempT)
                 val ok = r != null && acceptBody(r)
                 attempts.add(CascadeAttempt(FetchStage.TEMP_RECENT, skipped = false, accepted = ok, result = r, note = name))
                 if (ok) return CascadeResult(true, FetchStage.TEMP_RECENT, r, attempts)

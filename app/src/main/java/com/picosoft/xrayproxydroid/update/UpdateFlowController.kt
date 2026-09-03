@@ -62,7 +62,7 @@ object UpdateFlowController {
                 // Available из последней проверки; если в этой сессии не проверяли — проверить сейчас.
                 if (avail == null) {
                     _phase.value = Phase.Checking
-                    runCatching { UpdateChecker.check(app) }.getOrNull()?.let {
+                    runCatching { UpdateChecker.check(app, manual = true) }.getOrNull()?.let {
                         UpdateStore.apply(app, it, System.currentTimeMillis())
                     }
                     avail = UpdateStore.live.value as? UpdateCheckResult.Available
