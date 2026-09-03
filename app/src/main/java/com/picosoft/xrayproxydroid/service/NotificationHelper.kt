@@ -19,6 +19,7 @@ object NotificationHelper {
     const val PROMPT_ID = 2
     const val UPDATE_ID = 3
     const val NO_SERVERS_ID = 5   // Промпт 95.E: «нет рабочих серверов»
+    const val UPDATE_INSTALL_ID = 6   // «обновление скачано — установить» / «разрешите установку»
     private const val CHANNEL_ID = "xray_proxy"
     private const val CHANNEL_NAME = "X-Gates"   // отображаемое имя канала; CHANNEL_ID НЕ меняем (иначе осиротеет канал)
     // Промпт 93.J: ОТДЕЛЬНЫЙ канал «Обновления» — можно выключить, не трогая нотификацию сервиса.
@@ -48,6 +49,49 @@ object NotificationHelper {
 
     fun cancelUpdate(context: Context) =
         runCatching { androidx.core.app.NotificationManagerCompat.from(context).cancel(UPDATE_ID) }.let { }
+
+    /**
+     * Пункт 2: установка обновления ИЗ УВЕДОМЛЕНИЯ. Когда файл скачался, а приложение к этому моменту в фоне,
+     * прямой запуск системного установщика блокируется правилом Android «нельзя стартовать Activity из фона»
+     * (BAL) — молча, без окна. Тап по уведомлению = жест переднего плана, он НЕ блокируется, окно установки
+     * появляется. [installIntent] — ACTION_VIEW на APK через FileProvider (см. UpdateInstaller.buildInstallIntent).
+     */
+    fun notifyInstallReady(context: Context, installIntent: Intent) {
+        ensureUpdateChannel(context)
+        val pi = PendingIntent.getActivity(context, 6, installIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val n = NotificationCompat.Builder(context, UPDATE_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_stat_proxy)
+            .setContentTitle("Обновление скачано")
+            .setContentText("Нажмите, чтобы установить новую версию")
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setContentIntent(pi)
+            .build()
+        runCatching { androidx.core.app.NotificationManagerCompat.from(context).notify(UPDATE_INSTALL_ID, n) }
+    }
+
+    /** Пункт 2: нет права установки, а приложение в фоне (системный экран из фона тоже не открыть) — зовём
+     *  выдать разрешение через уведомление. [settingsIntent] — ACTION_MANAGE_UNKNOWN_APP_SOURCES для нашего пакета. */
+    fun notifyInstallPermission(context: Context, settingsIntent: Intent) {
+        ensureUpdateChannel(context)
+        val pi = PendingIntent.getActivity(context, 7, settingsIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val big = "Нажмите и включите «Установка неизвестных приложений» для X-Gates, затем вернитесь в приложение и нажмите «Установить»."
+        val n = NotificationCompat.Builder(context, UPDATE_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_stat_proxy)
+            .setContentTitle("Разрешите установку обновления")
+            .setContentText("Нажмите и включите «Установка неизвестных приложений».")
+            .setStyle(NotificationCompat.BigTextStyle().bigText(big))
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setContentIntent(pi)
+            .build()
+        runCatching { androidx.core.app.NotificationManagerCompat.from(context).notify(UPDATE_INSTALL_ID, n) }
+    }
+
+    fun cancelInstall(context: Context) =
+        runCatching { androidx.core.app.NotificationManagerCompat.from(context).cancel(UPDATE_INSTALL_ID) }.let { }
 
     private fun ensureUpdateChannel(context: Context) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

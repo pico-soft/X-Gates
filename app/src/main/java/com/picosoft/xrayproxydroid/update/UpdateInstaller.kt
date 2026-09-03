@@ -52,8 +52,13 @@ object UpdateInstaller {
         onProgress: (downloaded: Long, total: Long) -> Unit = { _, _ -> },
     ): DownloadOutcome {
         val dir = updatesDir(context)
-        dir.listFiles()?.forEach { it.delete() }   // не копим старые сборки
         val dest = File(dir, available.artifact.fileName)
+        // Пункт 1 (переиспользование): проверенный APK ИМЕННО этой сборки уже лежит на диске — НЕ качаем
+        // повторно. Раньше готовый файл помнился только в памяти процесса (readyFile), а download() первой
+        // строкой стирал каталог → после перезапуска/возврата приложение качало заново («скачалось дважды»).
+        // Сумму и подпись сверяем заново — доверяем только полностью проверенному файлу.
+        if (isVerifiedApk(context, dest, available.artifact)) return DownloadOutcome.Ok(dest)
+        dir.listFiles()?.forEach { it.delete() }   // чистим устаревшее/битое/чужие сборки
 
         val s = SettingsStore.current()
         val directT = s.subTimeoutSec * 1000
@@ -124,12 +129,15 @@ object UpdateInstaller {
     fun canInstall(context: Context): Boolean =
         Build.VERSION.SDK_INT < Build.VERSION_CODES.O || context.packageManager.canRequestPackageInstalls()
 
+    /** Интент системного экрана выдачи права установки для нашего пакета (для startActivity ИЛИ PendingIntent). */
+    fun permissionSettingsIntent(context: Context): Intent =
+        Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}"))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+
     /** Открыть системный экран выдачи права установки для нашего пакета (а не падать). */
     fun openInstallPermissionSettings(context: Context) {
-        val intent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}"))
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         try {
-            context.startActivity(intent)
+            context.startActivity(permissionSettingsIntent(context))
         } catch (e: Exception) {
             // На некоторых прошивках нет per-app экрана — открываем общий список источников.
             try {
@@ -140,15 +148,43 @@ object UpdateInstaller {
         }
     }
 
-    /** Запустить системный установщик для проверенного файла (через FileProvider). */
-    fun launchInstaller(context: Context, file: File) {
+    /** Интент запуска системного установщика для проверенного файла (через FileProvider). Годится и для
+     *  startActivity (передний план), и для PendingIntent уведомления (обход запрета фонового старта). */
+    fun buildInstallIntent(context: Context, file: File): Intent {
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-        val intent = Intent(Intent.ACTION_VIEW).apply {
+        return Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, "application/vnd.android.package-archive")
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        context.startActivity(intent)
+    }
+
+    /** Запустить системный установщик для проверенного файла (прямой startActivity — только с переднего плана). */
+    fun launchInstaller(context: Context, file: File) {
+        context.startActivity(buildInstallIntent(context, file))
+    }
+
+    /** Пункт 4: копия проверенного APK в общие «Загрузки», чтобы поставить вручную из файлового менеджера.
+     *  Возвращает человекочитаемое расположение или null. API 29+ — через MediaStore (без разрешений);
+     *  на старых версиях без WRITE_EXTERNAL_STORAGE не пишем (там — ручная загрузка со страницы релиза). */
+    fun exportToDownloads(context: Context, file: File): String? {
+        if (!file.exists() || file.length() <= 0) return null
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
+        return try {
+            val resolver = context.contentResolver
+            val values = android.content.ContentValues().apply {
+                put(android.provider.MediaStore.Downloads.DISPLAY_NAME, file.name)
+                put(android.provider.MediaStore.Downloads.MIME_TYPE, "application/vnd.android.package-archive")
+                put(android.provider.MediaStore.Downloads.IS_PENDING, 1)
+            }
+            val uri = resolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return null
+            resolver.openOutputStream(uri).use { out -> file.inputStream().use { it.copyTo(out!!) } }
+            values.clear(); values.put(android.provider.MediaStore.Downloads.IS_PENDING, 0)
+            resolver.update(uri, values, null, null)
+            "Загрузки/${file.name}"
+        } catch (e: Exception) {
+            Log.w(TAG, "export to downloads failed", e); null
+        }
     }
 
     // ─────────────────────── проверки ───────────────────────
@@ -167,6 +203,12 @@ object UpdateInstaller {
         }
         return md.digest().joinToString("") { "%02x".format(it) }
     }
+
+    /** Пункт 1: файл на диске — это ПРОВЕРЕННЫЙ APK именно этой сборки (сумма манифеста + подпись приложения). */
+    private fun isVerifiedApk(context: Context, file: File, artifact: UpdateArtifact): Boolean =
+        file.exists() && file.length() > 0 &&
+            runCatching { sha256Hex(file).equals(artifact.sha256, ignoreCase = true) }.getOrDefault(false) &&
+            verifySignature(context, file) == SignatureVerdict.OK
 
     private enum class SignatureVerdict { OK, MISMATCH, DEBUG_INSTALLED }
 

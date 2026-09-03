@@ -183,8 +183,15 @@ class MainActivity : ComponentActivity() {
     // Промпт 95.B: приложение выведено на передний план → немедленная проверка связи (не ждать цикла).
     override fun onResume() {
         super.onResume()
+        UpdateFlowController.appInForeground = true   // Пункт 2: на переднем плане ставим установщик напрямую
         MonitorCoordinator.wake()
         resumeTick.value = resumeTick.value + 1   // Промпт 117: перечитать состояние исключения из энергосбережения
+    }
+
+    // Пункт 2: ушли с переднего плана → установку запускать нельзя напрямую (BAL), только через уведомление.
+    override fun onPause() {
+        super.onPause()
+        UpdateFlowController.appInForeground = false
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -3646,6 +3653,7 @@ private fun UpdateBanner(versionName: String, onDismiss: () -> Unit) {
                     is UpdateFlowController.Phase.Downloading ->
                         if (p.total > 0) "Скачиваю ${p.done * 100 / p.total}%" else "Скачиваю…"
                     is UpdateFlowController.Phase.NeedPermission -> "Разрешите установку и нажмите ещё раз"
+                    is UpdateFlowController.Phase.ReadyToInstall -> "Скачано — нажмите, чтобы установить"
                     is UpdateFlowController.Phase.Failed -> p.message
                     else -> "$versionName · нажмите, чтобы обновить"
                 }
@@ -4076,6 +4084,25 @@ private fun UpdateCheckSection() {
                 avail != null -> ButtonLabel(UiIcon.PLAY, "Скачать и установить")
                 else -> ButtonLabel(UiIcon.REFRESH, "Проверить обновление")
             }
+        }
+
+        // Пункт 4: если окно установки так и не появилось — запасной ручной путь. Сохраняем ПРОВЕРЕННЫЙ APK
+        // в общие «Загрузки», откуда его можно открыть файловым менеджером и поставить вручную.
+        if (readyFile != null) {
+            OutlinedButton(
+                onClick = {
+                    val f = readyFile ?: return@OutlinedButton
+                    message = "Сохраняю APK в Загрузки…"
+                    Thread {
+                        val loc = UpdateInstaller.exportToDownloads(context, f)
+                        activity.runOnUiThread {
+                            message = loc?.let { "APK сохранён: $it. Откройте его в файловом менеджере (папка «Загрузки») и нажмите «Установить»." }
+                                ?: "Не удалось сохранить автоматически. Скачайте APK со страницы релиза на GitHub и установите вручную."
+                        }
+                    }.start()
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) { ButtonLabel(UiIcon.REFRESH, "Сохранить APK в Загрузки (для ручной установки)") }
         }
 
         // Подтверждённое обновление (update.json): версия, размер, сеть, изменения + прогресс скачивания.

@@ -22,17 +22,25 @@ object UpdateFlowController {
         object Checking : Phase
         data class Downloading(val done: Long, val total: Long) : Phase
         object NeedPermission : Phase          // открыт системный экран «разрешить установку» — тапнуть баннер ещё раз
+        object ReadyToInstall : Phase          // Пункт 3: файл скачан+проверен, установка вынесена в уведомление
         data class Failed(val message: String) : Phase
     }
 
     private val _phase = MutableStateFlow<Phase>(Phase.Idle)
     val phase: StateFlow<Phase> = _phase.asStateFlow()
 
+    // Пункт 2: приложение на переднем плане? (обновляет MainActivity в onResume/onPause.) На переднем плане
+    // запускаем установщик напрямую (один тап); в фоне прямой старт Activity блокируется системой (BAL) —
+    // тогда установку выносим в уведомление.
+    @Volatile var appInForeground = false
+
     @Volatile private var running = false
     @Volatile private var cancelFlag = false
     // Уже скачанный+проверенный файл (пережидаем выдачу разрешения на установку, чтобы не качать повторно).
     @Volatile private var readyFile: File? = null
     @Volatile private var readyForCode = 0
+
+    private enum class InstallLaunch { LAUNCHED, NOTIFIED, NEED_PERMISSION }
 
     fun cancel() { cancelFlag = true }
 
@@ -44,10 +52,10 @@ object UpdateFlowController {
         Thread {
             try {
                 var avail = UpdateStore.live.value as? UpdateCheckResult.Available
-                // Уже скачан этот же код и ждём лишь разрешения → просто доустановить (без повторной загрузки).
+                // Уже скачан этот же код → просто доустановить (без повторной загрузки).
                 readyFile?.let { f ->
                     if (f.exists() && (avail == null || readyForCode == avail.versionCode)) {
-                        if (tryInstall(app, f)) _phase.value = Phase.Idle else _phase.value = Phase.NeedPermission
+                        _phase.value = phaseFor(tryInstall(app, f))
                         return@Thread
                     }
                 }
@@ -73,7 +81,7 @@ object UpdateFlowController {
                 when (outcome) {
                     is UpdateInstaller.DownloadOutcome.Ok -> {
                         readyFile = outcome.file; readyForCode = avail.versionCode
-                        if (tryInstall(app, outcome.file)) _phase.value = Phase.Idle else _phase.value = Phase.NeedPermission
+                        _phase.value = phaseFor(tryInstall(app, outcome.file))
                     }
                     is UpdateInstaller.DownloadOutcome.Fail ->
                         _phase.value = if (outcome.kind == UpdateErrorKind.CANCELLED) Phase.Idle
@@ -85,14 +93,34 @@ object UpdateFlowController {
         }.start()
     }
 
-    /** true — установщик запущен; false — нет разрешения (открыт системный экран, ждём выдачи + повторного тапа). */
-    private fun tryInstall(app: Context, file: File): Boolean {
+    private fun phaseFor(r: InstallLaunch): Phase = when (r) {
+        InstallLaunch.LAUNCHED -> Phase.Idle                 // окно установки показано (передний план)
+        InstallLaunch.NOTIFIED -> Phase.ReadyToInstall        // установка вынесена в уведомление — окно ещё не подтверждено
+        InstallLaunch.NEED_PERMISSION -> Phase.NeedPermission
+    }
+
+    /**
+     * Пункты 2+3: запустить установку максимально надёжно и НЕ врать про успех.
+     *  • нет права установки → на переднем плане открыть системный экран, в фоне — уведомление «разрешите»;
+     *  • на переднем плане → прямой запуск установщика (один тап); успех — снять полосу/уведомление;
+     *  • в фоне (или прямой старт не удался) → установку в УВЕДОМЛЕНИЕ (обход BAL). Полосу/пометку «отклонено»
+     *    НЕ трогаем — окно установки ещё не подтверждено пользователем (Пункт 3: не гасим баннер авансом).
+     */
+    private fun tryInstall(app: Context, file: File): InstallLaunch {
         if (!UpdateInstaller.canInstall(app)) {
-            UpdateInstaller.openInstallPermissionSettings(app)
-            return false
+            if (appInForeground) UpdateInstaller.openInstallPermissionSettings(app)
+            else NotificationHelper.notifyInstallPermission(app, UpdateInstaller.permissionSettingsIntent(app))
+            return InstallLaunch.NEED_PERMISSION
         }
-        UpdateInstaller.launchInstaller(app, file)
-        NotificationHelper.cancelUpdate(app); UpdateStore.markDismissed(app)
-        return true
+        if (appInForeground) {
+            val ok = runCatching { UpdateInstaller.launchInstaller(app, file) }.isSuccess
+            if (ok) {
+                NotificationHelper.cancelUpdate(app); NotificationHelper.cancelInstall(app)
+                UpdateStore.markDismissed(app)
+                return InstallLaunch.LAUNCHED
+            }
+        }
+        NotificationHelper.notifyInstallReady(app, UpdateInstaller.buildInstallIntent(app, file))
+        return InstallLaunch.NOTIFIED
     }
 }
