@@ -26,9 +26,9 @@ android {
         applicationId = "com.picosoft.xrayproxydroid"
         minSdk = 24
         targetSdk = 37
-        versionCode = 21
+        versionCode = 22
         // Бампим по +0.01 до принципиальных изменений (напр. sing-box → 2.0). versionCode ++ на релиз.
-        versionName = "0.30 beta"
+        versionName = "0.31 beta"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
