@@ -43,6 +43,10 @@ data class SubSource(
     val lastDetail: String? = null,    // диагностика под тапом (URL/код/байты/тело-200/исключение)
     val retryAfterSec: Int? = null,    // для RATE_LIMITED (сколько ждать)
     val serverCount: Int = 0,
+    // Пр.140: источник «белого списка РФ» (Vless-Reality-White-Lists…). Такие держим в общем списке ВЫКЛ по
+    // умолчанию, авто-обновляем раз в полчаса и используем ТОЛЬКО в режиме белых списков (когда сеть пускает
+    // только домены из белого списка: yandex открыт, google — нет). Помечаем, чтобы отличать от обычных подписок.
+    val whiteList: Boolean = false,
 )
 
 /**

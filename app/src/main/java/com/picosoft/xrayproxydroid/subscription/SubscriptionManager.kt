@@ -53,6 +53,17 @@ object SubscriptionManager {
     const val DEFAULT_SOURCE_URL = "https://raw.githack.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS_mobile.txt"
     const val DEFAULT_SOURCE_NAME = "Обход ограничений в РФ по-умолчанию"
 
+    /** Пр.140: источники «белого списка РФ» — сеются ВЫКЛ, авто-обновляются раз в полчаса (безакцептно), используются
+     *  только в режиме белых списков (или если юзер включит их вручную). Дедуп по URL (не плодим дубли). Каждую
+     *  пробуем каждые полчаса: на GitHub файлы меняются — какой-то может временно отдавать 404 (напр. `…-2.txt`
+     *  сейчас 404), а `WHITE-CIDR-RU-all.txt` вопреки имени содержит рабочие vless-конфиги. В режиме белых списков
+     *  прямой путь к githack закрыт — обновление идёт ЧЕРЕЗ ТУННЕЛЬ рабочего белого сервера (CascadeFetch, ступень SOCKS). */
+    val WHITE_LIST_SOURCES = listOf(
+        "Серверы для белых списков РФ" to "https://raw.githack.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
+        "Серверы для белых списков РФ (2)" to "https://raw.githack.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt",
+        "Белые списки РФ (CIDR)" to "https://raw.githack.com/igareck/vpn-configs-for-russia/main/WHITE-CIDR-RU-all.txt",
+    )
+
     /** Пр.136: состояние посева дефолтной подписки для UI. [attempted]=пробовали хоть раз; [error] пуст = успех/не
      *  пробовали, непуст = последняя попытка не удалась (показываем причину + «Повторить», не пустой экран). */
     data class SeedStatus(val attempted: Boolean = false, val error: String = "")
@@ -90,6 +101,9 @@ object SubscriptionManager {
         if (!f.seededDefaultRuBypass && f.sources.isNotEmpty()) {
             SubscriptionStore.save(context, f.copy(seededDefaultRuBypass = true))
         }
+        // Пр.140: добавить источники белого списка (ВЫКЛ) существующим установкам, у кого их ещё нет. Только
+        // метаданные (URL) — тела подтянет авто-рефреш раз в полчаса. На свежей установке их сеет trySeedDefaultSource.
+        runCatching { ensureWhiteListSources(context) }
         // Промпт 85.E: самопроверка — неполные (осиротевшие) профили пересобрать из сырья + записать в журнал.
         runCatching { verifyAndHeal(context) }
         // Пр.136: восстановить статус посева для UI (переживает перезапуск) — чтобы карточка «не загрузилось»
@@ -134,14 +148,45 @@ object SubscriptionManager {
         val f2 = SubscriptionStore.load(context)               // перечитать (гонка) — вдруг юзер успел добавить
         if (f2.seededDefaultRuBypass || f2.sources.isNotEmpty()) { _seedStatus.value = SeedStatus(attempted = true, error = ""); return false }
         val id = newId()
+        // Пр.140: вместе с чёрным списком (ВКЛ) сеем источники белого списка (ВЫКЛ, whiteList=true) — тела
+        // подтянет авто-рефреш; в обычном режиме они не мешают (выключены), в белом — включатся эффективно.
+        val whiteSources = WHITE_LIST_SOURCES.map { (nm, u) ->
+            SubSource(id = newId(), name = nm, url = normalizeUrl(u), enabled = false, whiteList = true)
+        }
         SubscriptionStore.save(context, f2.copy(
             seededDefaultRuBypass = true,
             seedLastError = "",                                // успех — чистим прежнюю ошибку
-            sources = listOf(SubSource(id = id, name = DEFAULT_SOURCE_NAME, url = url, enabled = true)),
+            sources = listOf(SubSource(id = id, name = DEFAULT_SOURCE_NAME, url = url, enabled = true)) + whiteSources,
         ))
         importInto(context, id, cascade.result!!.body, "Дефолтная подписка (первый успешный фетч)")
         _seedStatus.value = SeedStatus(attempted = true, error = "")
         return true
+    }
+
+    /** Пр.140: добавить недостающие источники белого списка (ВЫКЛ) — для установок, где чёрный список уже был.
+     *  Идемпотентно: сверяем по URL, дубли не плодим. Только метаданные (без сети) — тела подтянет авто-рефреш. */
+    fun ensureWhiteListSources(context: Context) {
+        val file = SubscriptionStore.load(context)
+        if (file.sources.isEmpty()) return                     // свежая установка — засеет trySeedDefaultSource
+        val haveUrls = file.sources.map { it.url }.toSet()
+        val missing = WHITE_LIST_SOURCES
+            .filter { (_, u) -> normalizeUrl(u) !in haveUrls }
+            .map { (nm, u) -> SubSource(id = newId(), name = nm, url = normalizeUrl(u), enabled = false, whiteList = true) }
+        if (missing.isEmpty()) return
+        SubscriptionStore.save(context, file.copy(sources = file.sources + missing))
+        Log.i(TAG, "добавлены источники белого списка (ВЫКЛ): ${missing.size}")
+    }
+
+    /** Пр.140: id источников белого списка. */
+    fun whiteListSourceIds(context: Context): Set<String> =
+        SubscriptionStore.load(context).sources.filter { it.whiteList }.map { it.id }.toSet()
+
+    /** Пр.140: авто-обновление источников белого списка (раз в полчаса, безакцептно). Возвращает сколько ОК. */
+    fun refreshWhiteListSources(context: Context): Int {
+        val ids = SubscriptionStore.load(context).sources.filter { it.whiteList && it.url.isNotBlank() }.map { it.id }
+        var ok = 0
+        for (id in ids) if (runCatching { refreshOne(context, id).ok }.getOrDefault(false)) ok++
+        return ok
     }
 
     /** Пр.136: короткая причина неудачи посева (последняя реальная попытка каскада) — для показа человеку. */
@@ -189,11 +234,17 @@ object SubscriptionManager {
     /** Метаданные источников. */
     fun sources(context: Context): List<SubSource> = SubscriptionStore.load(context).sources
 
-    /** Плоский ДЕДУПЛИЦИРОВАННЫЙ список серверов из ВКЛЮЧЁННЫХ источников (для списка/Авто). */
+    /** Плоский ДЕДУПЛИЦИРОВАННЫЙ список серверов из ВКЛЮЧЁННЫХ источников (для списка/Авто).
+     *  Пр.140: в режиме белых списков (whiteListModeActive) — ТОЛЬКО серверы белых источников, независимо от их
+     *  enabled-флага (флаги пользователя НЕ трогаем — это эффективный override, а не разрушающее выключение). */
     fun allServers(context: Context): List<ServerProfile> {
         val file = SubscriptionStore.load(context)
-        val enabled = file.sources.filter { it.enabled }.map { it.id }.toSet()
-        return file.servers.filter { rec -> rec.sourceIds.any { it in enabled } }.map { it.profile }
+        val useIds: Set<String> =
+            if (SettingsStore.current().whiteListModeActive)
+                file.sources.filter { it.whiteList }.map { it.id }.toSet()
+            else
+                file.sources.filter { it.enabled }.map { it.id }.toSet()
+        return file.servers.filter { rec -> rec.sourceIds.any { it in useIds } }.map { it.profile }
     }
 
     /** Сколько серверов ПОЯВИТСЯ, если включить выключенные источники (сейчас скрыты — нет активного источника). */

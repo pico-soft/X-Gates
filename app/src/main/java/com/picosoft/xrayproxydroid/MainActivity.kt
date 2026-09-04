@@ -186,6 +186,9 @@ class MainActivity : ComponentActivity() {
         UpdateFlowController.appInForeground = true   // Пункт 2: на переднем плане ставим установщик напрямую
         com.picosoft.xrayproxydroid.subscription.DefaultSeeder.maybeSeed(applicationContext, "resume")   // Пр.136: повтор посева
         com.picosoft.xrayproxydroid.monitor.EconomyNet.applyNow(applicationContext)   // Пр.139: пересчитать режим по ТЕКУЩЕЙ сети (чинит «игнор Wi-Fi»)
+        if (SettingsStore.current().whiteListAutoEnabled) Thread {   // Пр.140: оценить белые списки при открытии (сеть — блокирующе, в фоне)
+            runCatching { com.picosoft.xrayproxydroid.monitor.WhiteListDetector.evaluate(applicationContext, tunnelForeignOk = false) }
+        }.start()
         MonitorCoordinator.wake()
         resumeTick.value = resumeTick.value + 1   // Промпт 117: перечитать состояние исключения из энергосбережения
     }
@@ -1606,6 +1609,12 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                             .padding(vertical = 3.dp, horizontal = 2.dp),
                     )
                 }
+                // Пр.140: режим белых списков активен — сказать прямо + дать вернуться в обычный вручную.
+                if (settings.whiteListModeActive) {
+                    WhiteListBanner(onNormal = {
+                        Thread { com.picosoft.xrayproxydroid.monitor.WhiteListDetector.userForceNormal(context) }.start()
+                    })
+                }
                 ActionsBar(
                     fullTesting = fullTesting, running = proxy.running, refreshingSubs = refreshingSubs,
                     onFullTest = { onFastest() },
@@ -2058,6 +2067,20 @@ private fun TrafficBlock() {
                 SettingsStore.update(context, settings.copy(trafficSaveBlindProbe = it))
             }
         }
+
+        // Пр.140: режим белых списков РФ.
+        Spacer(Modifier.height(6.dp))
+        SettingsGroupLabel("Режим белых списков РФ")
+        BoolSettingRow("Автопереход в режим белых списков", settings.whiteListAutoEnabled, d.whiteListAutoEnabled) {
+            SettingsStore.update(context, SettingsStore.current().copy(whiteListAutoEnabled = it))
+        }
+        Text(
+            "Если сеть пускает только «белый список» (yandex открыт, а google нет) и обычные серверы не поднимаются, " +
+                "приложение само переходит на серверы белого списка и раз в полчаса проверяет возврат google. Когда " +
+                "google снова доступен — возвращается в обычный режим. Переключить вручную можно на главном экране. " +
+                "Источники белого списка держатся в списке подписок выключенными; при желании их можно включить и в обычном режиме.",
+            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+        )
     }
 }
 
@@ -3761,6 +3784,27 @@ private fun BatteryOptBanner(onEnable: () -> Unit, onDismiss: () -> Unit) {
         }
         Text("✕", color = Color.White, fontWeight = FontWeight.Bold,
             modifier = Modifier.clip(RoundedCornerShape(6.dp)).clickable { onDismiss() }.padding(8.dp))
+    }
+}
+
+/** Пр.140: режим белых списков активен — тонкая полоса-состояние + кнопка «Обычный режим». Сине-серый (состояние). */
+@Composable
+private fun WhiteListBanner(onNormal: () -> Unit) {
+    val bg = Color(0xFF37474F)
+    Row(
+        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(bg).padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text("Режим белых списков", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold, color = Color.White)
+            Text("google недоступен, работаем на серверах белого списка. Вернёмся сами, как только google откроется.",
+                style = MaterialTheme.typography.bodySmall, color = Color(0xFFB0BEC5))
+        }
+        Button(
+            onClick = onNormal,
+            colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = bg),
+            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+        ) { Text("Обычный") }
     }
 }
 

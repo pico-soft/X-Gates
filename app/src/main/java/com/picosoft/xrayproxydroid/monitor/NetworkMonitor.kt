@@ -46,6 +46,12 @@ object NetworkMonitor {
 
     private val directDnsProbes = listOf("77.88.8.8" to 53, "8.8.8.8" to 53, "1.1.1.1" to 53)
 
+    // Пр.140: режим белых списков — интервалы. Источники обновляем раз в полчаса; оценку сети — раз в полчаса
+    // в норме, но раз в минуту при проблемах (нет серверов/восстановление/нет интернета), чтобы быстро распознать.
+    private const val WHITE_REFRESH_MS = 30 * 60_000L
+    private const val WHITE_EVAL_NORMAL_MS = 30 * 60_000L
+    private const val WHITE_EVAL_PROBLEM_MS = 60_000L
+
     private const val SWITCH_THROTTLE_MS = 60_000L        // в фоне переключаться не чаще раза в 60с
     // Пауза при «НЕТ РАБОЧИХ СЕРВЕРОВ» (интернет есть, но ни один сервер не поднялся): удвоение 10 мин → 4 ч.
     private const val BACKOFF_START_MS = 10 * 60_000L     // первая пауза «нет серверов» — 10 минут
@@ -100,6 +106,8 @@ object NetworkMonitor {
         var lastSpeedSampleMs = 0L      // живая скорость плашки: когда последний раз сэмплировали
         var lastActiveProbeMs = 0L      // когда последний раз делали АКТИВНУЮ пробу (в простое)
         var lastExactAlarm = false      // Промпт 118: последний тик поставлен ТОЧНЫМ будильником? (для лога/диагностики)
+        var lastWhiteEvalMs = 0L        // Пр.140: когда последний раз оценивали режим белых списков
+        var lastWhiteRefreshMs = 0L     // Пр.140: когда последний раз обновляли источники белого списка
         val cycleLock = MonitorAlarm.newWakeLock(app)   // держит CPU на время ОДНОГО цикла (иначе уснёт посреди пробы)
         Log.i(TAG, "monitor loop started")
 
@@ -139,6 +147,27 @@ object NetworkMonitor {
             }
             cycles++
             Log.i(TAG, "cycle $cycles (exactAlarm=$lastExactAlarm, wait=${waitMs / 1000}s, phase=$ph)")
+
+            // Пр.140: режим белых списков — авто-обновление источников (раз в полчаса) + оценка сети. Оценка чаще
+            // при проблемах (быстрее распознать «только белый список»), иначе раз в полчаса. Пинг/живость это НЕ
+            // трогает — детектор лишь сужает эффективный список серверов (allServers) через whiteListModeActive.
+            if (cur.whiteListAutoEnabled) {
+                if (now() - lastWhiteRefreshMs >= WHITE_REFRESH_MS) {
+                    lastWhiteRefreshMs = now()
+                    runCatching { SubscriptionManager.refreshWhiteListSources(app) }
+                        .onFailure { MonitorLog.event(app, "error", "Ошибка обновления белых списков", it.message ?: "") }
+                }
+                val problem = ph == TunnelHealth.Phase.NO_SERVERS || ph == TunnelHealth.Phase.RECOVERING || ph == TunnelHealth.Phase.NO_INTERNET
+                val evalDue = now() - lastWhiteEvalMs >= (if (problem) WHITE_EVAL_PROBLEM_MS else WHITE_EVAL_NORMAL_MS)
+                if (evalDue) {
+                    lastWhiteEvalMs = now()
+                    runCatching { WhiteListDetector.evaluate(app, tunnelForeignOk = false) }
+                        .onFailure { MonitorLog.event(app, "error", "Ошибка оценки белых списков", it.message ?: "") }
+                }
+            } else if (cur.whiteListModeActive) {
+                // Фичу выключили в настройках, а режим ещё активен → сбросить в обычный.
+                runCatching { WhiteListDetector.evaluate(app, tunnelForeignOk = false) }
+            }
             // Пр.126.A: отметить факт трафика через туннель (прирост байт с прошлого цикла > порога).
             val bytesNow = TrafficTracker.state.value.let { it.sessionRx + it.sessionTx }
             if (lastTunnelBytes in 1..bytesNow && bytesNow - lastTunnelBytes > OPTIMIZE_IDLE_TRAFFIC_MIN_BYTES) lastUserTrafficMs = now()

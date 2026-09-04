@@ -146,6 +146,8 @@ class XrayProxyService : Service() {
                 bypassRetryAfterMs = 0L; scheduleVpnBypass()
                 // Пр.129: авто-переключение экономии по типу сети — по СОБЫТИЮ (default network отдаёт свои капы здесь).
                 com.picosoft.xrayproxydroid.monitor.EconomyNet.onDefaultNetwork(applicationContext, caps)
+                // Пр.140: смена сети → свежая оценка белых списков (снять ручной «держать обычный»); сама оценка — в мониторе.
+                com.picosoft.xrayproxydroid.monitor.WhiteListDetector.onNetworkChange(applicationContext)
             }
         }
         runCatching { cm.registerDefaultNetworkCallback(cb); netCallback = cb }
