@@ -108,6 +108,7 @@ object NetworkMonitor {
         var lastExactAlarm = false      // Промпт 118: последний тик поставлен ТОЧНЫМ будильником? (для лога/диагностики)
         var lastWhiteEvalMs = 0L        // Пр.140: когда последний раз оценивали режим белых списков
         var lastWhiteRefreshMs = 0L     // Пр.140: когда последний раз обновляли источники белого списка
+        var lastEconomyRecheckMs = now()   // Пр.141: когда последний раз проверяли активный сервер в экономии
         val cycleLock = MonitorAlarm.newWakeLock(app)   // держит CPU на время ОДНОГО цикла (иначе уснёт посреди пробы)
         Log.i(TAG, "monitor loop started")
 
@@ -215,6 +216,20 @@ object NetworkMonitor {
                         userTrafficActive() -> { /* идёт загрузка — не мешаем и не портим замер */ }
                         else -> runCatching { optimizeToFastest(app, cur) }.onFailure { MonitorLog.event(app, "error", "Ошибка оптимизации", it.message ?: "") }
                     }
+                }
+                // Пр.141: в ЭКОНОМИИ автоперемер выше выключен, поэтому полу-живой сервер (IP-чек проходит, но
+                // реально плохо) сам не чинится. Раз в economyRecheckSec — ОДИН дешёвый замер достаточности активного;
+                // если ниже порога деградации, шагаем на лучшего кандидата (переиспользуем maybeStepFromDegraded).
+                val recheckKey = ProxyState.state.value.serverKey
+                if (cur.trafficSaveMode && cur.economyRecheckSec > 0 && !userTrafficActive() && recheckKey != null &&
+                    now() - lastEconomyRecheckMs >= cur.economyRecheckSec * 1000L) {
+                    lastEconomyRecheckMs = now()
+                    val curSrv = SubscriptionManager.allServers(app).firstOrNull { SubscriptionManager.serverKey(it) == recheckKey }
+                    if (curSrv != null) runCatching {
+                        val mbps = ServerSpeedTester.measureSufficiency(app, curSrv, cur.sufficientMbps.coerceAtLeast(0.1))
+                        MonitorLog.event(app, "monitor", "Экономия: ре-чек активного", "${fmt(mbps)} Мбит/с")
+                        if (mbps in 0.0..cur.degradationMinMbps) maybeStepFromDegraded(app, cur, recheckKey, mbps)
+                    }.onFailure { MonitorLog.event(app, "error", "Ошибка ре-чека экономии", it.message ?: "") }
                 }
                 continue
             }
@@ -372,7 +387,21 @@ object NetworkMonitor {
         val r2 = probeAndConnect(app, s, startKey, "2")
         if (r2 != SwitchResult.NO_CANDIDATES) return r2
 
-        handleNoAlive(app)   // пункт E: предложить включить выключенные источники (или записать «все включены»)
+        // Пр.141: ПОСЛЕДНИЙ ШАНС перед «нет серверов» — авто-включить дефолтные Белые списки (сеются ВЫКЛ),
+        // уведомить пользователя, обновить их и пройти ещё раз. Связь любой ценой (Пр.95).
+        if (aborted(startKey)) return SwitchResult.ABORTED
+        val wlEnabled = runCatching { SubscriptionManager.enableWhiteListForFallback(app) }.getOrDefault(0)
+        if (wlEnabled > 0) {
+            MonitorLog.event(app, "monitor", "Рабочих серверов нет — включаю «Белые списки»", "источников: $wlEnabled")
+            NotificationHelper.notifyWhiteListEnabled(app)
+            TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "включил Белые списки — ищу сервер")
+            runCatching { SubscriptionManager.refreshWhiteListSources(app) }
+            if (aborted(startKey)) return SwitchResult.ABORTED
+            val r3 = probeAndConnect(app, s, startKey, "3 (белые списки)")
+            if (r3 != SwitchResult.NO_CANDIDATES) return r3
+        }
+
+        handleNoAlive(app)   // пункт E: предложить включить прочие выкл-источники / добавить (если выкл нет)
         return SwitchResult.NO_CANDIDATES
     }
 
@@ -387,17 +416,26 @@ object NetworkMonitor {
      */
     private suspend fun probeAndConnect(app: Context, s: AppSettings, startKey: String?, round: String): SwitchResult {
         val bl = BlocklistStore.current()
+        // Пр.141: СНАЧАЛА вероятно-живые (свежий пинг ≥0 ИЛИ известная скорость >0) — быстро пробуем их, а не
+        // грызём весь пул мёртвых по 68 штук (жалоба «17 мин перебирает 13/68 при 2 живых»). Внутри — по скорости,
+        // затем по пингу. Остальные (никогда не мерянные/мёртвые) идут ХВОСТОМ — как запас, если живые не подошли.
         val candidates = SubscriptionManager.allServers(app)
             .filter { SubscriptionManager.serverKey(it) != startKey }
             .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl) && !ServerFilter.isPaused(it, bl) }
-            .sortedByDescending { it.speedMbps ?: 0.0 }
+            .sortedWith(
+                compareByDescending<com.picosoft.xrayproxydroid.xray.link.ServerProfile> { (it.pingMs ?: -1) >= 0 || (it.speedMbps ?: 0.0) > 0.0 }
+                    .thenByDescending { it.speedMbps ?: 0.0 }
+                    .thenBy { it.pingMs ?: Int.MAX_VALUE }
+            )
         val total = candidates.size
+        val likelyAlive = candidates.count { (it.pingMs ?: -1) >= 0 || (it.speedMbps ?: 0.0) > 0.0 }
 
         for ((i, c) in candidates.withIndex()) {
             if (aborted(startKey)) return SwitchResult.ABORTED
             MonitorStatus.update(true, "перебор $round: ${i + 1}/$total · ${ServerLabels.display(c)}", now(), 0)
-            // Промпт 122: тот же объективный текст — в плашку статуса связи (что делаем сейчас).
-            TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "перебираю живые серверы: ${i + 1}/$total")
+            // Пр.141: честный текст — сначала «вероятно живые», потом остальные (а не «перебираю живые: N/всех»).
+            val where = if (i < likelyAlive) "проверяю недавно рабочие: ${i + 1}/$likelyAlive" else "проверяю остальные: ${i + 1 - likelyAlive}/${total - likelyAlive}"
+            TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), where)
             // Дешёвая проверка (Промпт 52): temp-инстанс + РЕАЛЬНАЯ передача нескольких КБ (байты пришли),
             // НЕ пинг/задержка — иначе «не пингуется, но работает» серверы отбрасывались бы молча. НЕ полный замер.
             if (!ServerSpeedTester.probeAlive(app, c)) continue

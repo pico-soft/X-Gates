@@ -181,6 +181,14 @@ object SubscriptionManager {
     fun whiteListSourceIds(context: Context): Set<String> =
         SubscriptionStore.load(context).sources.filter { it.whiteList }.map { it.id }.toSet()
 
+    /** Пр.141: ПОСЛЕДНИЙ ШАНС при «рабочих серверов нет» — включить выключенные источники белого списка (они
+     *  сеются ВЫКЛ) для обычного режима, чтобы дать связь любой ценой (Пр.95). Возвращает сколько включили. */
+    fun enableWhiteListForFallback(context: Context): Int {
+        val disabled = SubscriptionStore.load(context).sources.filter { it.whiteList && !it.enabled && it.url.isNotBlank() }
+        disabled.forEach { setEnabled(context, it.id, true) }
+        return disabled.size
+    }
+
     /** Пр.140: авто-обновление источников белого списка (раз в полчаса, безакцептно). Возвращает сколько ОК. */
     fun refreshWhiteListSources(context: Context): Int {
         val ids = SubscriptionStore.load(context).sources.filter { it.whiteList && it.url.isNotBlank() }.map { it.id }

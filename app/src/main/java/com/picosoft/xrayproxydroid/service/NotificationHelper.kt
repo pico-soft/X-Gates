@@ -148,6 +148,24 @@ object NotificationHelper {
     fun cancelNoServers(context: Context) =
         runCatching { androidx.core.app.NotificationManagerCompat.from(context).cancel(NO_SERVERS_ID) }.let { }
 
+    /** Пр.141: сообщить, что при отсутствии рабочих серверов автоматически включены источники «Белые списки». */
+    fun notifyWhiteListEnabled(context: Context) {
+        ensureChannel(context)
+        val pi = PendingIntent.getActivity(
+            context, 8, Intent(context, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val n = NotificationCompat.Builder(context, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_stat_proxy)
+            .setContentTitle("Включены «Белые списки»")
+            .setContentText("Рабочих серверов не было — включил серверы белого списка, чтобы восстановить связь.")
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setContentIntent(pi)
+            .build()
+        runCatching { androidx.core.app.NotificationManagerCompat.from(context).notify(PROMPT_ID, n) }
+    }
+
     fun buildNotification(service: Service, label: String?): Notification {
         ensureChannel(service)
 
