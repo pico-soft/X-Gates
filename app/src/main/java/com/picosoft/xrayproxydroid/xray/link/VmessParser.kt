@@ -56,6 +56,7 @@ object VmessParser : LinkParser {
             hostHeader = o.optString("host").ifBlank { null },
             serviceName = if (net == "grpc") path else null, // grpc: serviceName лежит в path
             headerType = o.optString("type").ifBlank { null },
+            mode = o.optString("mode").ifBlank { null },     // xhttp mode (vmess-json)
             raw = uri,
         )
     }

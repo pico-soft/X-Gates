@@ -13,8 +13,12 @@ import com.picosoft.xrayproxydroid.xray.link.ServerProfile
  */
 object XrayConfigBuilder {
 
-    /** Транспорты, которые умеем собирать сейчас (xhttp/kcp/quic — отложены). */
-    private val SUPPORTED_NETWORKS = setOf("tcp", "ws", "grpc")
+    // Транспорты, которые собираем И которые умеет наше ядро (проверено по бинарю AAR, xray-core v26.x:
+    // rawSettings/xhttpSettings/httpupgradeSettings/kcpSettings присутствуют). quic ядром НЕ поддержан (нет пакета).
+    //  • raw   — новое имя tcp (нормализуем raw→tcp);
+    //  • xhttp — новое имя splithttp (ядро принимает оба имени + xhttpSettings);
+    //  • kcp/mkcp — одно и то же (нормализуем kcp→mkcp).
+    private val SUPPORTED_NETWORKS = setOf("tcp", "raw", "ws", "grpc", "xhttp", "httpupgrade", "kcp", "mkcp")
 
     /** Боевой конфиг: общий inbound (socks 10815 + http 10816) + outbound сервера. */
     fun build(p: ServerProfile): String = """
@@ -145,20 +149,55 @@ object XrayConfigBuilder {
     // --- streamSettings (общий для vless/vmess/trojan) ---
 
     private fun streamSettings(p: ServerProfile): String {
+        // Нормализация имён-синонимов транспорта: raw→tcp (raw = переименованный tcp), kcp→mkcp.
+        val net = when (p.network) {
+            "raw" -> "tcp"
+            "kcp" -> "mkcp"
+            else -> p.network
+        }
         val parts = mutableListOf<String>()
-        parts += """"network": ${j(p.network)}"""
+        parts += """"network": ${j(net)}"""
         if (p.security != "none") parts += """"security": ${j(p.security)}"""
 
         when (p.security) {
             "tls" -> parts += """"tlsSettings": ${tlsBlock(p)}"""
             "reality" -> parts += """"realitySettings": ${realityBlock(p)}"""
         }
-        when (p.network) {
+        when (net) {
             "ws" -> parts += """"wsSettings": ${wsBlock(p)}"""
             "grpc" -> parts += """"grpcSettings": { "serviceName": ${j(p.serviceName ?: "")}, "multiMode": true }"""
             "tcp" -> if (p.headerType == "http") parts += """"tcpSettings": { "header": { "type": "http" } }"""
+            "xhttp" -> parts += """"xhttpSettings": ${xhttpBlock(p)}"""
+            "httpupgrade" -> parts += """"httpupgradeSettings": ${httpUpgradeBlock(p)}"""
+            "mkcp" -> parts += """"kcpSettings": ${kcpBlock(p)}"""
         }
         return "{ ${parts.joinToString(", ")} }"
+    }
+
+    // xhttp (бывш. splithttp): path + host (как ws) + необязательный mode (пусто → ядро выбирает auto).
+    private fun xhttpBlock(p: ServerProfile): String {
+        val host = p.hostHeader?.takeIf { it.isNotBlank() } ?: p.sni ?: ""
+        val fields = mutableListOf(
+            """"path": ${j(p.path ?: "/")}""",
+            """"host": ${j(host)}""",
+        )
+        if (!p.mode.isNullOrBlank()) fields += """"mode": ${j(p.mode)}"""
+        return "{ ${fields.joinToString(", ")} }"
+    }
+
+    // httpupgrade: path + host (та же схема, что ws).
+    private fun httpUpgradeBlock(p: ServerProfile): String {
+        val host = p.hostHeader?.takeIf { it.isNotBlank() } ?: p.sni ?: ""
+        return """{ "path": ${j(p.path ?: "/")}, "host": ${j(host)} }"""
+    }
+
+    // mkcp: тип обфускации заголовка (headerType, деф. none) + необязательный seed.
+    private fun kcpBlock(p: ServerProfile): String {
+        val fields = mutableListOf(
+            """"header": { "type": ${j(p.headerType?.takeIf { it.isNotBlank() } ?: "none")} }""",
+        )
+        if (!p.seed.isNullOrBlank()) fields += """"seed": ${j(p.seed)}"""
+        return "{ ${fields.joinToString(", ")} }"
     }
 
     private fun tlsBlock(p: ServerProfile): String {

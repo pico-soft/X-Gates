@@ -40,11 +40,13 @@ data class ServerProfile(
     val allowInsecure: Boolean = false,
 
     // --- транспорт ---
-    val network: String = "tcp",       // поддержаны: tcp | ws | grpc
+    val network: String = "tcp",       // tcp | raw(=tcp) | ws | grpc | xhttp | httpupgrade | kcp/mkcp
     val path: String? = null,
-    val hostHeader: String? = null,    // ws Host; если пусто — билдер берёт sni (как Python-эталон)
+    val hostHeader: String? = null,    // ws/xhttp/httpupgrade Host; если пусто — билдер берёт sni (как Python-эталон)
     val serviceName: String? = null,   // grpc
-    val headerType: String? = null,    // tcp http-header
+    val headerType: String? = null,    // tcp http-header; mkcp тип обфускации заголовка (none/srtp/utp/…)
+    val mode: String? = null,          // xhttp mode (auto/packet-up/stream-up/stream-one); пусто → ядро auto
+    val seed: String? = null,          // mkcp seed (обфускация)
 
     // --- reality ---
     val publicKey: String? = null,

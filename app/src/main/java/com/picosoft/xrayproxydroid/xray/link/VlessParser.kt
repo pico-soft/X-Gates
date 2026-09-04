@@ -34,6 +34,8 @@ object VlessParser : LinkParser {
             hostHeader = q["host"],
             serviceName = q["serviceName"],
             headerType = q["headerType"],
+            mode = q["mode"],
+            seed = q["seed"],
             publicKey = q["pbk"],
             shortId = q["sid"],
             spiderX = q["spx"],
