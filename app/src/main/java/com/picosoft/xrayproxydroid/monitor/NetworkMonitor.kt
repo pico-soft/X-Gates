@@ -474,9 +474,12 @@ object NetworkMonitor {
             MonitorPrompt.request(disabled.size, srv)
             NotificationHelper.notifyEnableSources(app, disabled.size, srv)
             MonitorLog.event(app, "monitor", "Нет живых серверов", "есть ${disabled.size} выключенных источников (~$srv серв.) — предложил включить")
+        } else if (disabled.isEmpty()) {
+            // Пр.141: включать нечего (все источники уже включены/их нет) → предложить ДОБАВИТЬ подписку.
+            NotificationHelper.notifyAddSubscription(app)
+            MonitorLog.event(app, "monitor", "Нет живых серверов", "включать нечего — предложил добавить подписку")
         } else {
-            MonitorLog.event(app, "monitor", "Нет живых серверов",
-                if (disabled.isEmpty()) "все источники включены" else "пользователь отказался включать")
+            MonitorLog.event(app, "monitor", "Нет живых серверов", "пользователь отказался включать")
         }
     }
 

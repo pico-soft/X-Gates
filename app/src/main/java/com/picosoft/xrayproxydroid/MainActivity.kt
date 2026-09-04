@@ -167,6 +167,7 @@ class MainActivity : ComponentActivity() {
         const val EXTRA_OPEN = "open"          // Промпт 93.J: интент-навигация из уведомления
         const val OPEN_UPDATE = "update"       // открыть на «О приложении»/экране обновления
         const val OPEN_SETTINGS = "settings"   // Пр.134: перейти на вкладку «Настройки»
+        const val OPEN_SUBSCRIPTIONS = "subs"  // Пр.141: перейти на вкладку «Подписки» (из уведомления «добавьте подписку»)
         // Запрос навигации (из уведомления) — StateFlow, чтобы AppRoot среагировал и при onNewIntent (приложение уже открыто).
         val pendingOpen = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
         // Промпт 117: тик возврата на передний план. Системные экраны (исключение из энергосбережения)
@@ -253,6 +254,7 @@ private fun AppRoot() {
     val pendingOpen by MainActivity.pendingOpen.collectAsState()
     LaunchedEffect(pendingOpen) {
         if (pendingOpen == MainActivity.OPEN_UPDATE || pendingOpen == MainActivity.OPEN_SETTINGS) { tab = 2; MainActivity.pendingOpen.value = null }
+        if (pendingOpen == MainActivity.OPEN_SUBSCRIPTIONS) { tab = 1; MainActivity.pendingOpen.value = null }   // Пр.141
     }
     val stateHolder = rememberSaveableStateHolder()   // сохраняет состояние вкладки (раскрытые секции) при переключении
     Scaffold(

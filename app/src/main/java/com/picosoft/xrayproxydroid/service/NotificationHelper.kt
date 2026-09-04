@@ -148,6 +148,26 @@ object NotificationHelper {
     fun cancelNoServers(context: Context) =
         runCatching { androidx.core.app.NotificationManagerCompat.from(context).cancel(NO_SERVERS_ID) }.let { }
 
+    /** Пр.141: рабочих серверов нет и включать нечего (нет выключенных источников) — предложить ДОБАВИТЬ подписку. */
+    fun notifyAddSubscription(context: Context) {
+        ensureChannel(context)
+        val intent = Intent(context, MainActivity::class.java)
+            .putExtra(MainActivity.EXTRA_OPEN, MainActivity.OPEN_SUBSCRIPTIONS)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        val pi = PendingIntent.getActivity(context, 9, intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val n = NotificationCompat.Builder(context, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_stat_proxy)
+            .setContentTitle("Нет рабочих серверов")
+            .setContentText("Добавьте подписку: откройте «Подписки» и вставьте ссылку/URL или конфигурацию текстом.")
+            .setStyle(NotificationCompat.BigTextStyle().bigText("Рабочих серверов не нашлось и включать нечего. Откройте «Подписки» и добавьте источник: URL подписки или вставьте ссылки (vless/vmess/trojan/ss) текстом — их можно взять из мессенджера или у провайдера."))
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setContentIntent(pi)
+            .build()
+        runCatching { androidx.core.app.NotificationManagerCompat.from(context).notify(PROMPT_ID, n) }
+    }
+
     /** Пр.141: сообщить, что при отсутствии рабочих серверов автоматически включены источники «Белые списки». */
     fun notifyWhiteListEnabled(context: Context) {
         ensureChannel(context)
