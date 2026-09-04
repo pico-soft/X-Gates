@@ -6,15 +6,12 @@ import android.net.NetworkCapabilities
 import com.picosoft.xrayproxydroid.settings.SettingsStore
 
 /**
- * Пр.129: АВТО-ПЕРЕКЛЮЧЕНИЕ режима экономии по ТИПУ СЕТИ — по СОБЫТИЮ смены сети (из NetworkCallback), НЕ опросом.
- *  • Wi-Fi/Ethernet → экономия ВЫКЛ (обычный режим);
- *  • мобильная (cellular) → экономия ВКЛ.
- * Работает, только если включена настройка [AppSettings.trafficSaveAutoByNetwork]. [trafficSaveMode] остаётся
- * ЕДИНЫМ источником правды (его читают все потребители) — автоматика просто пишет в него по типу сети.
- *
- * Пр.129.C: ручное переключение при активной автоматике держится ДО следующей смены ТИПА сети (флаг
- * [trafficSaveManualUntilNetChange]); при смене типа автоматика снимает флаг и берёт своё. Перезапуск сервиса
- * = свежая оценка по текущей сети (ожидающий ручной override при этом сбрасывается — чистый старт).
+ * Пр.139 (переустройство Пр.129): вычисляет ЭФФЕКТИВНОЕ состояние экономии [trafficSaveMode] (его читают все
+ * потребители) из МАСТЕРА [economyEnabled] + подпункта «только моб.» [trafficSaveAutoByNetwork] + типа сети:
+ *   effective = economyEnabled && ( !onlyMobile || isMobile ).
+ * Единственный писатель trafficSaveMode — [recompute] (идемпотентен). Зовётся по событию сети (onDefaultNetwork)
+ * и по [applyNow] (старт сервиса / возврат приложения / смена мастера-подпункта) — последнее чинит случай, когда
+ * Wi-Fi уже подключён ДО регистрации колбэка и события смены не приходит.
  */
 object EconomyNet {
     // Последний известный тип сети (мобильная?) — чтобы реагировать ТОЛЬКО на смену Wi-Fi↔мобильная, а не на
@@ -29,36 +26,47 @@ object EconomyNet {
         return caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
     }
 
-    /** Событие смены сети по умолчанию (из NetworkCallback.onCapabilitiesChanged). Дедуп по типу. */
+    /** Событие сети по умолчанию (из NetworkCallback). Пересчитываем ЭФФЕКТИВНОЕ состояние (идемпотентно). */
     fun onDefaultNetwork(app: Context, caps: NetworkCapabilities?) {
         val isMobile = mobileFromCaps(caps)
-        val prev = lastMobile
-        if (prev != null && prev == isMobile) return   // тип не менялся — не трогаем (ручной override живёт)
         lastMobile = isMobile
-        applyForType(app.applicationContext, isMobile)
+        recompute(app.applicationContext, isMobile)
     }
 
-    /** Применить по ТЕКУЩЕЙ сети немедленно (когда включили автоматику в настройках). Форсирует, минуя дедуп. */
+    /**
+     * Применить по ТЕКУЩЕЙ активной сети немедленно. Зовётся при старте сервиса, возврате приложения на
+     * передний план и переключении мастера/подпункта — ЧИНИТ «игнор уже-подключённого Wi-Fi» (событие смены
+     * не приходит, если сеть подключена ДО регистрации колбэка).
+     */
     fun applyNow(app: Context) {
         val ctx = app.applicationContext
         val cm = ctx.getSystemService(ConnectivityManager::class.java)
         val caps = runCatching { cm?.getNetworkCapabilities(cm.activeNetwork) }.getOrNull()
         val isMobile = mobileFromCaps(caps)
         lastMobile = isMobile
-        applyForType(ctx, isMobile)
+        recompute(ctx, isMobile)
     }
 
-    private fun applyForType(app: Context, isMobile: Boolean) {
+    /**
+     * Пр.139: ЕДИНСТВЕННЫЙ писатель эффективного [trafficSaveMode]. Чистая функция входов:
+     *   effective = economyEnabled && ( !onlyMobile || isMobile )
+     *  • мастер выкл → экономии нет никогда;
+     *  • мастер вкл + «только моб.» вкл → экономия лишь на мобильной (на Wi-Fi обычный);
+     *  • мастер вкл + «только моб.» выкл → экономия всегда.
+     * Пишет только при РЕАЛЬНОЙ смене (идемпотентно) — можно звать сколько угодно.
+     */
+    private fun recompute(app: Context, isMobile: Boolean) {
         val s = SettingsStore.current()
-        if (!s.trafficSaveAutoByNetwork) return                                   // автоматика выключена — тип сети не влияет
-        if (s.trafficSaveMode == isMobile && !s.trafficSaveManualUntilNetChange) return   // уже как надо, override нет
-        // Смена типа сети → автоматика берёт своё: снять ручной override и выставить режим по типу.
-        SettingsStore.update(app, s.copy(trafficSaveMode = isMobile, trafficSaveManualUntilNetChange = false))
-        MonitorLog.event(
-            app, "net",
-            if (isMobile) "Экономия включена — мобильная сеть" else "Экономия выключена — Wi-Fi",
-            "авто по типу сети (Пр.129)",
-        )
+        val want = s.economyEffective(isMobile)
+        if (s.trafficSaveMode == want) return
+        SettingsStore.update(app, s.copy(trafficSaveMode = want))
+        val why = when {
+            !s.economyEnabled -> "режим экономии выключен"
+            !s.trafficSaveAutoByNetwork -> "экономия всегда (подпункт «только моб.» выкл)"
+            isMobile -> "мобильная сеть"
+            else -> "Wi-Fi (экономия только на мобильной)"
+        }
+        MonitorLog.event(app, "net", if (want) "Экономия включена" else "Экономия выключена", why)
         MonitorCoordinator.wake()   // монитор перечитает режим на ближайшем цикле
     }
 }

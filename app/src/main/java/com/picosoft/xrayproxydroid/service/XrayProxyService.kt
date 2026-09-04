@@ -149,6 +149,9 @@ class XrayProxyService : Service() {
             }
         }
         runCatching { cm.registerDefaultNetworkCallback(cb); netCallback = cb }
+        // Пр.139: сразу оценить ТЕКУЩУЮ сеть — если Wi-Fi подключён ДО регистрации колбэка, события смены не
+        // будет, и без этого экономия «игнорировала» бы уже-активный Wi-Fi.
+        com.picosoft.xrayproxydroid.monitor.EconomyNet.applyNow(applicationContext)
     }
 
     /** applyVpnBypass делает БЛОКИРУЮЩУЮ пробу связности — вызывать с фона (не из callback'а/main). */

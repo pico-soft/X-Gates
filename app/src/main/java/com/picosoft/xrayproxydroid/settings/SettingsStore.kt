@@ -119,21 +119,27 @@ data class AppSettings(
     // ГРАБЛЯ (Пр.125): раньше режим упорядочивал по ПИНГУ и мерил батчами → подключался к случайному/медленному
     //   (пинг ≠ скорость), а у кого замеров не было — «живых 0». Поля batch/minAlive/refreshSec БОЛЬШЕ НЕ
     //   используются (оставлены только для совместимости старого JSON; refreshSec был мёртв и раньше).
-    val trafficSaveMode: Boolean = false,      // ЕДИНЫЙ источник правды режима (его читают все); автоматика ниже пишет в него
-    // Пр.129: авто-переключение экономии по ТИПУ СЕТИ (по событию смены сети, не по опросу). Wi-Fi/Ethernet →
-    // экономия ВЫКЛ (обычный режим), мобильная → ВКЛ. Выкл — тип сети ни на что не влияет.
-    // Пр.137: ДЕФОЛТ ВЫКЛ (было ВКЛ). Экономия НЕ должна включаться сама после обновления/запуска с нуля —
-    // на мобильной она мерила лишь пару серверов, из-за чего живые оставались «не изм.» и выбор был хуже.
-    // Экономия остаётся, но как ЯВНЫЙ выбор пользователя, а не молчаливый дефолт.
-    val trafficSaveAutoByNetwork: Boolean = false,
-    // Пр.137: одноразовая миграция «выключить авто-экономию» на существующих установках (у них persist'нут
-    // прежний дефолт ВКЛ). false → при загрузке один раз сбрасываем auto+режим экономии в ВЫКЛ и ставим true.
-    // Пользователь может снова включить экономию вручную — флаг уже true, повторно не сбросим.
+    // Пр.139: ЭФФЕКТИВНОЕ состояние экономии (его читают ВСЕ потребители). НЕ настраивается напрямую —
+    // вычисляется из [economyEnabled] + [trafficSaveAutoByNetwork] + типа сети в EconomyNet. При загрузке
+    // нормализуется (если мастер выкл → false).
+    val trafficSaveMode: Boolean = false,
+    // Пр.139: МАСТЕР «Режим экономии трафика» — НАМЕРЕНИЕ пользователя. Persist, помним между обновлениями
+    // (первая установка — ВЫКЛ; далее как оставил юзер). Всё, что связано с экономией, включается ТОЛЬКО при нём.
+    val economyEnabled: Boolean = false,
+    // Пр.139: ПОДПУНКТ мастера «Экономить только на мобильной сети» (виден/меняется только при economyEnabled).
+    // ДЕФОЛТ ВКЛ. вкл → на Wi-Fi/Ethernet обычный режим, на мобильной экономия; выкл → экономия всегда.
+    // (Историческое имя trafficSaveAutoByNetwork из Пр.129 — та же суть «эконом. по типу сети».)
+    val trafficSaveAutoByNetwork: Boolean = true,
+    // Пр.137: одноразовая миграция «выключить авто-экономию» на существующих установках. (Оставлено; Пр.139 —
+    // отдельная миграция [economyModelV2Migrated] под новую модель мастер+подпункт.)
     val economyAutoResetDone: Boolean = false,
+    // Пр.139: одноразовая миграция под модель мастер+подпункт: economyEnabled=ВЫКЛ (после обновления экономия
+    // не активна, дальше — по выбору юзера), подпункт «только моб.» = ВКЛ (дефолт). Ставится один раз.
+    val economyModelV2Migrated: Boolean = false,
     // Пр.129.C: пользователь переключил режим ВРУЧНУЮ при активной автоматике → его выбор держится ДО следующей
     // смены типа сети, потом автоматика снова берёт своё. Флаг снимается при смене сети (EconomyNet).
     val trafficSaveManualUntilNetChange: Boolean = false,
-    val trafficSaveBlindProbe: Int = 10,       // Пр.125.C/Пр.137: сколько кандидатов мерить, когда прошлых замеров нет (≥10 живых)
+    val trafficSaveBlindProbe: Int = 3,        // Пр.139: экономия мерит НЕМНОГО (первый живой + пара на фоллбэк); «10» — про ОБЫЧНЫЙ режим (он мерит всех живых)
     val trafficSaveBatch: Int = 5,             // УСТАРЕЛО (Пр.125): не используется
     val trafficSaveMinAlive: Int = 2,          // УСТАРЕЛО (Пр.125): не используется
     val trafficSaveRefreshSec: Int = 3600,     // УСТАРЕЛО (Пр.125): не используется
@@ -193,6 +199,10 @@ data class AppSettings(
     val uploadMeasureBudgetBytes: Long get() = uploadMeasureMb * 1_048_576L
     val marginRatio: Double get() = upgradeMarginPercent / 100.0
 
+    /** Пр.139: ЭФФЕКТИВНАЯ экономия для данного типа сети — чистая функция мастера+подпункта (для EconomyNet и тестов).
+     *  мастер выкл → нет; мастер вкл + «только моб.» → лишь на мобильной; мастер вкл + «всегда» → всегда. */
+    fun economyEffective(isMobile: Boolean): Boolean = economyEnabled && (!trafficSaveAutoByNetwork || isMobile)
+
     // Пр.131: АКТИВНЫЙ набор (обычный/экономия) по [trafficSaveMode] — его читают все потребители.
     val activeOptimizeSec: Int get() = if (trafficSaveMode) optimizeSecSave else optimizeSecNormal
     val activeTopBatch: Int get() = if (trafficSaveMode) topBatchSave else topBatchNormal
@@ -229,19 +239,21 @@ object SettingsStore {
         val f = file(context)
         if (!f.exists()) return
         try {
-            val loaded = json.decodeFromString<AppSettings>(f.readText())
-            // Пр.137: одноразовая миграция — на существующих установках была persist'нута авто-экономия (ВКЛ).
-            // Elyor: экономия не должна включаться сама после обновления. Один раз выключаем авто+режим экономии.
-            _state.value = if (!loaded.economyAutoResetDone) {
-                val migrated = loaded.copy(
-                    trafficSaveAutoByNetwork = false,
-                    trafficSaveMode = false,
-                    trafficSaveManualUntilNetChange = false,
-                    economyAutoResetDone = true,
+            var s = json.decodeFromString<AppSettings>(f.readText())
+            // Пр.139: одноразовая миграция под модель мастер+подпункт. Мастер economyEnabled=ВЫКЛ (после
+            // обновления экономия не активна; дальше помним выбор юзера), подпункт «только моб.» = ВКЛ (дефолт).
+            if (!s.economyModelV2Migrated) {
+                s = s.copy(
+                    economyEnabled = false,
+                    trafficSaveAutoByNetwork = true,
+                    economyModelV2Migrated = true,
+                    economyAutoResetDone = true,   // старую миграцию считаем пройденной (её эффект поглощён этой)
                 )
-                runCatching { update(context, migrated) }
-                migrated
-            } else loaded
+            }
+            // Нормализация ЭФФЕКТИВНОГО состояния: мастер выкл → экономии нет (EconomyNet уточнит по сети при старте).
+            if (!s.economyEnabled && s.trafficSaveMode) s = s.copy(trafficSaveMode = false)
+            _state.value = s
+            runCatching { update(context, s) }   // сохранить нормализованное/мигрированное
         } catch (e: Exception) {
             Log.w(TAG, "load failed, keeping defaults", e)
         }

@@ -185,6 +185,7 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         UpdateFlowController.appInForeground = true   // Пункт 2: на переднем плане ставим установщик напрямую
         com.picosoft.xrayproxydroid.subscription.DefaultSeeder.maybeSeed(applicationContext, "resume")   // Пр.136: повтор посева
+        com.picosoft.xrayproxydroid.monitor.EconomyNet.applyNow(applicationContext)   // Пр.139: пересчитать режим по ТЕКУЩЕЙ сети (чинит «игнор Wi-Fi»)
         MonitorCoordinator.wake()
         resumeTick.value = resumeTick.value + 1   // Промпт 117: перечитать состояние исключения из энергосбережения
     }
@@ -1591,8 +1592,8 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                 run {
                     val save = settings.trafficSaveMode
                     val reason = when {
-                        !settings.trafficSaveAutoByNetwork -> "вручную"
-                        settings.trafficSaveManualUntilNetChange -> "вручную до смены сети"
+                        !settings.economyEnabled -> "выкл"
+                        !settings.trafficSaveAutoByNetwork -> "всегда"
                         save -> "моб. сеть"
                         else -> "Wi-Fi"
                     }
@@ -2018,42 +2019,40 @@ private fun TrafficBlock() {
             )
         }
         SettingsGroupLabel("Экономия трафика")
-        // Пр.129.A: авто-переключение по типу сети. Включение — применяем по ТЕКУЩЕЙ сети сразу (не ждём смены).
-        BoolSettingRow("Экономить только на мобильной сети", settings.trafficSaveAutoByNetwork, d.trafficSaveAutoByNetwork) {
-            SettingsStore.update(context, settings.copy(trafficSaveAutoByNetwork = it))
-            if (it) EconomyNet.applyNow(context)
+        // Пр.139: МАСТЕР. Всё, что связано с экономией, включается ТОЛЬКО при нём. По дефолту (первая установка)
+        // ВЫКЛ; далее состояние помнится между обновлениями. Переключение применяем по текущей сети сразу.
+        BoolSettingRow("Режим экономии трафика", settings.economyEnabled, d.economyEnabled) {
+            SettingsStore.update(context, SettingsStore.current().copy(economyEnabled = it))
+            EconomyNet.applyNow(context)   // сразу пересчитать эффективный режим по текущей сети
         }
-        Text(
-            "На Wi-Fi — обычный режим, на мобильной — экономия. Переключается САМО при смене сети. Выключите — режим ниже действует всегда, как выбрали вручную.",
-            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
-        )
-        // Пр.129.B: текущее состояние и ПРИЧИНА — чтобы смена режима не выглядела сбоем.
-        Text(
-            when {
-                !settings.trafficSaveAutoByNetwork -> "● Режим выбран вручную (авто по сети выключено)."
-                settings.trafficSaveManualUntilNetChange -> "● Сейчас вручную — до следующей смены сети, потом снова по сети."
-                settings.trafficSaveMode -> "● Экономия активна: мобильная сеть."
-                else -> "● Экономия выключена: Wi-Fi."
-            },
-            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary,
-        )
-        BoolSettingRow("Режим экономии трафика", settings.trafficSaveMode, d.trafficSaveMode) {
-            // Пр.129.C: ручное переключение при активной автоматике держится до следующей смены сети.
-            val s = SettingsStore.current()
-            SettingsStore.update(context, s.copy(trafficSaveMode = it, trafficSaveManualUntilNetChange = s.trafficSaveAutoByNetwork))
-        }
-        if (settings.trafficSaveMode) {
-            // Пр.125.F: честно сказать, за что человек платит и на чём экономит.
+        if (settings.economyEnabled) {
+            // Пр.139: ПОДПУНКТ мастера — виден и меняется только при включённом мастере. По дефолту ВКЛ.
+            BoolSettingRow("    ↳ Экономить только на мобильной сети", settings.trafficSaveAutoByNetwork, d.trafficSaveAutoByNetwork) {
+                SettingsStore.update(context, SettingsStore.current().copy(trafficSaveAutoByNetwork = it))
+                EconomyNet.applyNow(context)
+            }
             Text(
-                "Что меняется: пинг живых — как обычно (дёшев). Замер скорости — только у ВЫБРАННОГО сервера, " +
-                    "не у всех. Выбор — по прошлым замерам (от быстрых к медленным); ниже порога — берём следующий. " +
-                    "Фоновая оптимизация «держать лучший» и плановые пробы плашки — отключены; остаются только " +
-                    "дешёвые проверки связи. Переключение — при реальной потере связи, не ради лучшей скорости.",
-                style = MaterialTheme.typography.bodySmall, color = fg,
-            )
-            Text(
-                "Когда прошлых замеров нет (первый запуск / список только обновлён), выбирать не по чему — тогда мерим несколько первых по пингу и берём лучшего.",
+                if (settings.trafficSaveAutoByNetwork)
+                    "На Wi-Fi — обычный режим, на мобильной — экономия. Переключается САМО при смене сети."
+                else "Экономия действует ВСЕГДА (и на Wi-Fi, и на мобильной).",
                 style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+            )
+            // Текущее ЭФФЕКТИВНОЕ состояние + причина — чтобы смена режима не выглядела сбоем.
+            Text(
+                when {
+                    !settings.trafficSaveAutoByNetwork -> "● Экономия активна: включена всегда."
+                    settings.trafficSaveMode -> "● Экономия активна: мобильная сеть."
+                    else -> "● Сейчас обычный режим: Wi-Fi (экономия только на мобильной)."
+                },
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary,
+            )
+            // Пр.125.F/Пр.139: за что платим и на чём экономим. ПИНГ (живость) — как обычно во всех режимах.
+            Text(
+                "Что меняется ТОЛЬКО в экономии: проверка живости (пинг) — как обычно, во всех режимах одинаково. " +
+                    "А вот полный замер скорости минимальный: подключаемся к первому рабочему серверу и дальше явно " +
+                    "не мерим; в фоне держим ещё пару на подмену. В обычном режиме, наоборот, мерим достаточно " +
+                    "серверов (и в фоне), чтобы было из чего выбрать при падении основного.",
+                style = MaterialTheme.typography.bodySmall, color = fg,
             )
             IntSettingRow("Мерить кандидатов, когда данных нет", "", settings.trafficSaveBlindProbe, d.trafficSaveBlindProbe, 1, 10) {
                 SettingsStore.update(context, settings.copy(trafficSaveBlindProbe = it))
@@ -2934,10 +2933,10 @@ private fun OptimizeChecksBlock(settings: AppSettings, onChange: (AppSettings) -
 
     val modeName = if (save) "Экономия" else "Обычный"
     val modeReason = when {
-        !settings.trafficSaveAutoByNetwork -> "выбран вручную"
-        settings.trafficSaveManualUntilNetChange -> "вручную до смены сети"
+        !settings.economyEnabled -> "экономия выключена"
+        !settings.trafficSaveAutoByNetwork -> "экономия всегда"
         save -> "мобильная сеть"
-        else -> "Wi-Fi"
+        else -> "Wi-Fi (экономия только на моб.)"
     }
     Text(
         "⚙ Правите набор режима: $modeName ($modeReason). Смена сети подставит другой набор — цифры изменятся сами (это не сбой).",
