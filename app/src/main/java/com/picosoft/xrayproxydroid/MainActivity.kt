@@ -3207,7 +3207,7 @@ private fun SubscriptionsSection(
             }
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
+                verticalAlignment = Alignment.Top,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 // Тап по точке = свернуть/развернуть ПОДРОБНОСТИ (постадийная диагностика).
@@ -3228,7 +3228,7 @@ private fun SubscriptionsSection(
                         .clickable { onRenameRequest(s) }
                         .padding(vertical = 2.dp),
                 ) {
-                    Text(s.name, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(s.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)   // Пр.140.A: полное имя (перенос, без обрезки)
                     Text(
                         "${s.serverCount} серв" + (if (s.url.isBlank()) " · локальная" else ""),
                         style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
@@ -3271,18 +3271,30 @@ private fun SubscriptionsSection(
                         )
                     }
                 }
-                // Копировать URL источника (Промпт 82) — только для подписок с адресом (локальные без URL).
-                if (s.url.isNotBlank()) {
-                    TextButton(
-                        onClick = {
-                            clipboard.setText(androidx.compose.ui.text.AnnotatedString(s.url))
-                            android.widget.Toast.makeText(ctx, "URL скопирован", android.widget.Toast.LENGTH_SHORT).show()
-                        },
-                        contentPadding = PaddingValues(horizontal = 6.dp),
-                    ) { Text("⧉") }
+                // Пр.140.A: компактная колонка управления справа — переключатель, под ним копия(⧉) и удаление(✗).
+                // Так имя занимает всю ширину строки и не обрезается, а контролы очевидно сгруппированы.
+                Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Switch(checked = s.enabled, onCheckedChange = { onToggle(s.id, it) })
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                        if (s.url.isNotBlank()) Text(
+                            "⧉", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable {
+                                    clipboard.setText(androidx.compose.ui.text.AnnotatedString(s.url))
+                                    android.widget.Toast.makeText(ctx, "URL скопирован", android.widget.Toast.LENGTH_SHORT).show()
+                                }
+                                .padding(horizontal = 8.dp, vertical = 4.dp),
+                        )
+                        Text(
+                            "✗", style = MaterialTheme.typography.titleMedium, color = red,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable { onDeleteRequest(s) }
+                                .padding(horizontal = 8.dp, vertical = 4.dp),
+                        )
+                    }
                 }
-                Switch(checked = s.enabled, onCheckedChange = { onToggle(s.id, it) })
-                TextButton(onClick = { onDeleteRequest(s) }, contentPadding = PaddingValues(horizontal = 6.dp)) { Text("✗") }
             }
         }
 
