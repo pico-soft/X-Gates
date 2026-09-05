@@ -1464,8 +1464,15 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                 // TunnelSpeed с активным serverKey — иначе это данные ПРЕЖНЕГО сервера, не показываем (ни адрес, ни числа).
                 val ipForActive = if (health.serverKey == proxy.serverKey) health.ip else ""
                 val ts = if (tunnelSpeed.serverKey == proxy.serverKey) tunnelSpeed else TunnelSpeed.Speed()
+                // Пр.142.C2: связь подтверждена для ЦВЕТА, если ЛИБО внешний IP свеж (ipVerified), ЛИБО через туннель
+                // ЭТОГО сервера недавно (≤3мин) реально шли байты (живая ↓>0) — это тоже ФАКТ рабочего туннеля, не
+                // реестр (не регрессит Пр.123). Убирает «серую/янтарную плашку при высоких скоростях», когда IP-проба
+                // на миг устарела/сменился сервер, а туннель жив.
+                val liveTunnelFresh = (ts.tunnelDownMbps ?: 0.0) > 0.0 && ts.measuredAtMs > 0 &&
+                    (System.currentTimeMillis() - ts.measuredAtMs) <= HEALTH_FRESH_MS
+                val connConfirmed = ipVerified || liveTunnelFresh
                 StatusBox(
-                    running = proxy.running, verified = ipVerified,
+                    running = proxy.running, verified = connConfirmed,
                     ipText = ipForActive,
                     statusLine = healthLine,
                     onRefreshIp = { refreshIp() },
@@ -1479,7 +1486,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                     tunnelDownMbps = ts.tunnelDownMbps,
                     tunnelUpMbps = ts.tunnelUpMbps,
                     liveMeasuredAtMs = ts.measuredAtMs,
-                    tunnelOk = ipVerified,
+                    tunnelOk = connConfirmed,
                     hidden = activeHidden, blocked = activeBlocked,
                     problem = proxy.running && (
                         health.phase == TunnelHealth.Phase.NO_INTERNET ||
