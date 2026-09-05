@@ -793,6 +793,13 @@ object NetworkMonitor {
         val all = SubscriptionManager.allServers(app)
             .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl) && !ServerFilter.isPaused(it, bl) }
         if (all.size <= 1) return
+        // Пр.146 Ф4: единственный ЖИВОЙ сервер — активный (других живых нет) → оптимизировать не на что: держим,
+        // ничего не мерим (не тратим трафик на перебор мёртвых). Фоновый пере-пинг (refreshAllPings) ловит новых
+        // живых; как только появится другой живой — следующий проход оптимизации его рассмотрит.
+        if (all.none { key(it) != curKey && isLikelyAlive(it) }) {
+            MonitorLog.event(app, "monitor", "Единственный живой сервер — держим", "других живых нет; фон ловит новых")
+            return
+        }
         // СВЕЖИЙ топ: измерены (speed>0) и НЕ старее предела давности (Пр.132.D). Их перемерять не нужно.
         val freshHours = (s.topFreshSec.coerceAtLeast(600) / 3600).coerceAtLeast(1)
         val freshTop = SubscriptionManager.recentWorkingServers(app, freshHours).take(topN)

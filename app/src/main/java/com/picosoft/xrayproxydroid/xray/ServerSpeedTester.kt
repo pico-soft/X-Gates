@@ -88,6 +88,14 @@ object ServerSpeedTester {
     // Потолок правдоподобия ОТДАЧИ: выше — это не отдача, а мгновенная запись в буфер сокета (фейк ~1864 Мбит/с).
     // Реальная отдача через мобильный туннель много ниже; 500 Мбит/с с огромным запасом отсекает буфер-фейк.
     private const val MAX_PLAUSIBLE_UPLOAD_MBPS = 500.0
+    // Пр.148: «много-заходный» замер — окно измерения бьём на под-окна и берём МЕДИАНУ их скоростей. Одиночное
+    // окно шумит (Пр.108/109/130): случайная просадка занижает быстрый сервер → он ошибочно уходит вниз в выборе.
+    // Медиана под-окон сглаживает шум БЕЗ доп. трафика (та же загрузка). Нужно ≥3 под-окна, иначе берём общее.
+    private const val SUB_WINDOW_NANOS = 300_000_000L
+    private fun median(xs: List<Double>): Double {
+        val s = xs.sorted(); val n = s.size
+        return if (n % 2 == 1) s[n / 2] else (s[n / 2 - 1] + s[n / 2]) / 2.0
+    }
 
     /**
      * Скорость одного сервера, Mbps. >0 — ВАЛИДНЫЙ замер; -1.0 — ПРОВАЛ/«не измерено»
@@ -422,6 +430,9 @@ object ServerSpeedTester {
         var readErr: String? = null
         var warmupEndReason = "—"     // ПО_ВРЕМЕНИ / ПО_ОБЪЁМУ / EOF / ОШИБКА
         var measureEndReason = "—"
+        var subStartNanos = 0L        // Пр.148: под-окна измерения (для медианы — сглаживание шума)
+        var subBytes = 0L
+        val subRates = ArrayList<Double>()
         try {
             conn.inputStream.use { input ->
                 val buf = ByteArray(64 * 1024)
@@ -456,6 +467,14 @@ object ServerSpeedTester {
                     } else {
                         measuredBytes += n
                         lastMeasuredNanos = now
+                        // Пр.148: копим под-окно; по истечении SUB_WINDOW_NANOS — фиксируем его скорость (для медианы).
+                        if (subStartNanos == 0L) subStartNanos = if (warmupDoneNanos != 0L) warmupDoneNanos else now
+                        subBytes += n
+                        val subDt = now - subStartNanos
+                        if (subDt >= SUB_WINDOW_NANOS) {
+                            subRates.add(subBytes * 8.0 / (subDt / 1_000_000_000.0) / 1_000_000.0)
+                            subStartNanos = now; subBytes = 0L
+                        }
                         val byTime = now >= measureTimeEnd
                         val byVol = measuredBytes >= measureBudget
                         if (byTime || byVol) {
@@ -493,9 +512,12 @@ object ServerSpeedTester {
             return Measurement(-1.0, false, failReason, bytes = totalBytes)
         }
 
-        val mbps = measuredBytes * 8.0 / (actualWindowMs / 1000.0) / 1_000_000.0   // ЕДИНАЯ формула
+        val overallMbps = measuredBytes * 8.0 / (actualWindowMs / 1000.0) / 1_000_000.0   // общее окно
+        // Пр.148: если под-окон ≥3 — берём МЕДИАНУ их скоростей (сглаживает шум); иначе (короткий замер/стоп по
+        // объёму у быстрого сервера) — общее окно. Медиана не даёт одиночной просадке занизить хороший сервер.
+        val mbps = if (subRates.size >= 3) median(subRates) else overallMbps
         val rounded = (mbps * 100).roundToInt() / 100.0
-        log("«$name» probe=$probe → $rounded Mbps | $diag")
+        log("«$name» probe=$probe → $rounded Mbps (медиана ${subRates.size} под-окон, общее ${(overallMbps * 100).roundToInt() / 100.0}) | $diag")
         return Measurement(rounded, true, "ok/$measureEndReason", bytes = totalBytes)
     }
 
