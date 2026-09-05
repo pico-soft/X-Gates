@@ -4,6 +4,8 @@ import com.picosoft.xrayproxydroid.settings.AppSettings
 import com.picosoft.xrayproxydroid.settings.Blocklist
 import com.picosoft.xrayproxydroid.subscription.SubscriptionManager
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
+import java.text.SimpleDateFormat
+import java.util.Locale
 
 /**
  * ЕДИНАЯ точка всех отсевов сервера: живость (пинг), минимальная скорость, протокол и стоп-лист.
@@ -45,9 +47,22 @@ object ServerFilter {
      * для совместимости вызова и возможной диагностики — на видимость НЕ влияет.
      * ИСКЛЮЧЕНИЕ — АКТИВНЫЙ подключённый сервер: его живость доказана туннелем (в MainActivity добавляется отдельно).
      */
+    // Пр.148: живость = свежий ПИНГ (≥0) ИЛИ свежий успешный ЗАМЕР СКОРОСТИ (≤2ч). Раньше только пинг (Пр.139) →
+    // быстрый сервер, не ответивший на капризный под DPI пинг, выпадал из «Живых», хотя реально работает (жалоба
+    // Elyor: «в Живых 6 медленных, а во Все есть быстрые»). Замер скорости — ДОКАЗАТЕЛЬСТВО прохождения трафика,
+    // сильнее пинга. Экономию не ломаем: пинг-живые с speed=null остаются видимы (Пр.139), это лишь ДОБАВЛЯет.
+    private val speedTsFmt = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
+    private const val SPEED_ALIVE_FRESH_MS = 2 * 3600_000L
+    private fun speedFreshAlive(p: ServerProfile): Boolean {
+        if ((p.speedMbps ?: 0.0) <= 0.0) return false
+        val t = runCatching { speedTsFmt.parse(p.speedTestedTs)?.time }.getOrNull() ?: return false
+        return System.currentTimeMillis() - t <= SPEED_ALIVE_FRESH_MS
+    }
+
     @Suppress("UNUSED_PARAMETER")
     fun isVisible(p: ServerProfile, pingMs: Int?, speedMbps: Double?, s: AppSettings, b: Blocklist): Boolean =
-        !isBlocked(p, b) && !isPaused(p, b) && protocolAllowed(p, s) && pingMs != null && pingMs >= 0
+        !isBlocked(p, b) && !isPaused(p, b) && protocolAllowed(p, s) &&
+            ((pingMs != null && pingMs >= 0) || speedFreshAlive(p))
 
     /** Пригоден для автоподключения/апгрейда: не заблокирован + не на паузе + протокол разрешён + скорость ≥ порога. */
     fun isSelectable(p: ServerProfile, speedMbps: Double?, s: AppSettings, b: Blocklist): Boolean =
