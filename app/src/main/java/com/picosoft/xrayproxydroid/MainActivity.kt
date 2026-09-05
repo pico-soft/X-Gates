@@ -1254,6 +1254,13 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
     // Отложенные («на паузе») остаются в «Все серверы», но скрыты из «Живых» → тоже в счётчик «скрыто».
     val pausedShownCount = allowedServers.count { ServerFilter.isPaused(it, blocklist) }
     val hiddenCount = servers.size - allowedServers.size + pausedShownCount   // протокол + стоп-лист + пауза
+    // Пр.147.B: ЖИВЫЕ серверы (пинг≥0), скрытые ФИЛЬТРОМ ПРОТОКОЛОВ (не блок/пауза) — их можно показать,
+    // включив соответствующие протоколы. Полезно, когда среди видимых живых нет, а среди скрытых — есть.
+    val hiddenLiveByProto = notBlocked
+        .filter { !ServerFilter.isPaused(it, blocklist) }
+        .filter { !ServerFilter.protocolAllowed(it, settings) }
+        .filter { (effPing(it) ?: -1) >= 0 }
+    val hiddenLiveProtocols = hiddenLiveByProto.map { it.protocol }.distinct()
 
     // Сортировка как Termux sort_servers_by_speed: скорость>0 (убыв.) → живые по пингу (возр.) → остальные.
     val shown = allowedServers.sortedWith(Comparator { a, b ->
@@ -1564,6 +1571,24 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
         if (settings.allowedProtocols.isEmpty() && servers.isNotEmpty()) item {
             Box(Modifier.fillMaxWidth().background(liveBg).padding(horizontal = 12.dp, vertical = 6.dp)) {
                 Text("Все протоколы отключены в Настройках → Протоколы.", style = MaterialTheme.typography.bodyMedium, color = Color(0xFFD32F2F))
+            }
+        }
+        // Пр.147.B: среди ВИДИМЫХ живых мало/нет, а среди СКРЫТЫХ по протоколу — есть живые → предложить показать
+        // (включить эти протоколы). Реверсивно в Настройках → Протоколы. Тап читает список → рекомпозиция.
+        if (hiddenLiveByProto.isNotEmpty() && alive.size < 3) item {
+            Box(Modifier.fillMaxWidth().background(liveBg).padding(horizontal = 12.dp, vertical = 6.dp)) {
+                val protoStr = hiddenLiveProtocols.joinToString(", ") { it.name }
+                Text(
+                    "Есть живые серверы, скрытые фильтром протоколов ($protoStr): ${hiddenLiveByProto.size}. Нажмите, чтобы показать их.",
+                    style = MaterialTheme.typography.bodySmall, color = Color(0xFFE8710A), fontWeight = FontWeight.Bold,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .clickable {
+                            SettingsStore.update(context, settings.copy(allowedProtocols = settings.allowedProtocols + hiddenLiveProtocols))
+                            MonitorCoordinator.wake()
+                        }
+                        .padding(vertical = 4.dp, horizontal = 2.dp),
+                )
             }
         }
         item { Box(Modifier.fillMaxWidth().background(liveBg).bottomHairline(divCol)) { ServerTableHeader() } }
