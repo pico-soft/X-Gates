@@ -60,10 +60,18 @@ object NetworkMonitor {
     // обновляем подписки ЧАЩЕ (раз в 5 мин), пока доля живых не поднимется выше 10% (ищем свежие серверы).
     private const val ALL_SUBS_REFRESH_DEGRADED_MS = 5 * 60_000L
     private const val DEGRADED_LIVE_SHARE_PCT = 10
+    // Пр.147: второй признак деградации — >80% ЖИВЫХ (с замером) медленнее 1 Мбит/с → пул почти бесполезен →
+    // тоже обновляем чаще (5 мин). Требуем минимум замеренных живых, чтобы не срабатывать на 1-2 серверах.
+    private const val SLOW_MBPS_THRESHOLD = 1.0
+    private const val SLOW_LIVE_SHARE_PCT = 80
+    private const val SLOW_RULE_MIN_MEASURED = 3
 
     // Пр.146.Ф2: периодический пинг ВСЕХ кандидатов (не только живых) — и прунит мёртвых, и ЛОВИТ воскресших.
     // Раньше пинговали только живых → список монотонно СЖИМАЛСЯ (после рестарта осталось 2 из 146). Пинг дёшев (КБ).
     private const val PING_REFRESH_INTERVAL_MS = 15 * 60_000L
+    // Пр.146 Ф3.5: после переключения (подбор подключает к первому живому) через столько открываем проход
+    // «держать лучший» — чтобы вскоре перейти на самый быстрый стабильный, не ждя обычные 6 ч.
+    private const val POST_SWITCH_OPTIMIZE_MS = 90_000L
     // Ниже этого числа «вероятно живых» кандидатов восстановление СНАЧАЛА делает полный пинг-скан (рединдексация),
     // иначе крутится на 2-3 устаревших. «Самый быстрый» вручную делал ровно это (пинг 146 → нашлось 56).
     private const val REDISCOVER_WHEN_ALIVE_BELOW = 6
@@ -229,13 +237,22 @@ object NetworkMonitor {
             run {
                 val allSrv = SubscriptionManager.allServers(app)
                 val total = allSrv.size
-                val liveShare = allSrv.count { (it.pingMs ?: -1) >= 0 }
-                val degraded = total > 0 && liveShare * 100 < DEGRADED_LIVE_SHARE_PCT * total
+                val live = allSrv.filter { (it.pingMs ?: -1) >= 0 }
+                val liveShare = live.size
+                // Признак 1: живых < 10% от всех.
+                val degradedByCount = total > 0 && liveShare * 100 < DEGRADED_LIVE_SHARE_PCT * total
+                // Признак 2 (Пр.147): среди ЖИВЫХ с замером >80% медленнее 1 Мбит/с (пул почти бесполезен).
+                val measuredLive = live.filter { (it.speedMbps ?: -1.0) >= 0.0 }
+                val slowLive = measuredLive.count { (it.speedMbps ?: 0.0) < SLOW_MBPS_THRESHOLD }
+                val degradedBySlow = measuredLive.size >= SLOW_RULE_MIN_MEASURED &&
+                    slowLive * 100 > SLOW_LIVE_SHARE_PCT * measuredLive.size
+                val degraded = degradedByCount || degradedBySlow
                 val interval = if (degraded) ALL_SUBS_REFRESH_DEGRADED_MS else ALL_SUBS_REFRESH_MS
                 if (now() - lastAllSubsRefreshMs >= interval && !MonitorCoordinator.fullTestRunning &&
                     !MonitorCoordinator.monitorSearchRunning && ph != TunnelHealth.Phase.RECOVERING) {
                     lastAllSubsRefreshMs = now()
-                    MonitorLog.event(app, "monitor", "Фон: обновляю подписки (${if (degraded) "деградация, 5 мин" else "30 мин"})", "живых $liveShare из $total")
+                    val why = when { degradedBySlow -> "деградация: медленные, 5 мин"; degradedByCount -> "деградация: мало живых, 5 мин"; else -> "30 мин" }
+                    MonitorLog.event(app, "monitor", "Фон: обновляю подписки ($why)", "живых $liveShare из $total, медленных ${slowLive}/${measuredLive.size}")
                     runCatching { SubscriptionManager.refreshAllEnabled(app, cancelled = { MonitorCoordinator.fullTestRunning }, onEach = { _, _ -> }) }
                         .onFailure { MonitorLog.event(app, "error", "Ошибка фонового обновления подписок", it.message ?: "") }
                 }
@@ -366,6 +383,11 @@ object NetworkMonitor {
                     val ip2 = ExternalIpChecker.fetch()   // подтвердить ФАКТОМ сразу
                     if (ip2 != null) { TunnelHealth.ok(ip2, now(), ProxyState.state.value.serverKey ?: ""); onRecovered(app) }
                     else TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "проверяю после переключения…")
+                    // Пр.146 Ф3.5: подбор подключает к ПЕРВОМУ живому (быстро). Чтобы вскоре перейти на САМЫЙ БЫСТРЫЙ
+                    // (стабильный) — сдвигаем таймер «держать лучший» так, чтобы его проход открылся через ~90с (а не
+                    // ждал полные 6ч). В экономии activeOptimizeSec=0 → проход и так не откроется (МБ не тратим).
+                    if (cur.activeOptimizeSec > 0)
+                        lastOptimizeMs = now() - cur.activeOptimizeSec * 1000L + POST_SWITCH_OPTIMIZE_MS
                 }
                 SwitchResult.ABORTED -> { /* пользователь вмешался — оставляем как есть */ }
                 SwitchResult.NO_CANDIDATES -> {
@@ -812,10 +834,11 @@ object NetworkMonitor {
                 if (k == curKey) continue
                 val mbps = ServerSpeedTester.measureSufficiency(app, c, enough)   // temp-инстанс, стоп на пороге
                 results[k] = mbps
-                if (mbps > bestMbps) { bestMbps = mbps; bestKey = k }
+                // Пр.146 Ф3.5: не переходим НА нестабильный сервер (Ф3) — он не может стать «лучшим» целевым.
+                if (mbps > bestMbps && !isUnstableKey(k)) { bestMbps = mbps; bestKey = k }
             }
-            // лучший из СВЕЖЕГО топа тоже участвует в решении (его не перемеряли — он свежий)
-            for (p in freshTop) { val sp = p.speedMbps ?: 0.0; if (sp > bestMbps) { bestMbps = sp; bestKey = key(p) } }
+            // лучший из СВЕЖЕГО топа тоже участвует в решении (его не перемеряли — он свежий); нестабильных не берём.
+            for (p in freshTop) { val sp = p.speedMbps ?: 0.0; if (sp > bestMbps && !isUnstableKey(key(p))) { bestMbps = sp; bestKey = key(p) } }
             SubscriptionManager.applySpeedResults(app, results)
             // ПРАВИЛО «ДЕРЖАТЬ ЛУЧШИЙ» (Промпт 90.A): переключаемся, если лучший быстрее текущего КРАТНО
             // (в keepBestMultiplier раз), даже когда текущий выше порога. Кратно — чтобы шум не дёргал.
