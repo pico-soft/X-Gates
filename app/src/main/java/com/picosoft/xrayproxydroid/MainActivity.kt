@@ -1479,6 +1479,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                     serverName = activeServer?.let { displayName(it, blocklist) } ?: proxy.label,
                     subtitle = activeServer?.let { protoNetSec(it) },
                     speedMbps = activeServer?.let { effSpeed(it) },
+                    pingMs = activeServer?.let { effPing(it) },
                     uploadMbps = activeUploadMbps,
                     // Живая скорость (гибрид) + время замера — активного сервера. Показываем ТОЛЬКО при подтверждённой
                     // свежей связи (ipVerified); при обрыве/устаревании говорит statusLine.
@@ -1748,6 +1749,7 @@ private fun StatusBox(
     serverName: String?,
     subtitle: String?,
     speedMbps: Double?,
+    pingMs: Int? = null,               // Пр.146: пинг активного — показываем в плашке (полезно и в восстановлении)
     uploadMbps: Double?,
     directDownMbps: Double?,
     tunnelDownMbps: Double?,
@@ -1861,9 +1863,11 @@ private fun StatusBox(
                 }
             }
             // Сообщение о системном VPN переехало на вкладку «Настройки» ([VpnStatusCard]).
-            // Мелко: протокол · network · security активного сервера (вместо портов).
+            // Мелко: протокол · network · security активного сервера (вместо портов). Пр.146: + ПИНГ активного
+            // (полезно и в восстановлении, когда скорости ещё нет). «✗» — не отозвался на последний пинг.
             if (subtitle != null) {
-                Text(subtitle, style = MaterialTheme.typography.bodySmall, color = fg)
+                val pingSuffix = pingMs?.let { pm -> if (pm < 0) " · пинг ✗" else " · пинг $pm мс" } ?: ""
+                Text(subtitle + pingSuffix, style = MaterialTheme.typography.bodySmall, color = fg)
             }
             val ipDisplay = if (ipText.isEmpty()) "…" else ipText
             // Тап по строке IP → ручное обновление. IP = индикатор реальной живости туннеля.

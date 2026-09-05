@@ -83,7 +83,14 @@ class XrayProxyService : Service() {
         // это ОСНОВНОЙ принцип, а не опция; monitorEnabled внутри цикла гейтит лишь вторичную оптимизацию).
         monitorScope.launch {
             ProxyState.state.map { it.running }.distinctUntilChanged()
-                .collect { active -> if (active) startMonitor() else stopMonitor() }
+                // Пр.146.Ф2 (КОРЕНЬ «зацикливания»): когда СМЕНУ сервера инициировал САМ монитор (подбор/лестница/
+                // держать-лучший), XrayController.stop()+start() на миг роняет running=false → раньше коллектор
+                // рвал корутину монитора (stopMonitor) прямо посреди подбора → подбор УБИВАЛСЯ, цикл стартовал
+                // заново (лог: «monitor loop started» на каждой смене). Пока идёт поиск монитора — НЕ трогаем его.
+                .collect { active ->
+                    if (active) startMonitor()
+                    else if (!MonitorCoordinator.monitorSearchRunning) stopMonitor()
+                }
         }
         // Переключение «Обходить системный VPN» применяем сразу (не ждём сетевого события).
         monitorScope.launch {

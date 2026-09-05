@@ -59,8 +59,15 @@ object ExternalIpChecker {
     @Volatile internal var onceCount = 0
     internal fun resetTestCounters() { maxConcurrentSeen = 0; onceCount = 0 }
 
+    /**
+     * Быстрая проверка прохода для подбора (Пр.146.Ф2): 1 эндпоинт × короткий таймаут. НЕ полные 3×5с — при
+     * переборе кандидатов важна скорость, а один свежий проход через туннель уже доказывает живость.
+     */
+    fun probePass(socksPort: Int = XrayConfig.SOCKS_PORT, timeoutMs: Int = 4000): Boolean =
+        fetch(socksPort, timeoutMs, maxEndpoints = 1) != null
+
     /** Единая точка запроса внешнего адреса. Блокирующий — запускать на фоновом потоке (как и раньше). */
-    fun fetch(socksPort: Int = XrayConfig.SOCKS_PORT): String? {
+    fun fetch(socksPort: Int = XrayConfig.SOCKS_PORT, timeoutMs: Int = TIMEOUT_MS, maxEndpoints: Int = Int.MAX_VALUE): String? {
         synchronized(lock) {
             if (inFlight) {
                 // Запрос уже идёт — дождаться ЕГО результата, свой НЕ запускать (не плодим параллельные).
@@ -78,7 +85,7 @@ object ExternalIpChecker {
             val n = concurrentNow.incrementAndGet()
             if (n > maxConcurrentSeen) maxConcurrentSeen = n
             onceCount++
-            result = onceOverrideForTest?.invoke(socksPort) ?: fetchOnce(socksPort)
+            result = onceOverrideForTest?.invoke(socksPort) ?: fetchOnce(socksPort, timeoutMs, maxEndpoints)
         } finally {
             concurrentNow.decrementAndGet()
             synchronized(lock) {
@@ -96,16 +103,16 @@ object ExternalIpChecker {
      * Пр.144: СВЕЖИЙ TCP+TLS сокет ЧЕРЕЗ SOCKS на каждый вызов (никакого пула/keep-alive). DNS — remote через
      * SOCKS (createUnresolved), как у реального трафика. Успех = реально прошёл HTTP 200 с телом-IP через туннель.
      */
-    private fun fetchOnce(socksPort: Int): String? {
+    private fun fetchOnce(socksPort: Int, timeoutMs: Int = TIMEOUT_MS, maxEndpoints: Int = Int.MAX_VALUE): String? {
         val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", socksPort))
-        for ((host, path) in endpoints) {
+        for ((host, path) in endpoints.take(maxEndpoints.coerceAtLeast(1))) {
             val n = nonce.incrementAndGet()
             var raw: Socket? = null
             try {
                 raw = Socket(proxy)
                 // createUnresolved → имя резолвит SOCKS-сервер (remote DNS, socks5h) тем же путём, что реальный трафик.
-                raw.connect(InetSocketAddress.createUnresolved(host, 443), TIMEOUT_MS)
-                raw.soTimeout = TIMEOUT_MS
+                raw.connect(InetSocketAddress.createUnresolved(host, 443), timeoutMs)
+                raw.soTimeout = timeoutMs
                 val ssl = (SSLSocketFactory.getDefault() as SSLSocketFactory)
                     .createSocket(raw, host, 443, true) as SSLSocket
                 ssl.startHandshake()   // реальный TLS через туннель — уже доказывает, что трафик ходит

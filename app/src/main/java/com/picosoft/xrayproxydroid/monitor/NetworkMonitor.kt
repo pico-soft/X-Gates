@@ -57,6 +57,13 @@ object NetworkMonitor {
     // чтобы пул серверов не устаревал (мёртвые уходят, новые появляются). Не во время ручного теста/восстановления.
     private const val ALL_SUBS_REFRESH_MS = 30 * 60_000L
 
+    // Пр.146.Ф2: периодический пинг ВСЕХ кандидатов (не только живых) — и прунит мёртвых, и ЛОВИТ воскресших.
+    // Раньше пинговали только живых → список монотонно СЖИМАЛСЯ (после рестарта осталось 2 из 146). Пинг дёшев (КБ).
+    private const val PING_REFRESH_INTERVAL_MS = 15 * 60_000L
+    // Ниже этого числа «вероятно живых» кандидатов восстановление СНАЧАЛА делает полный пинг-скан (рединдексация),
+    // иначе крутится на 2-3 устаревших. «Самый быстрый» вручную делал ровно это (пинг 146 → нашлось 56).
+    private const val REDISCOVER_WHEN_ALIVE_BELOW = 6
+
     private const val SWITCH_THROTTLE_MS = 60_000L        // в фоне переключаться не чаще раза в 60с
     // Пауза при «НЕТ РАБОЧИХ СЕРВЕРОВ» (интернет есть, но ни один сервер не поднялся): удвоение 10 мин → 4 ч.
     private const val BACKOFF_START_MS = 10 * 60_000L     // первая пауза «нет серверов» — 10 минут
@@ -124,7 +131,7 @@ object NetworkMonitor {
         var lastWhiteEvalMs = 0L        // Пр.140: когда последний раз оценивали режим белых списков
         var lastWhiteRefreshMs = 0L     // Пр.140: когда последний раз обновляли источники белого списка
         var lastEconomyRecheckMs = now()   // Пр.141: когда последний раз проверяли активный сервер в экономии
-        var lastLivePruneMs = now()        // Пр.143: когда последний раз пинговали живых для прунинга списка
+        var lastPingRefreshMs = now()      // Пр.146.Ф2: когда последний раз пинговали ВСЕХ (прунинг + рединдексация)
         var lastAllSubsRefreshMs = now()   // Пр.146: когда последний раз обновляли ВСЕ подписки в фоне (раз в 30 мин)
         val cycleLock = MonitorAlarm.newWakeLock(app)   // держит CPU на время ОДНОГО цикла (иначе уснёт посреди пробы)
         Log.i(TAG, "monitor loop started")
@@ -230,13 +237,13 @@ object NetworkMonitor {
                         .onFailure { MonitorLog.event(app, "error", "Ошибка замера скорости", it.message ?: "") }
                         .getOrDefault(lastActiveProbeMs)
                 }
-                // Пр.143: активный ОК → «продолжаем пинг живых, убирая тех, кто не отозвался». Периодически (раз в
-                // LIVE_PRUNE_INTERVAL_MS) и не во время активной загрузки — чтобы список «Живые» был честным и быстрый
-                // подбор при обрыве брал реально живого. Только ПИНГ (килобайты); скорость тут не мерим.
-                if (now() - lastLivePruneMs >= LIVE_PRUNE_INTERVAL_MS && !userTrafficActive()) {
-                    lastLivePruneMs = now()
-                    runCatching { pruneLiveByPing(app, cur) }
-                        .onFailure { MonitorLog.event(app, "error", "Ошибка пинга живых", it.message ?: "") }
+                // Пр.146.Ф2: активный ОК → периодически пингуем ВСЕХ кандидатов (не только живых): убираем мёртвых
+                // И ловим воскресших (список «Живые» и честный, и полный, и быстрый подбор при обрыве берёт реально
+                // живого). Раз в PING_REFRESH_INTERVAL_MS, не во время активной загрузки. Только ПИНГ (килобайты).
+                if (now() - lastPingRefreshMs >= PING_REFRESH_INTERVAL_MS && !userTrafficActive()) {
+                    lastPingRefreshMs = now()
+                    runCatching { refreshAllPings(app, cur) }
+                        .onFailure { MonitorLog.event(app, "error", "Ошибка пинга всех", it.message ?: "") }
                 }
                 // Вторичное: «держать лучший». Пр.126.B: ДЕФОЛТ ВЫКЛ (monitorOptimizeSec=0) — замеры активного и
                 // кандидата несопоставимы, решения шли бы по шуму. Пр.125.E: в экономии тоже выкл. Когда пользователь
@@ -389,6 +396,21 @@ object NetworkMonitor {
         MonitorCoordinator.monitorSearchRunning = true
         try {
             val startKey = ProxyState.state.value.serverKey
+            // Пр.146.Ф2: если «вероятно живых» осталось мало (список устарел — типично после рестарта: 2 из 146),
+            // СНАЧАЛА пере-пинг ВСЕХ (рединдексация, как ручной «Самый быстрый»: пинг 146 → нашлось 56), иначе
+            // подбор бесконечно крутится на 2-3 устаревших. Пинг не меняет сервер → монитор не дёргается.
+            val bl0 = BlocklistStore.current()
+            val likelyCount = SubscriptionManager.allServers(app)
+                .filter { SubscriptionManager.serverKey(it) != startKey }
+                .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl0) && !ServerFilter.isPaused(it, bl0) }
+                .count { isLikelyAlive(it) }
+            if (likelyCount < REDISCOVER_WHEN_ALIVE_BELOW) {
+                TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "мало живых ($likelyCount) — полный пинг")
+                MonitorStatus.update(true, "полный пинг: ищу живые серверы", now(), 0)
+                val found = runCatching { refreshAllPings(app, s) }.getOrDefault(0)
+                MonitorLog.event(app, "monitor", "Рединдексация при восстановлении: живых $found", "было вероятно-живых $likelyCount")
+                if (aborted(startKey)) return SwitchResult.ABORTED
+            }
             // Ступень 0 (Пр.143): быстрый ping-подбор живых по убыванию скорости. Успех → сразу наверх.
             val fast = fastPingSwitch(app, s, startKey)
             if (fast != SwitchResult.NO_CANDIDATES) return fast
@@ -463,8 +485,9 @@ object NetworkMonitor {
                 while (waited < 8000 && (!ProxyState.state.value.running || ProxyState.state.value.serverKey != key)) { delay(500); waited += 500 }
                 delay(800)   // дать туннелю осесть
                 if (ProxyState.state.value.serverKey != key) return SwitchResult.ABORTED   // сменили не мы
-                // ЗАМЕР АКТИВНОГО = внешний IP через новый сервер. Есть → остаёмся; скорость доберём.
-                if (ExternalIpChecker.fetch() != null) {
+                // Пр.146.Ф2: подтверждение прохода — КОРОТКОЕ (probePass ~4с, 1 эндпоинт), не полные 3×5с — при
+                // переборе важна скорость (выбор Elyor). Прошло → остаёмся, скорость доберём. Нет → следующий.
+                if (ExternalIpChecker.probePass()) {
                     measureAfterConnect(app, c)
                     return SwitchResult.SWITCHED
                 }
@@ -583,33 +606,34 @@ object NetworkMonitor {
     }
 
     /**
-     * Пр.143: ПОДДЕРЖАНИЕ «Живых» — пингуем текущих живых (свежий пинг ≥0), НЕ активного (его живость — по IP-чеку),
-     * и записываем результат (в т.ч. −1 → сервер уходит из «Живых»). Пул ServerTester.testAll (concurrency из
-     * настроек); ждём завершения без блокировки потока. Только пинг (килобайты) — скорость не трогаем.
+     * Пр.146.Ф2: ПЕРЕ-ПИНГ ВСЕХ кандидатов (протокол/стоп-лист/пауза ок), НЕ активного (его живость — по IP-чеку).
+     * И прунит мёртвых (−1 → уходят из «Живых»), И ловит воскресших (были −1, снова отвечают → возвращаются в
+     * «Живые»). Раньше пинговали только живых → список сжимался. Пул ServerTester.testAll; ждём без блокировки
+     * потока. Только пинг (килобайты). Возвращает число «живых» (пинг≥0) после пере-пинга — для рединдексации.
      */
-    private suspend fun pruneLiveByPing(app: Context, s: AppSettings) {
+    private suspend fun refreshAllPings(app: Context, s: AppSettings): Int {
         val bl = BlocklistStore.current()
         val curKey = ProxyState.state.value.serverKey
-        val live = SubscriptionManager.allServers(app)
+        val candidates = SubscriptionManager.allServers(app)
             .filter { SubscriptionManager.serverKey(it) != curKey }
-            .filter { (it.pingMs ?: -1) >= 0 }
             .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl) && !ServerFilter.isPaused(it, bl) }
-        if (live.isEmpty()) return
+        if (candidates.isEmpty()) return 0
         val results = java.util.concurrent.ConcurrentHashMap<String, Int>()
         kotlinx.coroutines.suspendCancellableCoroutine<Unit> { cont ->
             val handle = ServerTester.testAll(
-                app, live,
+                app, candidates,
                 onResult = { p, ms -> results[SubscriptionManager.serverKey(p)] = ms.toInt() },
                 onProgress = { _, _ -> },
                 onFinish = { if (cont.isActive) cont.resumeWith(Result.success(Unit)) },
             )
             cont.invokeOnCancellation { runCatching { handle.cancel() } }
         }
+        val aliveNow = results.count { it.value >= 0 }
         if (results.isNotEmpty()) {
             SubscriptionManager.applyPingResults(app, results)
-            val dead = results.count { it.value < 0 }
-            MonitorLog.event(app, "monitor", "Пинг живых: ${results.size}, отсеяно $dead", "поддержание списка «Живые»")
+            MonitorLog.event(app, "monitor", "Пере-пинг всех: ${results.size}, живых $aliveNow", "прунинг + рединдексация «Живых»")
         }
+        return aliveNow
     }
 
     /**
