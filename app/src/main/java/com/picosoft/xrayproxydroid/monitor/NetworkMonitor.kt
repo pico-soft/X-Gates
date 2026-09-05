@@ -110,6 +110,32 @@ object NetworkMonitor {
     // пересоздание корутины монитора (как restartedKeySinceOk), чтобы throttle не сбрасывался при рестарте.
     @Volatile private var lastDegradationMs = 0L
 
+    // Пр.146 Ф3: СТАБИЛЬНОСТЬ. Считаем «падения» сервера за окно (когда он был активным и связь оборвалась).
+    // Часто падающий («нестабильный») опускается в подборе В САМЫЙ НИЗ — предпочитаем стабильный, пусть чуть
+    // медленнее (просьба Elyor: «постоянные короткие обрывы → искать более стабильный, пусть менее быстрый»).
+    // Транзиентно (в памяти, сбрасывается при перезапуске — «недавнее поведение»). Object-поле переживает
+    // пересоздание корутины монитора.
+    private val flapEvents = java.util.concurrent.ConcurrentHashMap<String, ArrayDeque<Long>>()
+    private const val STABILITY_WINDOW_MS = 30 * 60_000L
+    private const val FLAP_UNSTABLE_THRESHOLD = 3
+    private fun recordFlap(key: String?) {
+        if (key.isNullOrEmpty()) return
+        val dq = flapEvents.getOrPut(key) { ArrayDeque() }
+        synchronized(dq) {
+            dq.addLast(now())
+            while (dq.isNotEmpty() && now() - dq.first() > STABILITY_WINDOW_MS) dq.removeFirst()
+        }
+    }
+    private fun recentFlaps(key: String): Int {
+        val dq = flapEvents[key] ?: return 0
+        synchronized(dq) {
+            while (dq.isNotEmpty() && now() - dq.first() > STABILITY_WINDOW_MS) dq.removeFirst()
+            return dq.size
+        }
+    }
+    /** Пр.146 Ф3: сервер считается НЕСТАБИЛЬНЫМ, если за окно падал ≥ порога раз (в подборе идёт последним). */
+    internal fun isUnstableKey(key: String): Boolean = recentFlaps(key) >= FLAP_UNSTABLE_THRESHOLD
+
     /**
      * Промпт 95 — ФАКТ-ПЕРВЫЙ цикл непрерывности связи. Работает ВСЕГДА, пока прокси активен (НЕ гейтится
      * monitorEnabled — это ОСНОВНОЙ принцип, а не опция; monitorEnabled гейтит лишь вторичную оптимизацию
@@ -332,6 +358,7 @@ object NetworkMonitor {
 
             // Обрыв ПОДТВЕРЖДЁН → восстановление: сперва БЫСТРЫЙ ping-подбор живых, при неудаче — тщательно.
             failures = 0
+            recordFlap(ProxyState.state.value.serverKey)   // Пр.146 Ф3: отметить падение активного (для стабильности)
             MonitorLog.event(app, "monitor", "Связь прервалась — ищу живой сервер", "внешний IP не получен")
             when (runRecoveryLadder(app, cur)) {
                 SwitchResult.SWITCHED -> {
@@ -470,7 +497,8 @@ object NetworkMonitor {
         val candidates = orderFastCandidates(
             SubscriptionManager.allServers(app)
                 .filter { SubscriptionManager.serverKey(it) != startKey }
-                .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl) && !ServerFilter.isPaused(it, bl) }
+                .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl) && !ServerFilter.isPaused(it, bl) },
+            isUnstable = { isUnstableKey(SubscriptionManager.serverKey(it)) },   // Пр.146 Ф3: нестабильные — в конец
         )
         if (candidates.isEmpty()) return SwitchResult.NO_CANDIDATES
         val pingTimeout = s.pingTimeoutMs.coerceAtMost(1500)
@@ -660,11 +688,14 @@ object NetworkMonitor {
      * меньший пинг раньше; берём только «вероятно живых» (isLikelyAlive). Чистая функция — покрыта тестом.
      */
     internal fun orderFastCandidates(
-        list: List<com.picosoft.xrayproxydroid.xray.link.ServerProfile>
+        list: List<com.picosoft.xrayproxydroid.xray.link.ServerProfile>,
+        isUnstable: (com.picosoft.xrayproxydroid.xray.link.ServerProfile) -> Boolean = { false },
     ): List<com.picosoft.xrayproxydroid.xray.link.ServerProfile> =
         list.filter { isLikelyAlive(it) }
             .sortedWith(
-                compareByDescending<com.picosoft.xrayproxydroid.xray.link.ServerProfile> { it.speedMbps ?: 0.0 }
+                // Пр.146 Ф3: СТАБИЛЬНЫЕ первыми (нестабильные — в самый низ, как запас), затем по скорости, затем пинг.
+                compareBy<com.picosoft.xrayproxydroid.xray.link.ServerProfile> { isUnstable(it) }
+                    .thenByDescending { it.speedMbps ?: 0.0 }
                     .thenBy { it.pingMs ?: Int.MAX_VALUE }
             )
 

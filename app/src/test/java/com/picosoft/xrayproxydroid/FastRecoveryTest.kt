@@ -54,6 +54,17 @@ class FastRecoveryTest {
         assertEquals(listOf("lo-ping", "hi-ping"), ordered)   // равная скорость → меньший пинг раньше
     }
 
+    // ── (3) Пр.146 Ф3: нестабильные идут В КОНЕЦ, даже если быстрее ──
+    @Test fun order_unstable_goes_last_even_if_faster() {
+        val list = listOf(
+            srv("flappy-fast", ping = 30, speed = 90.0),   // быстрый, но нестабильный
+            srv("stable-slow", ping = 50, speed = 8.0),    // медленнее, но стабильный
+        )
+        val unstable = setOf("flappy-fast.example.com")   // address используем как ключ теста
+        val ordered = NetworkMonitor.orderFastCandidates(list, isUnstable = { it.address in unstable }).map { it.remarks }
+        assertEquals(listOf("stable-slow", "flappy-fast"), ordered)   // стабильный первым, нестабильный запасом
+    }
+
     @Test fun order_drops_non_alive_and_keeps_ping_only() {
         val list = listOf(
             srv("dead", ping = -1),                 // отсеять
