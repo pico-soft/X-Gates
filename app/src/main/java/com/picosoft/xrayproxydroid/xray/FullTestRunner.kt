@@ -41,6 +41,9 @@ object FullTestRunner {
     //  верху цикла). Ограничиваем его вклад в видимый «застой», не давая застопорить бар на 0/N.
     private const val STALL_LIMIT_MS = 120_000L
     private const val PRIORITY_MEASURE_CAP_MS = 60_000L
+    // Пр.151: сколько ГОДНЫХ набрать на быстром Этапе 2 (после подключения) прежде чем перейти к точному Этапу 3.
+    // Хватает пула для точного замера топ-K; не мерим все десятки серверов подряд.
+    private const val FAST_SCAN_ENOUGH = 10
 
     data class Result(
         val connected: ServerProfile?,   // к чему подключены в итоге
@@ -279,6 +282,7 @@ object FullTestRunner {
                 var bestSpeed = 0.0
                 var selectable = 0
                 var measured = 0
+                val goodOnes = ArrayList<ServerProfile>()   // Пр.151: годные (Этап 2) → полный замер топа на Этапе 3
                 // Промпт 93.C: фон не должен ронять процесс — любое исключение фазы завершает тест штатно (finishOnce).
                 try {
                 // ПРИОРИТЕТ АКТИВНОГО ТУННЕЛЯ (обратная связь): если есть активное соединение — мерим ЕГО ПЕРВЫМ,
@@ -335,12 +339,15 @@ object FullTestRunner {
                         onPhase("Бюджет теста (${s.fullTestBudgetSec / 60} мин) исчерпан на $measured/${candidates.size} — стоп")
                         break
                     }
-                    val mbps = ServerSpeedTester.measureSpeed(appCtx, p)
+                    // Пр.151 Этап 2 — БЫСТРЫЙ замер (measureSufficiency, стоп на пороге достаточности): быстро находим
+                    // ГОДНОГО и подключаемся. Точную скорость (кто самый быстрый) добьём на Этапе 3 полным замером топа.
+                    val mbps = ServerSpeedTester.measureSufficiency(appCtx, p, s.sufficientMbps.coerceAtLeast(0.1))
                     if (cancelled.get()) break   // Промпт 103: сторож/отмена сработали во время замера — не действуем по нему
                     measured++
                     onSpeedResult(p, mbps)   // результат сохраняем всегда
                     if (ServerFilter.isSelectable(p, mbps, s, blocklist)) {
                         selectable++
+                        goodOnes.add(p)   // Пр.151: годный — в кандидаты на точный замер (Этап 3)
                         if (mbps > bestSpeed) { bestSpeed = mbps; best = p; hbBest.set(p) }
                         val curConn = connected
                         if (curConn == null) {
@@ -371,6 +378,39 @@ object FullTestRunner {
                     beat()   // Промпт 103: шаг прогресса — «пульс» для сторожа
                     // Батч-остановка: набрали минимум живых на границе батча — дальше не мерим (экономия трафика).
                     if (minAlive > 0 && selectable >= minAlive && measured % batch == 0) break
+                    // Пр.151: Этап 2 БЫСТРЫЙ — как только ПОДКЛЮЧИЛИСЬ и набрали достаточно годных для точного топа,
+                    // дальше НЕ мерим все подряд (иначе «Самый быстрый» тянется минутами на десятках серверов).
+                    if (connected != null && goodOnes.size >= FAST_SCAN_ENOUGH) {
+                        onPhase("Годных достаточно (${goodOnes.size}) — перехожу к точному замеру топа")
+                        break
+                    }
+                }
+                // ── Пр.151 Этап 3: ТОЧНЫЙ ТОП. Этап 2 был быстрым (все годные ≈ порог достаточности, не различить
+                // самого быстрого). Полным замером мерим ТОП-K годных → переключаемся на реально самый быстрый, если
+                // заметно быстрее подключённого. Так «Самый быстрый» = быстро связь + затем действительно быстрейший.
+                if (!cancelled.get() && goodOnes.size > 1) {
+                    val topK = goodOnes.distinctBy { key(it) }
+                        .sortedByDescending { it.speedMbps ?: 0.0 }   // по быстрому числу Этапа 2 (+ пинг вторично)
+                        .take(SettingsStore.current().activeTopBatch.coerceAtLeast(3))
+                    onPhase("Этап 3: точный замер топа (${topK.size})…")
+                    for (p in topK) {
+                        if (cancelled.get()) break
+                        if ((System.nanoTime() - phaseStart) / 1_000_000 > budgetMs) break
+                        val full = ServerSpeedTester.measureSpeed(appCtx, p)   // полный замер (точная скорость)
+                        if (cancelled.get()) break
+                        onSpeedResult(p, full)
+                        if (full > bestSpeed) { bestSpeed = full; best = p; hbBest.set(p) }
+                        beat()
+                    }
+                    val pick = best
+                    val conn = connected
+                    if (!cancelled.get() && pick != null && conn != null && key(pick) != key(conn) && bestSpeed > connectedSpeed * (1 + marginRatio)) {
+                        onPhase("Точный топ: ${label(pick)} ${fmt(bestSpeed)} > ${fmt(connectedSpeed)} — переключаюсь")
+                        val from = ServerLabels.displayForKey(appCtx, ProxyState.state.value.serverKey)
+                        MonitorLog.switch(appCtx, from, ServerLabels.display(pick), "полный тест: точный топ", "было ${fmt(connectedSpeed)} → стало ${fmt(bestSpeed)} Мбит/с")
+                        connected = pick; connectedSpeed = bestSpeed; hbConnected.set(pick)
+                        connect(pick)
+                    }
                 }
                 } catch (e: Throwable) {
                     runCatching { onPhase("Ошибка теста: ${e.javaClass.simpleName}: ${e.message}") }

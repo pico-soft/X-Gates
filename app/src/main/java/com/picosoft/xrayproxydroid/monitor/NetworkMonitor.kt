@@ -745,14 +745,18 @@ object NetworkMonitor {
     internal fun orderFastCandidates(
         list: List<com.picosoft.xrayproxydroid.xray.link.ServerProfile>,
         isUnstable: (com.picosoft.xrayproxydroid.xray.link.ServerProfile) -> Boolean = { false },
-    ): List<com.picosoft.xrayproxydroid.xray.link.ServerProfile> =
-        list.filter { isLikelyAlive(it) }
-            .sortedWith(
-                // Пр.146 Ф3: СТАБИЛЬНЫЕ первыми (нестабильные — в самый низ, как запас), затем по скорости, затем пинг.
-                compareBy<com.picosoft.xrayproxydroid.xray.link.ServerProfile> { isUnstable(it) }
-                    .thenByDescending { it.speedMbps ?: 0.0 }
-                    .thenBy { it.pingMs ?: Int.MAX_VALUE }
-            )
+    ): List<com.picosoft.xrayproxydroid.xray.link.ServerProfile> {
+        val alive = list.filter { isLikelyAlive(it) }
+        // Пр.151 «ВРЕМЕННЫЙ АНТИ-ТОП»: часто рвущиеся (Ф3, ≥3 обрывов/30мин) ИСКЛЮЧАЕМ из быстрого подбора, ПОКА
+        // есть стабильные живые. Уверенность, что это сервер (а не мы): флап считаем лишь на ПОДТВЕРЖДЁННОМ обрыве
+        // активного при живом интернете. Стабильных нет → берём ВСЕХ (связь любой ценой, Пр.95 — не исключаем последних).
+        val stable = alive.filterNot { isUnstable(it) }
+        val pool = if (stable.isNotEmpty()) stable else alive
+        return pool.sortedWith(
+            compareByDescending<com.picosoft.xrayproxydroid.xray.link.ServerProfile> { it.speedMbps ?: 0.0 }
+                .thenBy { it.pingMs ?: Int.MAX_VALUE }
+        )
+    }
 
     /** Скорость измеряем ПОСЛЕ подключения (пользователю нужна связь, не число) и записываем серверу. */
     private suspend fun measureAfterConnect(app: Context, c: com.picosoft.xrayproxydroid.xray.link.ServerProfile) {

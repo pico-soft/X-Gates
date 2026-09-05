@@ -54,15 +54,26 @@ class FastRecoveryTest {
         assertEquals(listOf("lo-ping", "hi-ping"), ordered)   // равная скорость → меньший пинг раньше
     }
 
-    // ── (3) Пр.146 Ф3: нестабильные идут В КОНЕЦ, даже если быстрее ──
-    @Test fun order_unstable_goes_last_even_if_faster() {
+    // ── (3) Пр.151 «анти-топ»: нестабильные ИСКЛЮЧАЮТСЯ, пока есть стабильные (даже если нестабильный быстрее) ──
+    @Test fun order_unstable_excluded_when_stable_exists() {
         val list = listOf(
-            srv("flappy-fast", ping = 30, speed = 90.0),   // быстрый, но нестабильный
+            srv("flappy-fast", ping = 30, speed = 90.0),   // быстрый, но нестабильный → ИСКЛЮЧИТЬ
             srv("stable-slow", ping = 50, speed = 8.0),    // медленнее, но стабильный
         )
-        val unstable = setOf("flappy-fast.example.com")   // address используем как ключ теста
+        val unstable = setOf("flappy-fast.example.com")
         val ordered = NetworkMonitor.orderFastCandidates(list, isUnstable = { it.address in unstable }).map { it.remarks }
-        assertEquals(listOf("stable-slow", "flappy-fast"), ordered)   // стабильный первым, нестабильный запасом
+        assertEquals(listOf("stable-slow"), ordered)   // нестабильный исключён (есть стабильный)
+    }
+
+    // Пр.151: если СТАБИЛЬНЫХ нет — берём и нестабильных (связь любой ценой).
+    @Test fun order_unstable_kept_when_no_stable() {
+        val list = listOf(
+            srv("flappy-a", ping = 30, speed = 5.0),
+            srv("flappy-b", ping = 50, speed = 9.0),
+        )
+        val unstable = setOf("flappy-a.example.com", "flappy-b.example.com")
+        val ordered = NetworkMonitor.orderFastCandidates(list, isUnstable = { it.address in unstable }).map { it.remarks }
+        assertEquals(listOf("flappy-b", "flappy-a"), ordered)   // оба нестабильны → берём, по скорости
     }
 
     @Test fun order_drops_non_alive_and_keeps_ping_only() {
