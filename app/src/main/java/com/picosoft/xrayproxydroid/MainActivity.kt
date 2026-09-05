@@ -1769,6 +1769,14 @@ private fun StatusBox(
     // ВАЖНО (принцип непрерывности связи): при ПОЛНОМ обрыве (нет интернета/восстановление/нет серверов)
     // трафик НЕ идёт — плашка ТЁМНО-КРАСНАЯ независимо от прошлой скорости. Зелёный остаётся признаком
     // живого быстрого туннеля, а не молча-зелёным при поломке.
+    // Пр.145: цвет полосы — по ЛУЧШЕЙ из (ЖИВАЯ ↓ «сейчас», если свежая ≤3мин) и (СОХРАНЁННЫЙ замер speedMbps).
+    // ПОЧЕМУ: раньше цвет брался ТОЛЬКО из сохранённого замера (effSpeed), и быстрый живой туннель («Туннель 13
+    // Мбит/с сейчас») красился по устаревшему низкому замеру (~4.3) → сине-серый/коричневый вместо зелёного —
+    // ЧИСЛО и ЦВЕТ спорили (жалоба Elyor). Берём max, чтобы: быстрый живой = зелёный сразу; в простое (живой ↓
+    // проседает без нагрузки) сохранённый замер держит правильный цвет, не давая плашке «пляске» в коричневый.
+    val liveFreshForColor = (tunnelDownMbps ?: 0.0) > 0.0 && liveMeasuredAtMs > 0 &&
+        (System.currentTimeMillis() - liveMeasuredAtMs) <= HEALTH_FRESH_MS
+    val colorSpeed = maxOf(if (liveFreshForColor) (tunnelDownMbps ?: 0.0) else 0.0, speedMbps ?: 0.0)
     val (bg, fg) = when {
         !running -> Color(0xFF3A3A3A) to Color(0xFFBDBDBD)             // серый — выключен
         problem -> Color(0xFF7F1D1D) to Color(0xFFFFCDD2)             // тёмно-красный — полный обрыв связи
@@ -1776,11 +1784,11 @@ private fun StatusBox(
         // подтверждена (переключаемся/проверяем) — ЯНТАРНЫЙ, даже если у сервера есть скорость в списке. Раньше
         // цвет брался от speedMbps (из реестра) РАНЬШЕ verified → «зелёный без туннеля» (тот самый дефект).
         !verified -> Color(0xFF6D4C00) to Color(0xFFFFE082)          // подключаемся/проверяем — янтарный
-        speedMbps != null && speedMbps > 0.0 -> when {
-            speedMbps > 5.0  -> Color(0xFF1B5E20) to Color(0xFFA5D6A7) // зелёный — быстро
-            speedMbps >= 1.0 -> Color(0xFF37474F) to Color(0xFFB0BEC5) // сине-серый — средне
-            speedMbps >= 0.2 -> Color(0xFF5D4037) to Color(0xFFD7CCC8) // коричневый — медленно
-            else             -> Color(0xFF5D2A2A) to Color(0xFFEF9A9A) // красно-коричневый — очень медленно
+        colorSpeed > 0.0 -> when {
+            colorSpeed > 5.0  -> Color(0xFF1B5E20) to Color(0xFFA5D6A7) // зелёный — быстро
+            colorSpeed >= 1.0 -> Color(0xFF37474F) to Color(0xFFB0BEC5) // сине-серый — средне
+            colorSpeed >= 0.2 -> Color(0xFF5D4037) to Color(0xFFD7CCC8) // коричневый — медленно
+            else              -> Color(0xFF5D2A2A) to Color(0xFFEF9A9A) // красно-коричневый — очень медленно
         }
         else -> Color(0xFF1B5E20) to Color(0xFFA5D6A7)               // подтверждён, скорость ещё не мерена — зелёный
     }
