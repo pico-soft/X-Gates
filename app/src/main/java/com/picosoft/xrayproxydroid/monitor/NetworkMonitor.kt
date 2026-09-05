@@ -16,6 +16,7 @@ import com.picosoft.xrayproxydroid.traffic.TrafficTracker
 import com.picosoft.xrayproxydroid.xray.ExternalIpChecker
 import com.picosoft.xrayproxydroid.xray.ServerFilter
 import com.picosoft.xrayproxydroid.xray.ServerSpeedTester
+import com.picosoft.xrayproxydroid.xray.ServerTester
 import com.picosoft.xrayproxydroid.xray.XrayConfig
 import com.picosoft.xrayproxydroid.xray.XrayConfigBuilder
 import com.picosoft.xrayproxydroid.xray.XrayController
@@ -427,25 +428,39 @@ object NetworkMonitor {
                     .thenByDescending { it.speedMbps ?: 0.0 }
                     .thenBy { it.pingMs ?: Int.MAX_VALUE }
             )
-        val total = candidates.size
-        val likelyAlive = candidates.count { (it.pingMs ?: -1) >= 0 || (it.speedMbps ?: 0.0) > 0.0 }
-
-        for ((i, c) in candidates.withIndex()) {
-            if (aborted(startKey)) return SwitchResult.ABORTED
-            MonitorStatus.update(true, "перебор $round: ${i + 1}/$total · ${ServerLabels.display(c)}", now(), 0)
-            // Пр.141: честный текст — сначала «вероятно живые», потом остальные (а не «перебираю живые: N/всех»).
-            val where = if (i < likelyAlive) "проверяю недавно рабочие: ${i + 1}/$likelyAlive" else "проверяю остальные: ${i + 1 - likelyAlive}/${total - likelyAlive}"
-            TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), where)
-            // Дешёвая проверка (Промпт 52): temp-инстанс + РЕАЛЬНАЯ передача нескольких КБ (байты пришли),
-            // НЕ пинг/задержка — иначе «не пингуется, но работает» серверы отбрасывались бы молча. НЕ полный замер.
-            if (!ServerSpeedTester.probeAlive(app, c)) continue
+        // Подключиться к кандидату (общий хвост: конфиг → старт → замер). Возврат SWITCHED/null-для-continue.
+        suspend fun tryConnect(c: com.picosoft.xrayproxydroid.xray.link.ServerProfile): SwitchResult? {
             val cfg = runCatching { XrayConfigBuilder.build(c) }.getOrNull()
-            if (cfg == null) { MonitorLog.event(app, "error", "Кандидат ${ServerLabels.display(c)}: ошибка конфига", ""); continue }
+            if (cfg == null) { MonitorLog.event(app, "error", "Кандидат ${ServerLabels.display(c)}: ошибка конфига", ""); return null }
             val from = ServerLabels.displayForKey(app, startKey)
             XrayProxyService.start(app, cfg, ServerLabels.full(c), SubscriptionManager.serverKey(c))
             MonitorLog.switch(app, from, ServerLabels.display(c), "монитор", "первый живой (проход $round)")
             measureAfterConnect(app, c)
             return SwitchResult.SWITCHED
+        }
+
+        // Пр.142: ПРОХОД 1 — сперва быстрый ПИНГ недавно-рабочих (жалоба: не перебирать вслепую замером). Пингуем
+        // короче обычного; отвечающих сразу проверяем temp-инстансом и подключаемся. Непингующихся откладываем.
+        val likely = candidates.filter { (it.pingMs ?: -1) >= 0 || (it.speedMbps ?: 0.0) > 0.0 }
+        val pingTimeout = SettingsStore.current().pingTimeoutMs.coerceAtMost(1500)
+        val pingDead = ArrayList<com.picosoft.xrayproxydroid.xray.link.ServerProfile>()
+        for ((i, c) in likely.withIndex()) {
+            if (aborted(startKey)) return SwitchResult.ABORTED
+            TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "пингую недавно рабочие: ${i + 1}/${likely.size}")
+            MonitorStatus.update(true, "пинг $round: ${i + 1}/${likely.size} · ${ServerLabels.display(c)}", now(), 0)
+            if (ServerTester.ping(app, c, pingTimeout) < 0) { pingDead.add(c); continue }   // не отозвался — отложить
+            if (!ServerSpeedTester.probeAlive(app, c)) continue
+            tryConnect(c)?.let { return it }
+        }
+        // Пр.142: ПРОХОД 2 — запас: непингующиеся недавно-рабочие (мёртвый пинг ≠ мёртвый под DPI) + никогда-не-мерянные,
+        // проверяем temp-инстансом БЕЗ пинг-гейта (как раньше). Так DPI-серверы не теряются, но идут ПОСЛЕ быстрых.
+        val rest = pingDead + candidates.filterNot { it in likely }
+        for ((i, c) in rest.withIndex()) {
+            if (aborted(startKey)) return SwitchResult.ABORTED
+            TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "проверяю остальные: ${i + 1}/${rest.size}")
+            MonitorStatus.update(true, "перебор $round: ${i + 1}/${rest.size} · ${ServerLabels.display(c)}", now(), 0)
+            if (!ServerSpeedTester.probeAlive(app, c)) continue
+            tryConnect(c)?.let { return it }
         }
         return SwitchResult.NO_CANDIDATES
     }
