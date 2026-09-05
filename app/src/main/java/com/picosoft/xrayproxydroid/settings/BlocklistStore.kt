@@ -130,6 +130,13 @@ object BlocklistStore {
     val state: StateFlow<Blocklist> = _state.asStateFlow()
     fun current(): Blocklist = _state.value
 
+    // Пр.147: ВРЕМЕННОЕ снятие стоп-СЛОВ (кнопка на главной). Транзиентно (в памяти, НЕ персистится) — при
+    // перезапуске ограничения возвращаются («временно»). Пока включено, ServerFilter.isBlocked игнорирует
+    // блокировку ПО СЛОВУ (точечные блоки по serverKey и «паузы» остаются — это ручные решения пользователя).
+    private val _stopWordsSuspended = MutableStateFlow(false)
+    val stopWordsSuspended: StateFlow<Boolean> = _stopWordsSuspended.asStateFlow()
+    fun setStopWordsSuspended(v: Boolean) { _stopWordsSuspended.value = v }
+
     private fun file(context: Context) = File(context.filesDir, FILE_NAME)
 
     /** Загрузить при старте (MainActivity.onCreate). Нет файла → первый запуск → засеять дефолтом. */

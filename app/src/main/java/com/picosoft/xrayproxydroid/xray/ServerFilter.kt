@@ -27,6 +27,8 @@ object ServerFilter {
      */
     fun isBlocked(p: ServerProfile, b: Blocklist): Boolean {
         val key = SubscriptionManager.serverKey(p)
+        // Пр.147: временно сняты стоп-СЛОВА → блокировка только по точечному serverKey (слова игнорируем).
+        if (com.picosoft.xrayproxydroid.settings.BlocklistStore.stopWordsSuspended.value) return b.isServerBlocked(key)
         return b.isBlocked(p.remarks.ifBlank { p.address }, b.customName(key), key)
     }
 

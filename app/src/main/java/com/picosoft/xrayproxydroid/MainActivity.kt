@@ -913,6 +913,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
     val proxy by ProxyState.state.collectAsState()
     val settings by SettingsStore.state.collectAsState()   // живое применение порогов в UI
     val blocklist by BlocklistStore.state.collectAsState() // стоп-лист: пересчёт списков при изменении
+    val stopWordsSuspended by BlocklistStore.stopWordsSuspended.collectAsState() // Пр.147: временно сняты стоп-слова → пересчёт
 
     var subStatus by remember { mutableStateOf("") }
     var servers by remember { mutableStateOf(SubscriptionManager.allServers(context)) }
@@ -1515,6 +1516,22 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                         modifier = Modifier
                             .clip(RoundedCornerShape(6.dp))
                             .clickable { MainActivity.pendingOpen.value = MainActivity.OPEN_SETTINGS }
+                            .padding(vertical = 3.dp, horizontal = 2.dp),
+                    )
+                }
+                // Пр.147: кнопка «Временно снять ограничения по стоп-словам». Транзиентно (сбрасывается при
+                // перезапуске). Полезно, когда живые есть только среди заблокированных по слову. Читаем
+                // stopWordsSuspended здесь → рекомпозиция пересобирает списки (ServerFilter берёт свежий флаг).
+                run {
+                    Text(
+                        if (stopWordsSuspended) "⚠ Стоп-слова сняты (временно) · вернуть ограничения"
+                        else "Снять ограничения по стоп-словам (временно)",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = if (stopWordsSuspended) FontWeight.Bold else FontWeight.Normal,
+                        color = if (stopWordsSuspended) Color(0xFFE8710A) else TABLE_GRAY,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .clickable { BlocklistStore.setStopWordsSuspended(!stopWordsSuspended); MonitorCoordinator.wake() }
                             .padding(vertical = 3.dp, horizontal = 2.dp),
                     )
                 }

@@ -56,6 +56,10 @@ object NetworkMonitor {
     // Пр.146: в фоновом мониторинге обновляем ВСЕ включённые подписки раз в полчаса (не только белые списки) —
     // чтобы пул серверов не устаревал (мёртвые уходят, новые появляются). Не во время ручного теста/восстановления.
     private const val ALL_SUBS_REFRESH_MS = 30 * 60_000L
+    // Пр.147: если рабочих (живых по пингу) серверов < 10% от всех в подписках — пул сильно деградировал,
+    // обновляем подписки ЧАЩЕ (раз в 5 мин), пока доля живых не поднимется выше 10% (ищем свежие серверы).
+    private const val ALL_SUBS_REFRESH_DEGRADED_MS = 5 * 60_000L
+    private const val DEGRADED_LIVE_SHARE_PCT = 10
 
     // Пр.146.Ф2: периодический пинг ВСЕХ кандидатов (не только живых) — и прунит мёртвых, и ЛОВИТ воскресших.
     // Раньше пинговали только живых → список монотонно СЖИМАЛСЯ (после рестарта осталось 2 из 146). Пинг дёшев (КБ).
@@ -193,14 +197,22 @@ object NetworkMonitor {
                 // Фичу выключили в настройках, а режим ещё активен → сбросить в обычный.
                 runCatching { WhiteListDetector.evaluate(app, tunnelForeignOk = false) }
             }
-            // Пр.146: фоновое обновление ВСЕХ включённых подписок раз в 30 мин (пул не устаревает). Не во время
-            // ручного теста и не в разгар восстановления (там подписки и так обновляются по лестнице).
-            if (now() - lastAllSubsRefreshMs >= ALL_SUBS_REFRESH_MS && !MonitorCoordinator.fullTestRunning &&
-                !MonitorCoordinator.monitorSearchRunning && ph != TunnelHealth.Phase.RECOVERING) {
-                lastAllSubsRefreshMs = now()
-                MonitorLog.event(app, "monitor", "Фон: обновляю все подписки (30 мин)", "")
-                runCatching { SubscriptionManager.refreshAllEnabled(app, cancelled = { MonitorCoordinator.fullTestRunning }, onEach = { _, _ -> }) }
-                    .onFailure { MonitorLog.event(app, "error", "Ошибка фонового обновления подписок", it.message ?: "") }
+            // Пр.146/147: фоновое обновление ВСЕХ включённых подписок. Обычно раз в 30 мин; но если пул сильно
+            // деградировал (живых по пингу < DEGRADED_LIVE_SHARE_PCT% от всех) — ЧАЩЕ, раз в 5 мин, пока доля не
+            // поднимется (ищем свежие серверы). Не во время ручного теста и не в разгар восстановления.
+            run {
+                val allSrv = SubscriptionManager.allServers(app)
+                val total = allSrv.size
+                val liveShare = allSrv.count { (it.pingMs ?: -1) >= 0 }
+                val degraded = total > 0 && liveShare * 100 < DEGRADED_LIVE_SHARE_PCT * total
+                val interval = if (degraded) ALL_SUBS_REFRESH_DEGRADED_MS else ALL_SUBS_REFRESH_MS
+                if (now() - lastAllSubsRefreshMs >= interval && !MonitorCoordinator.fullTestRunning &&
+                    !MonitorCoordinator.monitorSearchRunning && ph != TunnelHealth.Phase.RECOVERING) {
+                    lastAllSubsRefreshMs = now()
+                    MonitorLog.event(app, "monitor", "Фон: обновляю подписки (${if (degraded) "деградация, 5 мин" else "30 мин"})", "живых $liveShare из $total")
+                    runCatching { SubscriptionManager.refreshAllEnabled(app, cancelled = { MonitorCoordinator.fullTestRunning }, onEach = { _, _ -> }) }
+                        .onFailure { MonitorLog.event(app, "error", "Ошибка фонового обновления подписок", it.message ?: "") }
+                }
             }
             // Пр.126.A: отметить факт трафика через туннель (прирост байт с прошлого цикла > порога).
             val bytesNow = TrafficTracker.state.value.let { it.sessionRx + it.sessionTx }
