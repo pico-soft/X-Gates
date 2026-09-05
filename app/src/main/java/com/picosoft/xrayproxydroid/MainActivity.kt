@@ -1082,9 +1082,9 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
     // Полный адаптивный тест: ping → speed по живым → early-connect первого рабочего → апгрейд.
     fun onFullTest() {
         if (fullTesting) return
-        // Промпт 101.B: идёт ручная проверка текущего соединения — двух прогонов одновременно быть не должно.
-        // Не запускаем поверх неё (эскалация внутри onCheck сама снимает checking перед вызовом сюда).
-        if (checking) { checkStatus = "идёт проверка — сначала прервите её"; return }
+        // Пр.142: «Самый быстрый» БЕЗАКЦЕПТНО перебивает идущую проверку (не заставляем «сначала прервите»).
+        // «Проверить» теперь только мерит активный туннель и не переключает — двух подборов одновременно нет.
+        if (checking) { checkCancel = true; ServerSpeedTester.abortCurrentMeasure(); checking = false; MonitorCoordinator.fullTestRunning = false; checkStatus = "" }
         // Свежий список из реестра (не застаревший снимок): учитывает вкл/выкл источников, сделанные на
         // вкладке «Подписки» (Промпт 82). Сервер входит, если он в ЛЮБОМ включённом источнике.
         val all = SubscriptionManager.allServers(context).also { servers = it }
@@ -1153,7 +1153,8 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
     // его зовут автозапуск и эскалация «Проверить», которые уже обновились сами (без двойного рефреша).
     fun onFastest() {
         if (fullTesting || refreshingSubs) return
-        if (checking) { checkStatus = "идёт проверка — сначала прервите её"; return }   // Промпт 101.B: не поверх ручной проверки
+        // Пр.142: БЕЗАКЦЕПТНО перебиваем идущую проверку (было «сначала прервите её»).
+        if (checking) { checkCancel = true; ServerSpeedTester.abortCurrentMeasure(); checking = false; MonitorCoordinator.fullTestRunning = false; checkStatus = "" }
         val hasUrl = sources.any { it.enabled && it.url.isNotBlank() }
         if (hasUrl) onRefreshAll(onComplete = { onFullTest() }) else onFullTest()
     }
@@ -1174,149 +1175,47 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
         }.start()
     }
 
-    // Кнопка «Проверить» (Промпт 88/90, ПЕРЕРАБОТАНО Промпт 92 — устойчивость к массовому провалу замеров).
-    // ПРИНЦИП: НИКОГДА не бросаем рабочий сервер ради недостижимого. Порядок:
-    //  1) замер активного туннеля; если ≥ порога («в норме») — кандидатов ищем НЕ ОТКЛЮЧАЯСЬ (temp-замер),
-    //     и переключаемся ТОЛЬКО если лучший ПОДТВЕРЖДЁН кратно быстрее («держать лучший»); иначе остаёмся;
-    //  2) если текущий ниже порога/не запущен/forceSwitch — ищем рабочий: кандидаты меряем temp-инстансом
-    //     СВЕРХУ ВНИЗ (probeAlive→measureSpeed), к ПЕРВОМУ подтверждённому ≥ порога подключаемся ОДИН раз;
-    //  3) не нашли — ВОЗВРАЩАЕМСЯ к исходному рабочему серверу (реконнект), а не виснем; если исходного нет
-    //     (или он исключён) — полный тест с обновлением подписок.
-    // ОТДАЧА (90.B) — только показывается, НЕ триггер переключения (приёмник не верифицирован; низкая/провальная
-    // отдача НЕ должна ронять рабочий сервер). Замеры сопоставимы (90.A). Монитор молчит (fullTestRunning).
-    fun onCheck(liveList: List<ServerProfile>, forceSwitch: Boolean = false) {
+    // Кнопка «Проверить» (ПЕРЕРАБОТАНО Пр.142): ТОЛЬКО перемер АКТИВНОГО туннеля (↓/↑) + подтверждение живости.
+    // НИКОГДА не переключает сервер и не перебирает кандидатов — из-за прежней лестницы возникала «пляска»
+    // (проверка дралась с полным тестом и переключалась на плохой/исключённый сервер). Переключение теперь
+    // только «Самый быстрый» + авто-восстановление. Результат сразу виден на плашке (живая скорость + цвет).
+    fun onCheck() {
         if (checking) return
         if (fullTesting || refreshingSubs) { checkStatus = "идёт другой тест — подождите"; return }
-        checking = true; checkCancel = false; checkStatus = "Проверка…"
-        ServerSpeedTester.resetMeasureAbort()   // Промпт 101.B: снять флаг отмены прошлой проверки
-        MonitorCoordinator.fullTestRunning = true
-        MonitorCoordinator.wake()
-        val s = SettingsStore.current()
-        val threshold = s.monitorTunnelThreshold
-        val multiplier = s.keepBestMultiplier
-        fun key(p: ServerProfile) = SubscriptionManager.serverKey(p)
-        fun nm(p: ServerProfile) = displayName(p, blocklist)
+        val curKey = ProxyState.state.value.serverKey
+        if (!ProxyState.state.value.running || curKey == null) {
+            checkStatus = "Прокси не запущен — нажмите «Самый быстрый»"; return
+        }
+        checking = true; checkCancel = false; checkStatus = "Замер текущего соединения…"
+        ServerSpeedTester.resetMeasureAbort()
+        MonitorCoordinator.fullTestRunning = true   // монитор молчит, пока меряем активный
         fun fmt(v: Double) = if (v < 0) "—" else "${(v * 10).roundToInt() / 10.0}"
         fun ui(block: () -> Unit) = activity.runOnUiThread(block)
-        val collected = HashMap<String, Double>()
-        var escalated = false
         Thread {
             try {
                 if (!NetworkMonitor.directAlive()) { ui { checkStatus = "Нет интернета — проверка невозможна" }; return@Thread }
-
-                // Подключиться к p и замерить активный туннель (↓ для решения, ↑ только для показа). Возврат ↓.
-                fun connectAndMeasure(p: ServerProfile, cause: String): Double {
-                    val k = key(p)
+                val down = ServerSpeedTester.measureActiveDownloadMbps(context)
+                if (checkCancel) { ui { checkStatus = "" }; return@Thread }   // отмена — не залипаем «Проверка прервана» над рабочим туннелем
+                val up = ServerSpeedTester.measureActiveUploadMbps(context)
+                if (checkCancel) { ui { checkStatus = "" }; return@Thread }
+                if (down > 0) {
+                    // Туннель РАБОТАЕТ: сохранить скорость + подтвердить живость активного (плашка → зелёная/по-скорости).
+                    SubscriptionManager.applySpeedResults(context, mapOf(curKey to down))
+                    TunnelSpeed.setLive(down, if (up > 0) up else 0.0, System.currentTimeMillis(), curKey)
+                    TunnelHealth.ok(TunnelHealth.snapshot().ip, System.currentTimeMillis(), curKey)
                     ui {
-                        val from = ServerLabels.displayForKey(context, ProxyState.state.value.serverKey)
-                        MonitorLog.switch(context, from, nm(p), cause)
-                        startServer(p)
+                        speedResults = speedResults + (curKey to down)
+                        activeUploadMbps = if (up > 0) up else null
+                        checkStatus = "Соединение в норме: ↓${fmt(down)} / ↑${fmt(up)} Мбит/с"
                     }
-                    var waited = 0
-                    while (waited < 8000 && (!ProxyState.state.value.running || ProxyState.state.value.serverKey != k)) {
-                        Thread.sleep(500); waited += 500
-                    }
-                    Thread.sleep(1000)
-                    val down = ServerSpeedTester.measureActiveDownloadMbps(context)
-                    val up = ServerSpeedTester.measureActiveUploadMbps(context)
-                    if (down > 0) { collected[k] = down; ui { speedResults = speedResults + (k to down) } }
-                    ui { activeUploadMbps = if (up > 0) up else null }
-                    return down
-                }
-
-                val curKey = ProxyState.state.value.serverKey
-                val running = ProxyState.state.value.running
-                val originalProfile = if (running && curKey != null) servers.firstOrNull { key(it) == curKey } else null
-
-                // Кандидаты сверху вниз по известной скорости, кроме текущего, живые/непровальные.
-                fun candidatesTopDown() = liveList
-                    .filter { key(it) != curKey }
-                    .sortedByDescending { effSpeed(it) ?: 0.0 }
-
-                // Найти рабочего кандидата НЕ ОТКЛЮЧАЯ активный: temp-замер сверху вниз, вернуть первого ≥ порога.
-                // (probeAlive дёшев — быстро пропускает недостижимых при массовом провале, не тратя по 10 МБ.)
-                fun findWorkingCandidate(minMbps: Double): Pair<ServerProfile, Double>? {
-                    val cands = candidatesTopDown()
-                    for ((i, c) in cands.withIndex()) {
-                        if (checkCancel) return null
-                        ui { checkStatus = "Проверяю кандидатов ${i + 1}/${cands.size}: ${nm(c)}…" }
-                        if (!ServerSpeedTester.probeAlive(context, c)) continue
-                        val m = ServerSpeedTester.measureSpeed(context, c)   // temp-инстанс, активный не трогаем
-                        if (m > 0) { collected[key(c)] = m; ui { speedResults = speedResults + (key(c) to m) } }
-                        if (m >= minMbps) return c to m
-                    }
-                    return null
-                }
-
-                // ── 1. Текущий рабочий и НЕ forceSwitch: остаёмся, если он «в норме» и лучший не подтверждён ──
-                if (!forceSwitch && originalProfile != null) {
-                    ui { checkStatus = "Замер текущего соединения…" }
-                    val curDown = ServerSpeedTester.measureActiveDownloadMbps(context)
-                    if (checkCancel) { ui { checkStatus = "Проверка прервана" }; return@Thread }   // Промпт 101.B: отмена во время замера
-                    val curUp = ServerSpeedTester.measureActiveUploadMbps(context)
-                    if (checkCancel) { ui { checkStatus = "Проверка прервана" }; return@Thread }
-                    if (curDown > 0) { collected[curKey!!] = curDown; ui { speedResults = speedResults + (curKey to curDown) } }
-                    ui { activeUploadMbps = if (curUp > 0) curUp else null }
-
-                    if (curDown >= threshold) {
-                        // «В норме» по ЖИВОМУ ↓ (реальный опыт — оставляем для порога/показа). Пр.130: но РЕШЕНИЕ
-                        // «держать лучший» считаем по СОПОСТАВИМЫМ числам — активный меряем ТЕМ ЖЕ temp-инстансом,
-                        // что кандидатов (живой SOCKS занижает → кандидат всегда «кратно быстрее», Пр.108/109).
-                        val curTemp = ServerSpeedTester.measureSpeed(context, originalProfile)   // temp — сопоставимо с кандидатом
-                        val cmpBase = if (curTemp > 0) curTemp else curDown                       // фолбэк на живой, если temp не удался
-                        val bestKnown = candidatesTopDown().firstOrNull { (effSpeed(it) ?: 0.0) >= cmpBase * multiplier }
-                        if (bestKnown == null) {
-                            ui { checkStatus = "Соединение в норме: ↓${fmt(curDown)} / ↑${fmt(curUp)} Мбит/с" }; return@Thread
-                        }
-                        ui { checkStatus = "Проверяю более быстрый: ${nm(bestKnown)}…" }
-                        val m = ServerSpeedTester.measureSpeed(context, bestKnown)   // temp — сопоставимо с curTemp
-                        if (m > 0) { collected[key(bestKnown)] = m; ui { speedResults = speedResults + (key(bestKnown) to m) } }
-                        if (m >= threshold && m >= cmpBase * multiplier) {
-                            val d = connectAndMeasure(bestKnown, "проверка: держать лучший (${fmt(m)}>${fmt(cmpBase)})")
-                            if (d >= threshold) { ui { checkStatus = "Переключён на ${nm(bestKnown)}: ↓${fmt(d)} Мбит/с" }; return@Thread }
-                            // не подтвердился на активном → назад к рабочему
-                            connectAndMeasure(originalProfile, "проверка: возврат (лучший не подтвердился)")
-                            ui { checkStatus = "Оставил ${nm(originalProfile)}: быстрее не подтвердилось" }; return@Thread
-                        }
-                        ui { checkStatus = "Соединение в норме: ↓${fmt(curDown)} / ↑${fmt(curUp)} (быстрее не подтвердилось)" }; return@Thread
-                    }
-                    // Текущий ниже порога → ищем рабочий, НЕ отключаясь.
-                    ui { checkStatus = "Текущий ↓${fmt(curDown)} < ${fmt(threshold)} — ищу рабочий…" }
-                    val win = findWorkingCandidate(threshold)
-                    if (checkCancel) { ui { checkStatus = "Проверка прервана" }; return@Thread }
-                    if (win != null) {
-                        val d = connectAndMeasure(win.first, "проверка: замена (${fmt(win.second)})")
-                        if (d >= threshold) { ui { checkStatus = "Переключён на ${nm(win.first)}: ↓${fmt(d)} Мбит/с" }; return@Thread }
-                    }
-                    // Не нашли лучше — ОСТАЁМСЯ на текущем (он хоть и ниже порога, но рабочий), не виснем.
-                    ui { checkStatus = "Рабочей замены не нашёл — оставил ${nm(originalProfile)} (↓${fmt(curDown)})" }
-                    return@Thread
-                }
-
-                // ── 2. forceSwitch («Не использовать») ИЛИ прокси не запущен: ищем рабочий (не отключаясь) ──
-                ui { checkStatus = "Ищу рабочий сервер…" }
-                val win = findWorkingCandidate(threshold)
-                if (checkCancel) { ui { checkStatus = "Проверка прервана" }; return@Thread }
-                if (win != null) {
-                    val d = connectAndMeasure(win.first, "проверка: подбор (${fmt(win.second)})")
-                    if (d >= threshold) { ui { checkStatus = "Подключён ${nm(win.first)}: ↓${fmt(d)} Мбит/с" }; return@Thread }
-                }
-                // ── 3. Рабочего не нашли (и рабочего исходного нет) → полный тест с обновлением подписок ──
-                escalated = true
-                ui {
-                    checking = false
-                    MonitorCoordinator.fullTestRunning = false
-                    checkStatus = "Рабочий не найден — полный тест с обновлением подписок…"
-                    onRefreshAll(onComplete = { onFullTest() })
+                } else {
+                    // Туннель не ответил — НЕ переключаем сами (Пр.142), честно предлагаем «Самый быстрый».
+                    ui { checkStatus = "Туннель не отвечает — нажмите «Самый быстрый»" }
                 }
             } catch (e: Exception) {
                 ui { checkStatus = "Ошибка проверки: ${e.message}" }
             } finally {
-                if (collected.isNotEmpty()) SubscriptionManager.applySpeedResults(context, collected)
-                ui {
-                    if (!escalated) { checking = false; MonitorCoordinator.fullTestRunning = false }
-                    reloadServers()
-                }
+                ui { checking = false; MonitorCoordinator.fullTestRunning = false; reloadServers() }
             }
         }.start()
     }
@@ -1333,9 +1232,9 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
         val name = cur?.let { displayName(it, blocklist) } ?: (proxy.label ?: curKey)
         BlocklistStore.pauseServer(context, curKey, name, System.currentTimeMillis())
         MonitorLog.event(context, "switch", "Сервер исключён («Не использовать»)", name)
-        // Список Живых без исключённого (curKey теперь «не используется» — исключаем явно на случай устаревания).
-        // forceSwitch=true: не задерживаемся на «текущий в норме», сразу переключаемся на быстрейшего живого.
-        onCheck(liveList.filter { SubscriptionManager.serverKey(it) != curKey }, forceSwitch = true)
+        // Пр.142: переключение — ТОЛЬКО через путь полного теста (единая точка выбора, без «пляски»). Исключённый
+        // сервер уже на паузе → в кандидаты не попадёт. Полный тест выберет быстрейшего рабочего.
+        onFullTest()
     }
 
     // Промпт 91: переключить «использовать ↔ не использовать» сервер (глаз-переключатель в списках).
@@ -1589,7 +1488,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                     ),
                     message = proxy.message,
                     checking = checking, checkStatus = checkStatus,
-                    onCheck = { onCheck(alive) }, onCancelCheck = { onCancelCheck() },
+                    onCheck = { onCheck() }, onCancelCheck = { onCancelCheck() },
                     onExclude = { onRemoveCurrent(alive) },
                 )
                 // Пр.134.F: компактный признак режима рядом со статус-боксом (состояние, не тревога). Причина —
