@@ -1555,7 +1555,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
             Box(Modifier.fillMaxWidth().background(liveBg).then(rowMod)) {
                 ServerRow(
                     profile = p, name = displayName(p, blocklist), isActive = isActive,
-                    speedMbps = effSpeed(p), caption = discriminators[SubscriptionManager.serverKey(p)] ?: "",
+                    speedMbps = effSpeed(p), pingMs = effPing(p), caption = discriminators[SubscriptionManager.serverKey(p)] ?: "",
                     onConnect = { connectServer(p, "ручной выбор") },
                     onDetails = { detailProfile = p; remeasureStatus = "" },
                     showUseToggle = true,
@@ -1589,7 +1589,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                 Box(Modifier.fillMaxWidth().background(allBg).then(rowMod)) {
                     ServerRow(
                         profile = p, name = displayName(p, blocklist), isActive = isActive,
-                        speedMbps = effSpeed(p), caption = discriminators[SubscriptionManager.serverKey(p)] ?: "",
+                        speedMbps = effSpeed(p), pingMs = effPing(p), caption = discriminators[SubscriptionManager.serverKey(p)] ?: "",
                         onConnect = { connectServer(p, "ручной выбор") },
                         onDetails = { detailProfile = p; remeasureStatus = "" },
                         showUseToggle = true,
@@ -1781,9 +1781,10 @@ private fun StatusBox(
         !running -> Color(0xFF3A3A3A) to Color(0xFFBDBDBD)             // серый — выключен
         problem -> Color(0xFF7F1D1D) to Color(0xFFFFCDD2)             // тёмно-красный — полный обрыв связи
         // Промпт 123.C: зелёный/цвет-по-скорости — ТОЛЬКО когда связь ПОДТВЕРЖДЕНА фактом (verified). Пока не
-        // подтверждена (переключаемся/проверяем) — ЯНТАРНЫЙ, даже если у сервера есть скорость в списке. Раньше
-        // цвет брался от speedMbps (из реестра) РАНЬШЕ verified → «зелёный без туннеля» (тот самый дефект).
-        !verified -> Color(0xFF6D4C00) to Color(0xFFFFE082)          // подключаемся/проверяем — янтарный
+        // подтверждена (подключились локально, но проба ещё не прошла) — Пр.146: СЕРЫЙ («работаю, ещё не знаю»),
+        // а не янтарный (правило Elyor: не мерена/не подтверждена → серая, подтверждена → зелёная). Зелёного
+        // без факта по-прежнему нет (гейт verified не тронут — без регресса Пр.123/144 «зелёный без туннеля»).
+        !verified -> Color(0xFF5C5C5C) to Color(0xFFE8E8E8)          // подключаемся/проверяем — нейтрально-серый
         colorSpeed > 0.0 -> when {
             colorSpeed > 5.0  -> Color(0xFF1B5E20) to Color(0xFFA5D6A7) // зелёный — быстро
             colorSpeed >= 1.0 -> Color(0xFF37474F) to Color(0xFFB0BEC5) // сине-серый — средне
@@ -2178,6 +2179,7 @@ private fun ServerRow(
     name: String,
     isActive: Boolean,
     speedMbps: Double?,
+    pingMs: Int? = null,               // Пр.146: ЭФФЕКТИВНЫЙ пинг (effPing = сессионный ?: сохранённый), как и speed
     caption: String,
     onConnect: () -> Unit,
     onDetails: () -> Unit,
@@ -2209,6 +2211,23 @@ private fun ServerRow(
                 )
                 if (caption.isNotEmpty()) {
                     Text(caption, fontSize = TABLE_FONT_SUB, color = TABLE_GRAY)
+                }
+                // Пр.146: мелкой строкой — ПИНГ и когда он был (давность). Пинг ≠ скорость (под DPI), но
+                // показывает свежесть/живость по последней проверке. «✗» — не отозвался на пинг. Значение —
+                // ЭФФЕКТИВНЫЙ пинг (как и членство в «Живых»), иначе строка спорила бы со списком.
+                if (!paused) {
+                    val pingStr = when {
+                        pingMs == null -> null
+                        pingMs < 0 -> "пинг ✗"
+                        else -> "пинг $pingMs мс"
+                    }
+                    if (pingStr != null) {
+                        val pingAge = speedAgeText(profile.lastTestedTs)
+                        Text(
+                            pingStr + (if (pingAge.isNotEmpty()) " · $pingAge" else ""),
+                            fontSize = TABLE_FONT_SUB, color = TABLE_GRAY, maxLines = 1,
+                        )
+                    }
                 }
             }
             // Глаз-переключатель ДЕЙСТВИЯ (Промпт 91, как кнопка «Не использовать»): иконка = ЧТО СДЕЛАЕТ тап.

@@ -53,6 +53,10 @@ object NetworkMonitor {
     private const val WHITE_EVAL_NORMAL_MS = 30 * 60_000L
     private const val WHITE_EVAL_PROBLEM_MS = 60_000L
 
+    // Пр.146: в фоновом мониторинге обновляем ВСЕ включённые подписки раз в полчаса (не только белые списки) —
+    // чтобы пул серверов не устаревал (мёртвые уходят, новые появляются). Не во время ручного теста/восстановления.
+    private const val ALL_SUBS_REFRESH_MS = 30 * 60_000L
+
     private const val SWITCH_THROTTLE_MS = 60_000L        // в фоне переключаться не чаще раза в 60с
     // Пауза при «НЕТ РАБОЧИХ СЕРВЕРОВ» (интернет есть, но ни один сервер не поднялся): удвоение 10 мин → 4 ч.
     private const val BACKOFF_START_MS = 10 * 60_000L     // первая пауза «нет серверов» — 10 минут
@@ -121,6 +125,7 @@ object NetworkMonitor {
         var lastWhiteRefreshMs = 0L     // Пр.140: когда последний раз обновляли источники белого списка
         var lastEconomyRecheckMs = now()   // Пр.141: когда последний раз проверяли активный сервер в экономии
         var lastLivePruneMs = now()        // Пр.143: когда последний раз пинговали живых для прунинга списка
+        var lastAllSubsRefreshMs = now()   // Пр.146: когда последний раз обновляли ВСЕ подписки в фоне (раз в 30 мин)
         val cycleLock = MonitorAlarm.newWakeLock(app)   // держит CPU на время ОДНОГО цикла (иначе уснёт посреди пробы)
         Log.i(TAG, "monitor loop started")
 
@@ -180,6 +185,15 @@ object NetworkMonitor {
             } else if (cur.whiteListModeActive) {
                 // Фичу выключили в настройках, а режим ещё активен → сбросить в обычный.
                 runCatching { WhiteListDetector.evaluate(app, tunnelForeignOk = false) }
+            }
+            // Пр.146: фоновое обновление ВСЕХ включённых подписок раз в 30 мин (пул не устаревает). Не во время
+            // ручного теста и не в разгар восстановления (там подписки и так обновляются по лестнице).
+            if (now() - lastAllSubsRefreshMs >= ALL_SUBS_REFRESH_MS && !MonitorCoordinator.fullTestRunning &&
+                !MonitorCoordinator.monitorSearchRunning && ph != TunnelHealth.Phase.RECOVERING) {
+                lastAllSubsRefreshMs = now()
+                MonitorLog.event(app, "monitor", "Фон: обновляю все подписки (30 мин)", "")
+                runCatching { SubscriptionManager.refreshAllEnabled(app, cancelled = { MonitorCoordinator.fullTestRunning }, onEach = { _, _ -> }) }
+                    .onFailure { MonitorLog.event(app, "error", "Ошибка фонового обновления подписок", it.message ?: "") }
             }
             // Пр.126.A: отметить факт трафика через туннель (прирост байт с прошлого цикла > порога).
             val bytesNow = TrafficTracker.state.value.let { it.sessionRx + it.sessionTx }
