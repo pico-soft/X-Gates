@@ -104,6 +104,15 @@ object NetworkMonitor {
     // подтверждаем БЫСТРО, тут же в цикле: короткие перепроверки IP с этой паузой; удачная → это была миганка.
     private const val ANTIFLAP_RETRY_MS = 2_500L
 
+    // Пр.150: живость активного = ТРАФИК ИЛИ ПИНГ активного (temp, надёжен) + короткий ЗАМЕР. Флапающий ipify-GET
+    // убран из ВЕРДИКТА (давал ложные «обрывы»: Read timed out на 5с рукопожатии). Пинг — 8с (воздух рукопожатию).
+    private const val PING_LIVENESS_TIMEOUT_MS = 8_000
+    // GRACE: «связь прервалась» объявляем ТОЛЬКО если живость не подтверждалась дольше этого (не по одному провалу).
+    // Глючно-живой сервер (редкий успех в окне) → зелёная держится; реально мёртвый (молчит всё окно) → красная.
+    private const val LIVENESS_GRACE_MS = 90_000L
+    private const val GRACE_RECHECK_MS = 25_000L        // в grace перепроверяем чаще обычного цикла
+    private const val IP_REFRESH_MS = 150_000L          // внешний IP тянем реже — ТОЛЬКО для показа на плашке
+
     // Пр.143: поддержание списка «Живые». Пока активный ОК — периодически пингуем живых (свежий пинг ≥0) и
     // отсеиваем не отозвавшихся (pingMs=−1 → уходит из «Живых»), чтобы список был честным, а быстрый подбор при
     // обрыве брал реально живого. Пинг стоит килобайты (принцип Пр.127), поэтому дёшев; замеры скорости тут НЕ трогаем.
@@ -174,6 +183,9 @@ object NetworkMonitor {
         var lastEconomyRecheckMs = now()   // Пр.141: когда последний раз проверяли активный сервер в экономии
         var lastPingRefreshMs = now()      // Пр.146.Ф2: когда последний раз пинговали ВСЕХ (прунинг + рединдексация)
         var lastAllSubsRefreshMs = now()   // Пр.146: когда последний раз обновляли ВСЕ подписки в фоне (раз в 30 мин)
+        var lastLiveConfirmedMs = now()    // Пр.150: когда живость активного подтверждалась (трафик/пинг+замер) — для grace
+        var graceRecheck = false           // Пр.150: в grace-окне перепроверяем чаще (короче интервал следующего цикла)
+        var lastIpRefreshMs = 0L           // Пр.150: когда последний раз тянули внешний IP для ПОКАЗА на плашке
         val cycleLock = MonitorAlarm.newWakeLock(app)   // держит CPU на время ОДНОГО цикла (иначе уснёт посреди пробы)
         Log.i(TAG, "monitor loop started")
 
@@ -185,11 +197,13 @@ object NetworkMonitor {
             // Прерываемый wake() — событийные триггеры (сеть/экран/передний план) поднимают ДОСРОЧНО.
             val s = SettingsStore.current()
             val ph = TunnelHealth.snapshot().phase
-            val waitMs = when (ph) {
+            val waitMs = when {
                 // Нет интернета — переспрашиваем прямой канал по экспоненте (1→2→…→30 мин), не чаще.
-                TunnelHealth.Phase.NO_INTERNET -> noNetBackoffMs.coerceAtLeast(NO_NET_BACKOFF_START_MS)
+                ph == TunnelHealth.Phase.NO_INTERNET -> noNetBackoffMs.coerceAtLeast(NO_NET_BACKOFF_START_MS)
                 // Восстановление туннеля / нет серверов — чаще (быстрее вернуть связь).
-                TunnelHealth.Phase.RECOVERING, TunnelHealth.Phase.NO_SERVERS -> s.monitorProblemIntervalSec.coerceAtLeast(15) * 1000L
+                ph == TunnelHealth.Phase.RECOVERING || ph == TunnelHealth.Phase.NO_SERVERS -> s.monitorProblemIntervalSec.coerceAtLeast(15) * 1000L
+                // Пр.150: в grace-окне (проверка не прошла, но связь была недавно) перепроверяем ЧАЩЕ.
+                graceRecheck -> GRACE_RECHECK_MS
                 else -> s.connectionCheckIntervalSec.coerceAtLeast(15) * 1000L
             }
             // ── СОН (Промпт 118): отпустить CPU, поставить ТОЧНЫЙ будильник (срабатывает и в Doze), ждать его ИЛИ
@@ -280,11 +294,29 @@ object NetworkMonitor {
             }
             noNetBackoffMs = 0L   // интернет есть — сбросить экспоненту повтора
 
-            // ── СИГНАЛ B (ФАКТ): реальный запрос через SOCKS вернул внешний IP = связь РАБОТАЕТ ──
-            val ip = ExternalIpChecker.fetch()
-            if (ip != null) {
+            // ── Пр.150: ЖИВОСТЬ АКТИВНОГО = ТРАФИК ИЛИ ПИНГ активного сервера (temp, gstatic 204 — надёжен, НЕ
+            // флапает как ipify-GET, давший ложные «обрывы») + КОРОТКИЙ ЗАМЕР (тянет ли трафик). Внешний IP тянем
+            // РЕЖЕ и ТОЛЬКО для показа на плашке — его флап больше не влияет на вердикт «жив/нет». ──
+            val curKey0 = ProxyState.state.value.serverKey
+            val curSrv0 = curKey0?.let { k -> SubscriptionManager.allServers(app).firstOrNull { SubscriptionManager.serverKey(it) == k } }
+            var aliveNow = false
+            if (userTrafficActive()) {
+                aliveNow = true                                   // реальный трафик — сильнейший факт живости
+            } else if (curSrv0 != null) {
+                val pm = ServerTester.ping(app, curSrv0, PING_LIVENESS_TIMEOUT_MS).toInt()   // temp, надёжный сигнал
+                if (pm >= 0) {                                     // отвечает → короткий замер: реально ли тянет трафик
+                    val mbps = ServerSpeedTester.measureSufficiency(app, curSrv0, cur.monitorTunnelThreshold.coerceAtLeast(0.1))
+                    if (mbps > 0.0) aliveNow = true
+                }
+            }
+            if (aliveNow) {
+                lastLiveConfirmedMs = now(); graceRecheck = false
                 onRecovered(app)
-                TunnelHealth.ok(ip, now(), ProxyState.state.value.serverKey ?: "")   // Пр.123.B: подтверждение принадлежит активному серверу
+                // Внешний IP — ТОЛЬКО для показа, реже (флап не влияет на вердикт). Не вышло — держим прежний.
+                val ipShown = if (now() - lastIpRefreshMs >= IP_REFRESH_MS) {
+                    lastIpRefreshMs = now(); ExternalIpChecker.fetch() ?: TunnelHealth.snapshot().ip
+                } else TunnelHealth.snapshot().ip
+                TunnelHealth.ok(ipShown, now(), curKey0 ?: "")   // Пр.123.B: подтверждение принадлежит активному серверу
                 failures = 0; backoffMs = 0; restartedKeySinceOk = null   // Промпт 102: связь ок — сбросить «уже перезапускали»
                 MonitorStatus.update(true, "ок", now(), cycles)
                 // ЖИВАЯ скорость плашки (гибрид): раз в цикл сэмплируем — реальный трафик даёт скорость
@@ -333,56 +365,30 @@ object NetworkMonitor {
                 continue
             }
 
-            // Живой трафик пользователя — тоже ФАКТ работы туннеля (сигнал B мог мигнуть).
-            if (userTrafficActive()) {
-                onRecovered(app)
-                TunnelHealth.ok(TunnelHealth.snapshot().ip, now(), ProxyState.state.value.serverKey ?: "")
-                failures = 0; backoffMs = 0; restartedKeySinceOk = null   // Промпт 102
-                MonitorStatus.update(true, "ок (активный трафик)", now(), cycles)
-                continue
-            }
-
-            // Туннель не подтвердился. ПЕРЕПРОВЕРИТЬ прямой канал: интернет мог пропасть между сигналами A и B
-            // (или мигал). Нет интернета → это НЕ поломка туннеля — ядро НЕ перезапускаем, честно «нет связи».
+            // Живость НЕ подтвердилась этот цикл. Интернет мог уйти → это НЕ вина туннеля (ядро не трогаем).
             if (!directAlive()) {
                 failures = 0
                 noNetBackoffMs = enterNoInternet(app, noNetBackoffMs, cycles)
                 continue
             }
 
-            // ── ИНТЕРНЕТ ЕСТЬ, но туннель не пропускает ──
-            // Пр.143: подтвердить обрыв БЫСТРО, не отпуская цикл на 60с. Короткие перепроверки внешнего IP прямо
-            // здесь (monitorFailuresToVerdict−1 раз с паузой ANTIFLAP_RETRY_MS): любая удачная → это была миганка,
-            // остаёмся; интернет пропал по ходу → это не поломка туннеля. Так «восстановление» стартует за секунды.
-            TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "восстановление…")
-            MonitorStatus.update(true, "проверяю связь…", now(), cycles)
-            var flapRecovered = false
-            var flapLostInternet = false
-            for (n in 1 until cur.monitorFailuresToVerdict.coerceAtLeast(1)) {
-                delay(ANTIFLAP_RETRY_MS)
-                if (!directAlive()) { flapLostInternet = true; break }
-                if (ExternalIpChecker.fetch() != null) { flapRecovered = true; break }
-            }
-            if (flapRecovered) {
-                onRecovered(app)
-                TunnelHealth.ok(TunnelHealth.snapshot().ip, now(), ProxyState.state.value.serverKey ?: "")
-                failures = 0; backoffMs = 0; restartedKeySinceOk = null
-                MonitorStatus.update(true, "ок", now(), cycles)
-                continue
-            }
-            if (flapLostInternet || !directAlive()) {   // интернет ушёл во время перепроверок — не вина туннеля
-                failures = 0
-                noNetBackoffMs = enterNoInternet(app, noNetBackoffMs, cycles)
+            // Пр.150 GRACE: живость была недавно (≤ LIVENESS_GRACE_MS) → НЕ краснеем, держим прежнюю связь, но
+            // перепроверяем ЧАЩЕ (graceRecheck). Один провал (частый Read-timeout на живом сервере) красным НЕ мигает.
+            if (now() - lastLiveConfirmedMs <= LIVENESS_GRACE_MS) {
+                graceRecheck = true
+                MonitorStatus.update(true, "проверяю связь…", now(), cycles)
                 continue
             }
 
-            // Обрыв ПОДТВЕРЖДЁН → восстановление: сперва БЫСТРЫЙ ping-подбор живых, при неудаче — тщательно.
+            // ── GRACE ИСТЁК → РЕАЛЬНЫЙ ОБРЫВ → восстановление (быстрый замер живых → годный; тщательно при неудаче) ──
+            graceRecheck = false
             failures = 0
             recordFlap(ProxyState.state.value.serverKey)   // Пр.146 Ф3: отметить падение активного (для стабильности)
-            MonitorLog.event(app, "monitor", "Связь прервалась — ищу живой сервер", "внешний IP не получен")
+            TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "восстановление…")
+            MonitorLog.event(app, "monitor", "Связь прервалась (тишина ${humanDur(now() - lastLiveConfirmedMs)}) — ищу живой сервер", "ни трафика, ни пинга")
             when (runRecoveryLadder(app, cur)) {
                 SwitchResult.SWITCHED -> {
-                    lastSwitchMs = now(); failures = 0; backoffMs = 0
+                    lastSwitchMs = now(); failures = 0; backoffMs = 0; lastLiveConfirmedMs = now()   // Пр.150: связь восстановлена — сброс grace
                     val ip2 = ExternalIpChecker.fetch()   // подтвердить ФАКТОМ сразу
                     if (ip2 != null) { TunnelHealth.ok(ip2, now(), ProxyState.state.value.serverKey ?: ""); onRecovered(app) }
                     else TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "проверяю после переключения…")
