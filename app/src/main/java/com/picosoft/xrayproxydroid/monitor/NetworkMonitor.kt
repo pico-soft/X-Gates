@@ -72,6 +72,9 @@ object NetworkMonitor {
     // Пр.146 Ф3.5: после переключения (подбор подключает к первому живому) через столько открываем проход
     // «держать лучший» — чтобы вскоре перейти на самый быстрый стабильный, не ждя обычные 6 ч.
     private const val POST_SWITCH_OPTIMIZE_MS = 90_000L
+    // Пр.149: сколько кандидатов быстро ЗАМЕРЯЕМ в поисках ГОДНОГО при восстановлении (остальное — тщательная
+    // лестница). Замер temp-инстансом дороже пинга, поэтому ограничиваем; список отсортирован (быстрые первее).
+    private const val FAST_MEASURE_CAP = 12
     // Ниже этого числа «вероятно живых» кандидатов восстановление СНАЧАЛА делает полный пинг-скан (рединдексация),
     // иначе крутится на 2-3 устаревших. «Самый быстрый» вручную делал ровно это (пинг 146 → нашлось 56).
     private const val REDISCOVER_WHEN_ALIVE_BELOW = 6
@@ -508,11 +511,14 @@ object NetworkMonitor {
     }
 
     /**
-     * Пр.143: БЫСТРОЕ восстановление. Живые (свежий пинг ≥0 ИЛИ известная скорость >0) по УБЫВАНИЮ скорости
-     * (самый быстрый первым). Для каждого: короткий ПИНГ → не отозвался → помечаем мёртвым (уйдёт из «Живых»)
-     * и дальше; ПИНГ ОК → переключаемся и подтверждаем ЗАМЕРОМ АКТИВНОГО (внешний IP). Есть IP → остаёмся
-     * (скорость доберём следом). Нет IP (пинг был, но туннель не пропускает) → следующий по скорости. Никого —
-     * NO_CANDIDATES (наверх, к тщательной процедуре). Свежие пинги персистятся (прунит список «Живых»).
+     * Пр.149 (было Пр.143): БЫСТРОЕ восстановление с БЫСТРЫМ ЗАМЕРОМ СКОРОСТИ (ТЗ Elyor: «начинаем с быстрого
+     * замера, подключаемся к первому ГОДНОМУ, полный топ строим потом»). Живые по убыв. скорости (стабильные
+     * первее, Ф3): короткий ПИНГ (дёшев) → не отозвался → мёртвый, дальше; ПИНГ ОК → БЫСТРЫЙ медианный замер
+     * скорости temp-инстансом (measureSufficiency, активный туннель НЕ дёргаем) → ГОДНЫЙ (≥ monitorTunnelThreshold)
+     * → подключаемся и подтверждаем живым проходом (probePass). Так НЕ садимся на еле-живой сервер (частая причина
+     * скорого повторного обрыва). Годного нет в первых FAST_MEASURE_CAP → подключаем ЛУЧШИЙ «проходит-но-медленный»
+     * (связь любой ценой, Пр.95); совсем никого — NO_CANDIDATES (наверх, к тщательной). Полный точный топ добираем
+     * фоном (Ф3.5 optimize через ~90с). Свежие пинги+замеры персистятся (список «Живые»/топ).
      */
     private suspend fun fastPingSwitch(app: Context, s: AppSettings, startKey: String?): SwitchResult {
         val bl = BlocklistStore.current()
@@ -523,41 +529,62 @@ object NetworkMonitor {
             isUnstable = { isUnstableKey(SubscriptionManager.serverKey(it)) },   // Пр.146 Ф3: нестабильные — в конец
         )
         if (candidates.isEmpty()) return SwitchResult.NO_CANDIDATES
+        val scan = candidates.take(FAST_MEASURE_CAP)
         val pingTimeout = s.pingTimeoutMs.coerceAtMost(1500)
-        val pingUpdates = HashMap<String, Int>()   // свежие пинги → persist (в т.ч. −1 для прунинга «Живых»)
+        val goodThreshold = s.monitorTunnelThreshold.coerceAtLeast(0.1)   // ≥ этого = ГОДНЫЙ → сразу подключаем
+        val pingUpdates = HashMap<String, Int>()      // свежие пинги → persist (в т.ч. −1 для прунинга «Живых»)
         // Наш ключ активного меняется по ходу (мы сами переключаемся). Вмешательство пользователя ловим сравнением
         // ФАКТИЧЕСКОГО serverKey с тем, что ПОСТАВИЛИ мы (ownedKey), а не со стартовым (тот уже не активен).
         var ownedKey = startKey
+        var bestFb: com.picosoft.xrayproxydroid.xray.link.ServerProfile? = null   // проходит, но < порога — запас
+        var bestFbMbps = 0.0
+
+        // Подключиться к [c] и ПОДТВЕРДИТЬ живым проходом (probePass ~4с). true = SWITCHED; false = не подошёл (дальше).
+        suspend fun connectConfirm(c: com.picosoft.xrayproxydroid.xray.link.ServerProfile): Boolean {
+            val key = SubscriptionManager.serverKey(c)
+            val cfg = runCatching { XrayConfigBuilder.build(c) }.getOrNull()
+            if (cfg == null) { MonitorLog.event(app, "error", "Кандидат ${ServerLabels.display(c)}: ошибка конфига", ""); return false }
+            val from = ServerLabels.displayForKey(app, ownedKey)
+            XrayProxyService.start(app, cfg, ServerLabels.full(c), key)
+            ownedKey = key
+            MonitorLog.switch(app, from, ServerLabels.display(c), "монитор", "быстрый замер → подключение")
+            var waited = 0
+            while (waited < 8000 && (!ProxyState.state.value.running || ProxyState.state.value.serverKey != key)) { delay(500); waited += 500 }
+            delay(800)   // дать туннелю осесть
+            if (ProxyState.state.value.serverKey != key) return false   // сменили не мы — обработает верх (aborted)
+            if (ExternalIpChecker.probePass()) { measureAfterConnect(app, c); return true }
+            MonitorLog.event(app, "monitor", "Замерился, но живой проход не подтвердил — дальше", ServerLabels.display(c))
+            return false
+        }
+
         try {
-            for ((i, c) in candidates.withIndex()) {
+            // Пр.149: пинг (дёшев) → БЫСТРЫЙ ЗАМЕР скорости temp-инстансом (не дёргая активный) → ГОДНЫЙ (≥ порога)
+            // → подключаемся. Так не садимся на еле-живой сервер (частая причина скорого повторного обрыва).
+            for ((i, c) in scan.withIndex()) {
                 if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey != ownedKey) return SwitchResult.ABORTED
                 val key = SubscriptionManager.serverKey(c)
-                TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "быстрый подбор: ${i + 1}/${candidates.size}")
-                MonitorStatus.update(true, "быстрый подбор ${i + 1}/${candidates.size} · ${ServerLabels.display(c)}", now(), 0)
+                TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "быстрый замер: ${i + 1}/${scan.size}")
+                MonitorStatus.update(true, "быстрый замер ${i + 1}/${scan.size} · ${ServerLabels.display(c)}", now(), 0)
                 val p = ServerTester.ping(app, c, pingTimeout).toInt()
                 pingUpdates[key] = p
                 if (p < 0) continue   // не отозвался — мимо (из «Живых» уйдёт при persist)
-                val cfg = runCatching { XrayConfigBuilder.build(c) }.getOrNull()
-                if (cfg == null) { MonitorLog.event(app, "error", "Кандидат ${ServerLabels.display(c)}: ошибка конфига", ""); continue }
-                val from = ServerLabels.displayForKey(app, ownedKey)
-                XrayProxyService.start(app, cfg, ServerLabels.full(c), key)
-                ownedKey = key
-                MonitorLog.switch(app, from, ServerLabels.display(c), "монитор", "быстрый: пинг ОК (${p} мс)")
-                var waited = 0
-                while (waited < 8000 && (!ProxyState.state.value.running || ProxyState.state.value.serverKey != key)) { delay(500); waited += 500 }
-                delay(800)   // дать туннелю осесть
-                if (ProxyState.state.value.serverKey != key) return SwitchResult.ABORTED   // сменили не мы
-                // Пр.146.Ф2: подтверждение прохода — КОРОТКОЕ (probePass ~4с, 1 эндпоинт), не полные 3×5с — при
-                // переборе важна скорость (выбор Elyor). Прошло → остаёмся, скорость доберём. Нет → следующий.
-                if (ExternalIpChecker.probePass()) {
-                    measureAfterConnect(app, c)
-                    return SwitchResult.SWITCHED
-                }
-                MonitorLog.event(app, "monitor", "Пинг ОК, но туннель не прошёл — дальше", ServerLabels.display(c))
+                val mbps = ServerSpeedTester.measureSufficiency(app, c, goodThreshold)   // temp-инстанс, быстрый+медианный
+                // Замер грубый (короткое окно) — в реестр НЕ пишем (не портим точный топ); он лишь для РЕШЕНИЯ.
+                // Точную скорость поставит measureAfterConnect (подключённому) и полный топ фоном (Ф3.5).
+                if (mbps >= goodThreshold) {
+                    MonitorStatus.update(true, "подключаюсь к годному · ${ServerLabels.display(c)} ↓${fmt(mbps)}", now(), 0)
+                    if (connectConfirm(c)) return SwitchResult.SWITCHED
+                } else if (mbps > bestFbMbps) { bestFbMbps = mbps; bestFb = c }   // проходит, но медленный — запас
+            }
+            // Годного (≥ порога) не нашли → подключить ЛУЧШИЙ из «проходит, но медленный» (связь любой ценой, Пр.95).
+            val fb = bestFb
+            if (fb != null && bestFbMbps > 0.0 && !MonitorCoordinator.fullTestRunning && ProxyState.state.value.serverKey == ownedKey) {
+                MonitorStatus.update(true, "быстрых нет — держу лучший доступный · ${ServerLabels.display(fb)} ↓${fmt(bestFbMbps)}", now(), 0)
+                if (connectConfirm(fb)) return SwitchResult.SWITCHED
             }
             return SwitchResult.NO_CANDIDATES
         } finally {
-            SubscriptionManager.applyPingResults(app, pingUpdates)   // обновить живость (в т.ч. прунинг не-ответивших)
+            SubscriptionManager.applyPingResults(app, pingUpdates)     // обновить живость (в т.ч. прунинг не-ответивших)
         }
     }
 
