@@ -161,6 +161,7 @@ import com.picosoft.xrayproxydroid.xray.XrayConfig
 import com.picosoft.xrayproxydroid.xray.XrayConfigBuilder
 import com.picosoft.xrayproxydroid.xray.link.Protocol
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
+import com.picosoft.xrayproxydroid.xray.link.normalizeStreamSecurity
 
 class MainActivity : ComponentActivity() {
     companion object {
@@ -841,7 +842,8 @@ private fun displayName(p: ServerProfile, bl: Blocklist): String =
     bl.customName(SubscriptionManager.serverKey(p)) ?: providerName(p)
 
 /** Мелкая подпись: протокол · network · security (для строк с одинаковым именем и для статус-бокса). */
-private fun protoNetSec(p: ServerProfile): String = "${p.protocol} · ${p.network} · ${p.security}"
+private fun protoNetSec(p: ServerProfile): String =
+    "${p.protocol} · ${p.network} · ${normalizeStreamSecurity(p.security)}"
 
 /**
  * Подпись-дискриминатор для ОДИНАКОВЫХ имён (иначе строки визуально неотличимы, выбрать нельзя).
@@ -2419,7 +2421,7 @@ private fun ServerDetailDialog(
                 DetailRow("Протокол", profile.protocol.name)
                 DetailRow("Адрес", "${profile.address}:${profile.port}")
                 DetailRow("Транспорт", profile.network)
-                DetailRow("Безопасность", profile.security)
+                DetailRow("Безопасность", normalizeStreamSecurity(profile.security))
                 DetailRow("SNI", v(profile.sni))
                 DetailRow("Fingerprint", v(profile.fingerprint))
                 DetailRow("Flow", v(profile.flow))

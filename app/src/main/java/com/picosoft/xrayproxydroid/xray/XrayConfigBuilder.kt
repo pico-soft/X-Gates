@@ -2,6 +2,7 @@ package com.picosoft.xrayproxydroid.xray
 
 import com.picosoft.xrayproxydroid.xray.link.Protocol
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
+import com.picosoft.xrayproxydroid.xray.link.normalizeStreamSecurity
 
 /**
  * ServerProfile → configJson (строка для XrayController.startLoop).
@@ -155,11 +156,14 @@ object XrayConfigBuilder {
             "kcp" -> "mkcp"
             else -> p.network
         }
+        // security нормализуем: ядро знает только none/tls/reality; мусор из подписок (false/auto/…)
+        // иначе валит config load «Unknown security» → сервер не поднимается. См. normalizeStreamSecurity.
+        val sec = normalizeStreamSecurity(p.security)
         val parts = mutableListOf<String>()
         parts += """"network": ${j(net)}"""
-        if (p.security != "none") parts += """"security": ${j(p.security)}"""
+        if (sec != "none") parts += """"security": ${j(sec)}"""
 
-        when (p.security) {
+        when (sec) {
             "tls" -> parts += """"tlsSettings": ${tlsBlock(p)}"""
             "reality" -> parts += """"realitySettings": ${realityBlock(p)}"""
         }

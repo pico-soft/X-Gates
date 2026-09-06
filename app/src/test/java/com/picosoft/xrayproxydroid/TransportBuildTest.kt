@@ -2,7 +2,9 @@ package com.picosoft.xrayproxydroid
 
 import com.picosoft.xrayproxydroid.xray.XrayConfigBuilder
 import com.picosoft.xrayproxydroid.xray.link.VlessParser
+import com.picosoft.xrayproxydroid.xray.link.normalizeStreamSecurity
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -86,6 +88,36 @@ class TransportBuildTest {
         assertTrue("kcpSettings", cfg.contains("\"kcpSettings\""))
         assertTrue("header type srtp", cfg.contains("\"type\": \"srtp\""))
         assertTrue("seed", cfg.contains("\"seed\": \"mySeed\""))
+        assertTrue("json balanced", balanced(cfg))
+    }
+
+    // --- фикс: мусор в security (false/auto/…) больше не валит config load «Unknown security» ---
+
+    @Test fun normalizeStreamSecurity_maps_garbage_to_none() {
+        assertEquals("tls", normalizeStreamSecurity("tls"))
+        assertEquals("tls", normalizeStreamSecurity("TLS"))
+        assertEquals("reality", normalizeStreamSecurity("reality"))
+        assertEquals("none", normalizeStreamSecurity("none"))
+        assertEquals("none", normalizeStreamSecurity("false"))  // подписка: «без TLS»
+        assertEquals("none", normalizeStreamSecurity("auto"))   // утёкший шифр vmess
+        assertEquals("none", normalizeStreamSecurity("0"))
+        assertEquals("none", normalizeStreamSecurity(""))
+    }
+
+    @Test fun security_false_builds_as_none_no_crash() {
+        val p = vless("vless://11111111-1111-1111-1111-111111111111@h.example.com:80?type=ws&path=%2Fw&security=false#n")
+        assertEquals("false", p.security)                        // сырьё в профиле НЕ трогаем (serverKey стабилен)
+        val cfg = XrayConfigBuilder.build(p)                     // раньше ядро падало «Unknown security "false"»
+        assertFalse("нет мусорного security", cfg.contains("\"security\": \"false\""))
+        assertFalse("нет tls/reality-блока", cfg.contains("\"tlsSettings\"") || cfg.contains("\"realitySettings\""))
+        assertTrue("ws всё равно собран", cfg.contains("\"wsSettings\""))
+        assertTrue("json balanced", balanced(cfg))
+    }
+
+    @Test fun security_auto_builds_as_none_no_crash() {
+        val p = vless("vless://11111111-1111-1111-1111-111111111111@h.example.com:443?type=tcp&security=auto#n")
+        val cfg = XrayConfigBuilder.build(p)
+        assertFalse("нет мусорного security", cfg.contains("\"security\": \"auto\""))
         assertTrue("json balanced", balanced(cfg))
     }
 

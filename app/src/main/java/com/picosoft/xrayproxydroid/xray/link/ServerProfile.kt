@@ -7,6 +7,20 @@ import kotlinx.serialization.Serializable
 enum class Protocol { VLESS, VMESS, TROJAN, SHADOWSOCKS }
 
 /**
+ * streamSettings.security ядра принимает ТОЛЬКО none/tls/reality (наш билдер поддерживает этот набор).
+ * Подписки иногда присылают мусор в этом поле: `security=false`/`0` (значит «без TLS»), `security=auto`
+ * (утёкший шифр vmess) и т.п. → ядро падало «Unknown security "false"/"auto"», сервер не собирался,
+ * не подключался и не мерился. Всё незнакомое трактуем как отсутствие TLS-слоя ("none").
+ * Единый источник правды для билдера конфига и UI. НЕ меняем сохранённый ServerProfile.security
+ * (иначе сдвинется serverKey → dedup/стоп-лист) — нормализуем только на выходе (в конфиг/на экран).
+ */
+fun normalizeStreamSecurity(raw: String): String = when (raw.trim().lowercase()) {
+    "tls" -> "tls"
+    "reality" -> "reality"
+    else -> "none"
+}
+
+/**
  * Нормализованный сервер: результат разбора одной ссылки, вход для [XrayConfigBuilder].
  * Поля — общий знаменатель ss/vless/vmess/trojan; лишние для конкретного протокола остаются null.
  * @Serializable — сохраняется внутри подписки в subscriptions.json.
