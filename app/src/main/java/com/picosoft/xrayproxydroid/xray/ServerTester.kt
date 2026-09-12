@@ -5,6 +5,9 @@ import com.picosoft.xrayproxydroid.settings.SettingsStore
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.SynchronousQueue
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
@@ -19,8 +22,22 @@ object ServerTester {
     const val GSTATIC_204 = "https://www.gstatic.com/generate_204"
 
     /** Пул для МЯГКОГО таймаута: libv2ray.measureOutboundDelay сам таймаут не принимает, поэтому
-     *  ждём результат с Future.get(timeout); при просрочке — сервер считаем мёртвым. */
-    private val jniPool = Executors.newCachedThreadPool()
+     *  ждём результат с Future.get(timeout); при просрочке — сервер считаем мёртвым.
+     *
+     *  ⚠️ ГРАБЛЯ (полевой случай, Huawei CTR-L21, мёртвый пул): future.cancel(true) НЕ останавливает уже идущий
+     *  нативный measureOutboundDelay — он держит поток, пока не погаснет по СВОЕМУ внутреннему таймауту (дольше
+     *  нашего мягкого). На ПОЛНОСТЬЮ мёртвом пуле КАЖДЫЙ пинг упирается в таймаут → безлимитный cachedThreadPool
+     *  за ~20с порождал десятки залипших потоков → OutOfMemoryError при создании следующего потока → батч клинил
+     *  («Этап 1: пинг 33/140» намертво; Стоп не спасал; фоновый refreshAllPings так же зависал). ФИКС: пул
+     *  ОГРАНИЧЕН [MAX_CONCURRENT_MEASURES]. При насыщении submit() бросает RejectedExecutionException → пинг
+     *  вернёт -1 (сервер мёртв), число потоков не взрывается. Залипшие потоки сами гаснут (нативный таймаут) и
+     *  освобождаются — пул самовосстанавливается. corePoolSize=0 + keepAlive 30с: в простое потоков нет. */
+    private const val MAX_CONCURRENT_MEASURES = 24
+    private val jniPool: ExecutorService = ThreadPoolExecutor(
+        0, MAX_CONCURRENT_MEASURES,
+        30L, TimeUnit.SECONDS,
+        SynchronousQueue(),
+    )
 
     /**
      * Один замер: profile → config → real ping. Возвращает мс (≥0) или -1 (мёртвый/таймаут/ошибка).
@@ -32,13 +49,18 @@ object ServerTester {
         } catch (e: Exception) {
             return -1L   // неподдерживаемый транспорт и т.п.
         }
-        val future = jniPool.submit(Callable { XrayController.measureOutboundDelay(context, cfg, GSTATIC_204) })
+        // submit() ВНУТРИ try: на насыщенном/исчерпанном пуле он бросает RejectedExecutionException (Exception)
+        // или OutOfMemoryError (Error) — ловим ОБА через Throwable и считаем сервер мёртвым, а НЕ роняем задачу
+        // пинга (иначе прогресс батча залипал — см. testAll).
         return try {
-            future.get(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
-        } catch (e: TimeoutException) {
-            future.cancel(true)
-            -1L
-        } catch (e: Exception) {
+            val future = jniPool.submit(Callable { XrayController.measureOutboundDelay(context, cfg, GSTATIC_204) })
+            try {
+                future.get(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+            } catch (e: TimeoutException) {
+                future.cancel(true)   // прерываем ОЖИДАНИЕ; нативный вызов сам погаснет по своему таймауту
+                -1L
+            }
+        } catch (t: Throwable) {
             -1L
         }
     }
@@ -72,14 +94,20 @@ object ServerTester {
 
         for (p in servers) {
             pool.execute {
+                if (cancelled.get()) return@execute
+                var ms = -1L
                 try {
-                    if (cancelled.get()) return@execute
-                    val ms = ping(appCtx, p)
-                    if (cancelled.get()) return@execute
-                    onResult(p, ms)
-                    onProgress(done.incrementAndGet(), total)
-                } catch (e: Exception) {
-                    android.util.Log.w("ServerTester", "задача пинга упала (проглочено): ${e.message}")
+                    ms = ping(appCtx, p)   // ping() уже не бросает (Throwable → -1), но подстрахуемся
+                } catch (t: Throwable) {
+                    android.util.Log.w("ServerTester", "задача пинга упала (проглочено): ${t.message}")
+                } finally {
+                    // ПРОГРЕСС ДВИГАЕМ ВСЕГДА (в finally): даже если пинг упал/пул отказал — счётчик не залипает,
+                    // батч доходит до конца и onFinish срабатывает, «Стоп» действует. Полевой баг «пинг 33/140
+                    // навсегда» был именно из-за пропуска onProgress на исключении.
+                    if (!cancelled.get()) {
+                        runCatching { onResult(p, ms) }
+                        onProgress(done.incrementAndGet(), total)
+                    }
                 }
             }
         }
