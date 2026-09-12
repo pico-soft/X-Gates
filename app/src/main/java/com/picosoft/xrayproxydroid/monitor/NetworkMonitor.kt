@@ -199,6 +199,7 @@ object NetworkMonitor {
         var graceRecheck = false           // Пр.150: в grace-окне перепроверяем чаще (короче интервал следующего цикла)
         var lastLivenessMeasureMs = 0L     // адаптивный замер: когда последний раз мерили СКОРОСТЬ активного (0 = ещё ни разу → мерим на первом цикле)
         var lastActivePingMs = -1          // адаптивный замер: пинг активного в прошлый раз (для детекта «скачка»)
+        var lastFullCycleMs = 0L           // дебаунс паразитных пробуждений: когда последний раз делали ДОРОГУЮ работу цикла (пинг/IP/замер)
         var lastIpRefreshMs = 0L           // Пр.150: когда последний раз тянули внешний IP для ПОКАЗА на плашке
         val cycleLock = MonitorAlarm.newWakeLock(app)   // держит CPU на время ОДНОГО цикла (иначе уснёт посреди пробы)
         Log.i(TAG, "monitor loop started")
@@ -246,6 +247,20 @@ object NetworkMonitor {
             }
             cycles++
             Log.i(TAG, "cycle $cycles (exactAlarm=$lastExactAlarm, wait=${waitMs / 1000}s, phase=$ph)")
+
+            // ── ДЕБАУНС ПАРАЗИТНЫХ ПРОБУЖДЕНИЙ (батарея, ТЗ Elyor) ──
+            // Монитор будят ЧАСТО (сеть/AOD/уведомление/keepalive), а awaitWake возвращается досрочно → раньше на
+            // КАЖДОЕ пробуждение шла дорогая работа: пинг живости (temp-инстанс Xray ~8с) + IP-фетч + delay(1.2с)
+            // back-to-back (полевой факт на Fold: цикл ~каждые 12с в фоне). Q2 «300с при экране off» этим перебивался.
+            // При ЗДОРОВОЙ связи (phase=OK, не grace) выполняем дорогой цикл НЕ ЧАЩЕ эффективного интервала: экран
+            // выключен → 300с, включён → connectionCheckIntervalSec. Дешёвое пробуждение просто спит дальше. Проблемные
+            // фазы (нет интернета/восстановление/нет серверов) и grace НЕ дебаунсим — реагируем немедленно.
+            if (ph == TunnelHealth.Phase.OK && !graceRecheck) {
+                val everyMs = if (!screenInteractive(app)) SCREEN_OFF_IDLE_MS
+                              else cur.connectionCheckIntervalSec.coerceAtLeast(15) * 1000L
+                if (now() - lastFullCycleMs < everyMs) continue   // паразитное пробуждение — не тратим пинг/IP/батарею
+            }
+            lastFullCycleMs = now()
 
             // Пр.140: режим белых списков — авто-обновление источников (раз в полчаса) + оценка сети. Оценка чаще
             // при проблемах (быстрее распознать «только белый список»), иначе раз в полчаса. Пинг/живость это НЕ

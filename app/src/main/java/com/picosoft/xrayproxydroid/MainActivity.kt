@@ -1307,10 +1307,15 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
     }
     // Промпт 95: пока экран «Главная» открыт И прокси активен — ПЕРИОДИЧЕСКИ подтверждаем связь ФАКТОМ
     // (внешний IP через SOCKS), чтобы статус НЕ протухал (даже когда монитор занят полным тестом). ~12с.
+    // ⚠️ БАТАРЕЯ/ТРАФИК (полевой факт на Fold): Compose держит этот LaunchedEffect живым и когда приложение
+    // СВЁРНУТО/экран выключен (activity stopped, не destroyed) → refreshIp() каждые 12с тянул ipify через туннель
+    // И будил монитор (wake) КРУГЛОСУТОЧНО = лишняя батарея и трафик. Освежаем IP ТОЛЬКО когда пользователь
+    // реально смотрит (appInForeground: onResume/onPause). В фоне живость держит сам монитор — плашку освежать
+    // незачем, её никто не видит.
     LaunchedEffect(proxy.running) {
         while (proxy.running) {
             kotlinx.coroutines.delay(12_000)
-            if (ProxyState.state.value.running && !checking) refreshIp()
+            if (UpdateFlowController.appInForeground && ProxyState.state.value.running && !checking) refreshIp()
         }
     }
     // Промпт 95.D/123.C: «зелёный» — ТОЛЬКО когда запрос ФАКТИЧЕСКИ прошёл через туннель ИМЕННО активного
