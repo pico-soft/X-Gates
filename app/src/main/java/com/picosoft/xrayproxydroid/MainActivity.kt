@@ -1491,6 +1491,8 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                     statusLine = healthLine,
                     onRefreshIp = { refreshIp() },
                     serverName = activeServer?.let { displayName(it, blocklist) } ?: proxy.label,
+                    // номер активного в списке «Живые» (та же нумерация, что в строках списка) — видно, к какому подключён
+                    serverNumber = alive.indexOfFirst { proxy.running && proxy.serverKey == SubscriptionManager.serverKey(it) } + 1,
                     subtitle = activeServer?.let { protoNetSec(it) },
                     speedMbps = activeServer?.let { effSpeed(it) },
                     pingMs = activeServer?.let { effPing(it) },
@@ -1604,7 +1606,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
             Box(Modifier.fillMaxWidth().background(liveBg).then(rowMod)) {
                 ServerRow(
                     profile = p, name = displayName(p, blocklist), isActive = isActive,
-                    speedMbps = effSpeed(p), pingMs = effPing(p), caption = discriminators[SubscriptionManager.serverKey(p)] ?: "",
+                    speedMbps = effSpeed(p), number = index + 1, pingMs = effPing(p), caption = discriminators[SubscriptionManager.serverKey(p)] ?: "",
                     onConnect = { connectServer(p, "ручной выбор") },
                     onDetails = { detailProfile = p; remeasureStatus = "" },
                     showUseToggle = true,
@@ -1795,6 +1797,7 @@ private fun StatusBox(
     statusLine: String,
     onRefreshIp: () -> Unit,
     serverName: String?,
+    serverNumber: Int = 0,             // номер активного сервера в списке «Живые» (совпадает с нумерацией списка); 0 = нет
     subtitle: String?,
     speedMbps: Double?,
     pingMs: Int? = null,               // Пр.146: пинг активного — показываем в плашке (полезно и в восстановлении)
@@ -1852,7 +1855,7 @@ private fun StatusBox(
         verticalArrangement = Arrangement.spacedBy(3.dp),
     ) {
         Text(
-            if (running) "● ${serverName ?: "Активен"}" else "○ Не запущен",
+            if (running) "● " + (if (serverNumber > 0) "№$serverNumber · " else "") + (serverName ?: "Активен") else "○ Не запущен",
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.Bold,
             color = fg,
@@ -2231,6 +2234,7 @@ private fun ServerRow(
     name: String,
     isActive: Boolean,
     speedMbps: Double?,
+    number: Int = 0,                   // номер в списке «Живые» (1-based); 0 = не показывать. Виден и в плашке.
     pingMs: Int? = null,               // Пр.146: ЭФФЕКТИВНЫЙ пинг (effPing = сессионный ?: сохранённый), как и speed
     caption: String,
     onConnect: () -> Unit,
@@ -2256,7 +2260,7 @@ private fun ServerRow(
             // Имя полностью (перенос при длинном) + мелко caption под ним. Исключённый — приглушён (без подписей).
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    (if (isActive) "● " else "") + name,
+                    (if (isActive) "● " else "") + (if (number > 0) "$number. " else "") + name,
                     fontSize = TABLE_FONT,
                     fontWeight = if (isActive) FontWeight.Bold else FontWeight.Normal,
                     color = if (paused) TABLE_GRAY else Color.Unspecified,

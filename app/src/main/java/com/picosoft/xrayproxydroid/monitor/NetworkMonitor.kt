@@ -113,6 +113,18 @@ object NetworkMonitor {
     private const val GRACE_RECHECK_MS = 25_000L        // в grace перепроверяем чаще обычного цикла
     private const val IP_REFRESH_MS = 150_000L          // внешний IP тянем реже — ТОЛЬКО для показа на плашке
 
+    // ── АДАПТИВНЫЙ ЗАМЕР ЖИВОСТИ (снижение трафика/батареи; ТЗ Elyor поверх Пр.150) ──
+    // Пр.150 делал ЗАМЕР СКОРОСТИ активного КАЖДЫЙ цикл (60с) в простое → ~1000-1400 замеров/сут ≈ 0.3-1 ГБ/сут +
+    // радио каждую минуту = батарея. Живость активного оставляем на ПИНГЕ (дёшев, КБ, надёжен через свежий сокет —
+    // Пр.144). ЗАМЕР СКОРОСТИ — РЕДКО и АДАПТИВНО: пинг стабилен → раз в STABLE; пинг заметно скакнул (признак смены
+    // качества канала) → раз в UNSTABLE (чаще). Реальный трафик пользователя по-прежнему даёт скорость бесплатно.
+    private const val LIVENESS_MEASURE_STABLE_MS = 30 * 60_000L   // пинг стабилен → замер раз в 30 мин
+    private const val LIVENESS_MEASURE_UNSTABLE_MS = 3 * 60_000L  // пинг скакнул → замер раз в 3 мин
+    private const val PING_JITTER_ABS_MS = 80         // абсолютный порог «скачка» пинга, мс
+    private const val PING_JITTER_FRAC_PCT = 60       // ИЛИ относительный: изменение > 60% прежнего
+    // Q2 Elyor: при ВЫКЛЮЧЕННОМ экране и здоровой связи будим реже (было 60с) — меньше пробуждений = батарея.
+    private const val SCREEN_OFF_IDLE_MS = 300_000L   // 5 мин
+
     // Пр.143: поддержание списка «Живые». Пока активный ОК — периодически пингуем живых (свежий пинг ≥0) и
     // отсеиваем не отозвавшихся (pingMs=−1 → уходит из «Живых»), чтобы список был честным, а быстрый подбор при
     // обрыве брал реально живого. Пинг стоит килобайты (принцип Пр.127), поэтому дёшев; замеры скорости тут НЕ трогаем.
@@ -185,6 +197,8 @@ object NetworkMonitor {
         var lastAllSubsRefreshMs = now()   // Пр.146: когда последний раз обновляли ВСЕ подписки в фоне (раз в 30 мин)
         var lastLiveConfirmedMs = now()    // Пр.150: когда живость активного подтверждалась (трафик/пинг+замер) — для grace
         var graceRecheck = false           // Пр.150: в grace-окне перепроверяем чаще (короче интервал следующего цикла)
+        var lastLivenessMeasureMs = 0L     // адаптивный замер: когда последний раз мерили СКОРОСТЬ активного (0 = ещё ни разу → мерим на первом цикле)
+        var lastActivePingMs = -1          // адаптивный замер: пинг активного в прошлый раз (для детекта «скачка»)
         var lastIpRefreshMs = 0L           // Пр.150: когда последний раз тянули внешний IP для ПОКАЗА на плашке
         val cycleLock = MonitorAlarm.newWakeLock(app)   // держит CPU на время ОДНОГО цикла (иначе уснёт посреди пробы)
         Log.i(TAG, "monitor loop started")
@@ -204,7 +218,12 @@ object NetworkMonitor {
                 ph == TunnelHealth.Phase.RECOVERING || ph == TunnelHealth.Phase.NO_SERVERS -> s.monitorProblemIntervalSec.coerceAtLeast(15) * 1000L
                 // Пр.150: в grace-окне (проверка не прошла, но связь была недавно) перепроверяем ЧАЩЕ.
                 graceRecheck -> GRACE_RECHECK_MS
-                else -> s.connectionCheckIntervalSec.coerceAtLeast(15) * 1000L
+                else -> {
+                    // Q2 Elyor: здоровая связь + экран ВЫКЛЮЧЕН → будим реже (батарея). Экран включён (юзер смотрит
+                    // на плашку) или проблема → обычный интервал. Пинг-живость при этом всё равно надёжна.
+                    val base = s.connectionCheckIntervalSec.coerceAtLeast(15) * 1000L
+                    if (!screenInteractive(app)) maxOf(base, SCREEN_OFF_IDLE_MS) else base
+                }
             }
             // ── СОН (Промпт 118): отпустить CPU, поставить ТОЧНЫЙ будильник (срабатывает и в Doze), ждать его ИЛИ
             // событие (экран/сеть). Корутинный awaitWake здесь — лишь ЗАПАСНОЙ предел: в Doze он растягивается
@@ -294,9 +313,9 @@ object NetworkMonitor {
             }
             noNetBackoffMs = 0L   // интернет есть — сбросить экспоненту повтора
 
-            // ── Пр.150: ЖИВОСТЬ АКТИВНОГО = ТРАФИК ИЛИ ПИНГ активного сервера (temp, gstatic 204 — надёжен, НЕ
-            // флапает как ipify-GET, давший ложные «обрывы») + КОРОТКИЙ ЗАМЕР (тянет ли трафик). Внешний IP тянем
-            // РЕЖЕ и ТОЛЬКО для показа на плашке — его флап больше не влияет на вердикт «жив/нет». ──
+            // ── ЖИВОСТЬ АКТИВНОГО = ТРАФИК ИЛИ ПИНГ (temp, gstatic 204 — надёжен, НЕ флапает как ipify-GET). ЗАМЕР
+            // СКОРОСТИ вынесен из живости и делается РЕДКО/АДАПТИВНО (ТЗ Elyor поверх Пр.150 — тот мерил каждый цикл,
+            // это был сток трафика/батареи). Живость держит ПИНГ (дёшев). Внешний IP тянем реже, только для плашки. ──
             val curKey0 = ProxyState.state.value.serverKey
             val curSrv0 = curKey0?.let { k -> SubscriptionManager.allServers(app).firstOrNull { SubscriptionManager.serverKey(it) == k } }
             var aliveNow = false
@@ -304,9 +323,35 @@ object NetworkMonitor {
                 aliveNow = true                                   // реальный трафик — сильнейший факт живости
             } else if (curSrv0 != null) {
                 val pm = ServerTester.ping(app, curSrv0, PING_LIVENESS_TIMEOUT_MS).toInt()   // temp, надёжный сигнал
-                if (pm >= 0) {                                     // отвечает → короткий замер: реально ли тянет трафик
-                    val mbps = ServerSpeedTester.measureSufficiency(app, curSrv0, cur.monitorTunnelThreshold.coerceAtLeast(0.1))
-                    if (mbps > 0.0) aliveNow = true
+                if (pm >= 0) {
+                    aliveNow = true                               // ПИНГ отвечает → живо (замер скорости — отдельно, ниже)
+                    // Адаптивный интервал замера: пинг заметно скакнул (сменилось качество канала) → мерим ЧАЩЕ.
+                    val prev = lastActivePingMs
+                    val jumped = prev >= 0 &&
+                        kotlin.math.abs(pm - prev) > maxOf(PING_JITTER_ABS_MS, prev * PING_JITTER_FRAC_PCT / 100)
+                    lastActivePingMs = pm
+                    val measureDue = now() - lastLivenessMeasureMs >=
+                        (if (jumped) LIVENESS_MEASURE_UNSTABLE_MS else LIVENESS_MEASURE_STABLE_MS)
+                    if (measureDue && !MonitorCoordinator.monitorSearchRunning && !MonitorCoordinator.fullTestRunning) {
+                        // Порог замера = порог деградации: короткий замер (бюджет под этот порог) уверенно отвечает на
+                        // вопрос «активный ниже порога?». Быстрый сервер подтвердит порог за доли МБ и остановится.
+                        val mbps = ServerSpeedTester.measureSufficiency(app, curSrv0, cur.degradationMinMbps.coerceAtLeast(0.1))
+                        if (mbps < cur.minUsableMbps) {
+                            // пинг есть, но трафик реально НЕ идёт (полу-мёртвый) → в восстановление. Таймер НЕ двигаем:
+                            // следующий цикл перемерит; устойчивый провал → grace истечёт → лестница сменит сервер.
+                            aliveNow = false
+                        } else {
+                            lastLivenessMeasureMs = now()         // успешный замер — держим редкий интервал
+                            // АПГРЕЙД С МЕДЛЕННОГО (Q3 Elyor): активный ниже порога деградации → зафиксировать низкую
+                            // скорость в «Живых» И шагнуть на явно более быстрого кандидата (чинит «0.4 при топовом 47»,
+                            // живое не рвём — см. maybeStep…). Здоровый (≥ порога) НЕ перезаписываем: короткий замер шумный,
+                            // не портим точную сохранённую скорость из полного замера.
+                            if (mbps in 0.0..cur.degradationMinMbps) {
+                                SubscriptionManager.applySpeedResults(app, mapOf(curKey0!! to mbps))
+                                maybeStepFromDegraded(app, cur, curKey0!!, mbps)
+                            }
+                        }
+                    }
                 }
             }
             if (aliveNow) {
