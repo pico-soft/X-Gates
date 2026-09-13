@@ -18,6 +18,9 @@ object EconomyNet {
     // каждое сетевое событие (сигнал/капы). null — ещё не оценивали (первая оценка после регистрации колбэка).
     @Volatile private var lastMobile: Boolean? = null
 
+    /** Последний известный тип сети: true — мобильная, false — Wi-Fi/Ethernet/неизвестно. Для фонового рейтинга (шнур/сеть). */
+    val lastKnownMobile: Boolean get() = lastMobile ?: false
+
     private fun mobileFromCaps(caps: NetworkCapabilities?): Boolean {
         if (caps == null) return false
         // Wi-Fi/Ethernet — «немобильная» (даже если вдруг есть и cellular). Мобильная = только сотовая.
