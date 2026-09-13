@@ -283,6 +283,18 @@ object FullTestRunner {
                 var selectable = 0
                 var measured = 0
                 val goodOnes = ArrayList<ServerProfile>()   // Пр.151: годные (Этап 2) → полный замер топа на Этапе 3
+                // ТЗ Elyor (в): «годный» = скорость ≥ ПОРОГА ДОСТАТОЧНОСТИ; набираем [fastTarget] таких и стоп (не мерим
+                // все подряд). ФИКСАЦИЯ: сервер со свежим сохранённым ≥ порога НЕ перемеряем (экономия трафика/времени).
+                val threshold = s.sufficientMbps.coerceAtLeast(0.1)
+                val fastTarget = s.fastTopTarget.coerceAtLeast(1)
+                // ФИКСАЦИЯ: ключи серверов со СВЕЖИМ сохранённым замером ≥ порога (recentWorkingServers парсит speedTestedTs).
+                val freshHours = (s.topFreshSec.coerceAtLeast(3600) / 3600).coerceAtLeast(1)
+                val lockedInKeys = runCatching {
+                    SubscriptionManager.recentWorkingServers(appCtx, freshHours)
+                        .filter { (it.speedMbps ?: 0.0) >= threshold }
+                        .map { key(it) }.toSet()
+                }.getOrDefault(emptySet())
+                var goodAbove = 0                            // сколько набрали ≥ порога (для остановки на fastTarget)
                 // Промпт 93.C: фон не должен ронять процесс — любое исключение фазы завершает тест штатно (finishOnce).
                 try {
                 // ПРИОРИТЕТ АКТИВНОГО ТУННЕЛЯ (обратная связь): если есть активное соединение — мерим ЕГО ПЕРВЫМ,
@@ -339,11 +351,14 @@ object FullTestRunner {
                         onPhase("Бюджет теста (${s.fullTestBudgetSec / 60} мин) исчерпан на $measured/${candidates.size} — стоп")
                         break
                     }
-                    // Пр.151 Этап 2 — БЫСТРЫЙ замер (measureSufficiency, стоп на пороге достаточности): быстро находим
-                    // ГОДНОГО и подключаемся. Точную скорость (кто самый быстрый) добьём на Этапе 3 полным замером топа.
-                    val mbps = ServerSpeedTester.measureSufficiency(appCtx, p, s.sufficientMbps.coerceAtLeast(0.1))
+                    // в (ТЗ Elyor): ФИКСАЦИЯ — сервер со СВЕЖИМ сохранённым замером ≥ порога НЕ перемеряем (не тратим
+                    // трафик; «≥8 Мбит/с не нуждается в рейтинговании, пока жив»). Иначе — быстрый замер до порога.
+                    val savedFast = key(p) in lockedInKeys
+                    val mbps = if (savedFast) (p.speedMbps ?: 0.0)
+                               else ServerSpeedTester.measureSufficiency(appCtx, p, threshold)
                     if (cancelled.get()) break   // Промпт 103: сторож/отмена сработали во время замера — не действуем по нему
                     measured++
+                    if (mbps >= threshold) goodAbove++   // набор ≥ порога (для остановки на fastTarget)
                     onSpeedResult(p, mbps)   // результат сохраняем всегда
                     if (ServerFilter.isSelectable(p, mbps, s, blocklist)) {
                         selectable++
@@ -378,10 +393,11 @@ object FullTestRunner {
                     beat()   // Промпт 103: шаг прогресса — «пульс» для сторожа
                     // Батч-остановка: набрали минимум живых на границе батча — дальше не мерим (экономия трафика).
                     if (minAlive > 0 && selectable >= minAlive && measured % batch == 0) break
-                    // Пр.151: Этап 2 БЫСТРЫЙ — как только ПОДКЛЮЧИЛИСЬ и набрали достаточно годных для точного топа,
-                    // дальше НЕ мерим все подряд (иначе «Самый быстрый» тянется минутами на десятках серверов).
-                    if (connected != null && goodOnes.size >= FAST_SCAN_ENOUGH) {
-                        onPhase("Годных достаточно (${goodOnes.size}) — перехожу к точному замеру топа")
+                    // в (ТЗ Elyor): подключились И набрали fastTarget серверов ≥ порога → дальше НЕ мерим (иначе тест
+                    // тянется минутами на сотнях серверов). Если быстрых во всём пуле меньше — дойдём до конца/бюджета и
+                    // добьём топ лучшими из измеренных (Этап 3), даже если они ниже порога.
+                    if (connected != null && goodAbove >= fastTarget) {
+                        onPhase("Набрано $goodAbove серверов ≥ ${fmt(threshold)} Мбит/с — перехожу к точному замеру топа")
                         break
                     }
                 }
@@ -396,9 +412,12 @@ object FullTestRunner {
                     for (p in topK) {
                         if (cancelled.get()) break
                         if ((System.nanoTime() - phaseStart) / 1_000_000 > budgetMs) break
-                        val full = ServerSpeedTester.measureSpeed(appCtx, p)   // полный замер (точная скорость)
+                        // в: ФИКСАЦИЯ и здесь — свежий сохранённый ≥ порога не перемеряем точным замером (экономия).
+                        val savedFast3 = key(p) in lockedInKeys
+                        val full = if (savedFast3) (p.speedMbps ?: 0.0)
+                                   else ServerSpeedTester.measureSpeed(appCtx, p)   // полный замер (точная скорость)
                         if (cancelled.get()) break
-                        onSpeedResult(p, full)
+                        if (!savedFast3) onSpeedResult(p, full)
                         if (full > bestSpeed) { bestSpeed = full; best = p; hbBest.set(p) }
                         beat()
                     }
@@ -425,7 +444,7 @@ object FullTestRunner {
         pingHandle = ServerTester.testAll(
             context = appCtx,
             servers = testable,
-            concurrency = 8,
+            concurrency = 16,   // в (ТЗ Elyor): «пинг всех» быстрее — больше параллелизма (пинг дёшев; jniPool cap 24)
             onResult = { p, ms ->
                 val v = ms.toInt()
                 pingByKey[key(p)] = v

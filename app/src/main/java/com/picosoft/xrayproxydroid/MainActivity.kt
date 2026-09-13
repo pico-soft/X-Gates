@@ -936,6 +936,9 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
 
     var fullTesting by remember { mutableStateOf(false) }  // меняется только на старт/стоп (не на тик)
     var fullHandle by remember { mutableStateOf<FullTestRunner.Handle?>(null) }
+    // а (ТЗ Elyor): полный тест держит короткий CPU-wakelock, чтобы Doze не заморозил его потоки при сворачивании
+    // (иначе тест «замерзал» на середине — жалоба «висел 6 часов на пинге 122»). Держатель на 1 элемент (не state).
+    val fullTestWakeLock = remember { arrayOfNulls<android.os.PowerManager.WakeLock>(1) }
 
     // Кнопка «Проверить» (зелёный блок): замер текущего туннеля → при падении ниже порога перебор списка
     // Живых до первого ≥ порога → иначе полный тест с обновлением подписок. Статус — строкой в StatusBox.
@@ -1098,6 +1101,12 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
         if (all.isEmpty()) { subStatus = "нет серверов"; return }
         fullTesting = true
         MonitorCoordinator.fullTestRunning = true   // монитор молчит, пока идёт ручной тест
+        // а: удержать CPU на время теста (жёсткий потолок 5 мин — авто-снятие, если onDone не придёт) → тест не
+        // замерзает в фоне. Снимаем в onDone/onCancelFull. Не reference-counted; лишний release безопасен (runCatching).
+        runCatching {
+            fullTestWakeLock[0]?.let { if (it.isHeld) it.release() }
+            fullTestWakeLock[0] = com.picosoft.xrayproxydroid.monitor.MonitorAlarm.newWakeLock(context)?.also { it.acquire(5 * 60_000L) }
+        }
         // Промпт 93.E: как прервать тест извне (операции с источниками) — отмена handle → onDone снимет флаги.
         MonitorCoordinator.fullTestCancel = { fullHandle?.cancel() }
         MonitorCoordinator.wake()                   // прервать возможный перебор/паузу монитора
@@ -1126,6 +1135,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                         SubscriptionManager.applySpeedResults(context, sSnap) // персист скорости
                         activity.runOnUiThread {
                             fullTesting = false; fullHandle = null
+                            runCatching { fullTestWakeLock[0]?.let { if (it.isHeld) it.release() }; fullTestWakeLock[0] = null }   // а: снять wakelock
                             MonitorCoordinator.fullTestRunning = false   // тест закончился — монитор снова может работать
                             MonitorCoordinator.fullTestCancel = null; CrashContext.set("простой")
                             // «Готово» БЕЗ числа скорости: единый источник правды по скорости — ЖИВАЯ плашка
@@ -1168,6 +1178,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
 
     fun onCancelFull() {
         fullHandle?.cancel(); fullHandle = null   // Промпт 123.D: cancel() теперь рвёт и ИДУЩИЙ замер (abortCurrentMeasure)
+        runCatching { fullTestWakeLock[0]?.let { if (it.isHeld) it.release() }; fullTestWakeLock[0] = null }   // а: снять wakelock
         fullTesting = false
         MonitorCoordinator.fullTestRunning = false   // отмена теста — монитор снова может работать
         MonitorCoordinator.fullTestCancel = null
@@ -1317,6 +1328,11 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
             kotlinx.coroutines.delay(12_000)
             if (UpdateFlowController.appInForeground && ProxyState.state.value.running && !checking) refreshIp()
         }
+    }
+    // #2 (жалоба Elyor «серая плашка»): при ВОЗВРАЩЕНИИ в приложение (resumeTick) сразу освежаем IP — иначе после
+    // фона подтверждение связи устарело и плашка серела бы до ~12с (следующей периодической пробы). Теперь зелёная сразу.
+    LaunchedEffect(resumeTick) {
+        if (proxy.running && !checking) refreshIp()
     }
     // Промпт 95.D/123.C: «зелёный» — ТОЛЬКО когда запрос ФАКТИЧЕСКИ прошёл через туннель ИМЕННО активного
     // сервера И подтверждение не старше HEALTH_FRESH_MS. Сменился сервер / устарело подтверждение → не зелёный,
@@ -2791,9 +2807,12 @@ private fun WordChip(word: String, count: Int, onRemove: () -> Unit) {
 // Формат времени для журнала монитора (только main-поток композиции → один экземпляр безопасен).
 private val monitorTimeFmt = SimpleDateFormat("dd.MM HH:mm:ss", Locale.getDefault())
 
-// Промпт 123.C: «зелёный» = подтверждение связи не старше этого. Монитор/12с-цикл подтверждают ~раз в 60с;
-// 3 мин = несколько пропущенных подтверждений → устарело, цвет меняем (даже если ничего не «сломалось»).
-private const val HEALTH_FRESH_MS = 180_000L
+// Промпт 123.C: «зелёный» = подтверждение связи не старше этого. Окно должно ПЕРЕКРЫВАТЬ фоновый цикл монитора
+// (при выключенном экране он теперь 300с — SCREEN_OFF_IDLE_MS), иначе между проверками подтверждение протухало и
+// плашка мигала серым (жалоба Elyor «чаще серая, чем зелёная»). 330с > 300с → серым между циклами не мигает; на
+// переднем плане refreshIp каждые 12с и мгновенно при возврате (resumeTick) держат зелёным. Реальный обрыв ловит
+// монитор (фаза RECOVERING → красная плашка) независимо от этого окна — «зелёный при мёртвом» не удлиняется.
+private const val HEALTH_FRESH_MS = 330_000L
 
 // Пр.127.B: оценка байт на ОДНУ проверку живости (внешний IP через SOCKS + keepalive ядра). Для расчётной строки
 // «расход проверок за месяц». КАЛИБРОВАНО замером D (Пр.127): 10 мин простоя = 28.6 КБ на 10 циклов ≈ 2.9 КБ/цикл.
@@ -2966,6 +2985,11 @@ private fun OptimizeChecksBlock(settings: AppSettings, onChange: (AppSettings) -
     TickSlider("Перемер «держать лучший»", OPT_LABELS, nearestIndex(OPT_SECS, optSec)) { i ->
         val sec = OPT_SECS[i]
         onChange(if (save) settings.copy(optimizeSecSave = sec) else settings.copy(optimizeSecNormal = sec))
+    }
+    // в (ТЗ Elyor): сколько быстрых серверов (≥ порога достаточности) набирать в «Самом быстром» перед остановкой.
+    // Всегда видимо (влияет и на ручной тест). Серверы со свежим сохранённым ≥ порога не перемеряются (фиксация).
+    IntSettingRow("Сколько быстрых набирать («Самый быстрый»)", "", settings.fastTopTarget, dd.fastTopTarget, 1, 50) { v ->
+        onChange(settings.copy(fastTopTarget = v))
     }
     if (optSec > 0) {
         IntSettingRow("Размер топа (быстрых серверов)", "", topBatch, if (save) dd.topBatchSave else dd.topBatchNormal, 1, 50) { v ->
