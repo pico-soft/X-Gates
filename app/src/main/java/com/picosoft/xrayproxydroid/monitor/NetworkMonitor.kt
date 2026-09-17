@@ -149,6 +149,9 @@ object NetworkMonitor {
     // Пр.127.C: когда последний раз делали ШАГ по деградации (throttle между шагами). Object-поле — переживает
     // пересоздание корутины монитора (как restartedKeySinceOk), чтобы throttle не сбрасывался при рестарте.
     @Volatile private var lastDegradationMs = 0L
+    // Сколько ЖИВЫХ по пингу кандидатов пробуем при шаге с деградировавшего активного (ранняя остановка на первом
+    // годном). >1 — чтобы мёртвый призрак на вершине по старой скорости не съедал единственную попытку (полевой S908E).
+    private const val DEGRADED_STEP_CANDIDATES = 3
 
     // Пр.146 Ф3: СТАБИЛЬНОСТЬ. Считаем «падения» сервера за окно (когда он был активным и связь оборвалась).
     // Часто падающий («нестабильный») опускается в подборе В САМЫЙ НИЗ — предпочитаем стабильный, пусть чуть
@@ -1144,29 +1147,41 @@ object NetworkMonitor {
         if (MonitorCoordinator.fullTestRunning || MonitorCoordinator.monitorSearchRunning) return
         lastDegradationMs = now()
         val bl = BlocklistStore.current()
-        // ОДИН кандидат: лучший по СОХРАНЁННОЙ скорости, не текущий, годный (протокол/стоп-лист/пауза).
-        val cand = SubscriptionManager.allServers(app)
+        // Кандидаты по СОХРАНЁННОЙ скорости (не текущий, годный: протокол/стоп-лист/пауза), о ком есть данные.
+        val pool = SubscriptionManager.allServers(app)
             .filter { SubscriptionManager.serverKey(it) != curKey }
             .filter { ServerFilter.protocolAllowed(it, cur) && !ServerFilter.isBlocked(it, bl) && !ServerFilter.isPaused(it, bl) }
-            .maxByOrNull { it.speedMbps ?: 0.0 } ?: return
-        if ((cand.speedMbps ?: 0.0) <= 0.0) return                       // о кандидатах нет данных — судить не по чему
-        MonitorLog.event(app, "monitor", "Туннель медленный (${fmt(passiveDown)}) — проверяю кандидата", ServerLabels.display(cand))
+            .filter { (it.speedMbps ?: 0.0) > 0.0 }                      // о кандидатах нет данных — судить не по чему
+        // ⚠️ ПОЛЕВОЙ БАГ S908E (0.44, деградир. пул): раньше брали ОДНОГО — maxByOrNull{speedMbps}, БЕЗ проверки
+        // живости. На вершине по старой скорости стоял ПРИЗРАК (пинг ✗ сейчас, замер 30 мин назад) → measureSpeed
+        // призрака проваливался → «остаюсь», и живой-но-чуть-медленнее кандидат позади НЕ получал шанса (одна
+        // попытка раз в 30 мин). Теперь: ПРЕДПОЧИТАЕМ живых по свежему пингу (pingMs≥0) и пробуем ТОП-K с ранней
+        // остановкой на первом годном. Живых по пингу нет (данных нет/все ✗) → старое поведение: 1 лучший по скорости.
+        val aliveByPing = pool.filter { (it.pingMs ?: -1) >= 0 }.sortedByDescending { it.speedMbps ?: 0.0 }
+        val ordered = if (aliveByPing.isNotEmpty()) aliveByPing.take(DEGRADED_STEP_CANDIDATES)
+                      else pool.sortedByDescending { it.speedMbps ?: 0.0 }.take(1)
+        if (ordered.isEmpty()) return
+        MonitorLog.event(app, "monitor", "Туннель медленный (${fmt(passiveDown)}) — проверяю кандидатов (${ordered.size})",
+            ordered.joinToString(", ") { ServerLabels.display(it) })
         MonitorCoordinator.monitorSearchRunning = true
         try {
-            val candMbps = ServerSpeedTester.measureSpeed(app, cand)     // ОДИН замер (temp-инстанс)
-            SubscriptionManager.applySpeedResults(app, mapOf(SubscriptionManager.serverKey(cand) to candMbps))
-            if (ProxyState.state.value.serverKey != curKey) return       // пользователь/лестница сменили — не вмешиваемся
-            if (candMbps >= cur.degradationMinMbps && candMbps > passiveDown) {
-                val cfg = runCatching { XrayConfigBuilder.build(cand) }.getOrNull() ?: return
-                val from = ServerLabels.displayForKey(app, curKey)
-                XrayProxyService.start(app, cfg, ServerLabels.full(cand), SubscriptionManager.serverKey(cand))
-                MonitorLog.switch(app, from, ServerLabels.display(cand), "деградация: кандидат приемлемо быстрее",
-                    "${fmt(passiveDown)} → ${fmt(candMbps)}")
-                measureAfterConnect(app, cand)
-            } else {
-                MonitorLog.event(app, "monitor", "Кандидат не лучше (${fmt(candMbps)}) — остаюсь",
-                    "порог ${fmt(cur.degradationMinMbps)}, сейчас ${fmt(passiveDown)}")
+            for (cand in ordered) {
+                if (ProxyState.state.value.serverKey != curKey) return   // пользователь/лестница сменили — не вмешиваемся
+                val candMbps = ServerSpeedTester.measureSpeed(app, cand) // замер temp-инстансом (активный не дёргаем)
+                SubscriptionManager.applySpeedResults(app, mapOf(SubscriptionManager.serverKey(cand) to candMbps))
+                if (ProxyState.state.value.serverKey != curKey) return
+                if (candMbps >= cur.degradationMinMbps && candMbps > passiveDown) {
+                    val cfg = runCatching { XrayConfigBuilder.build(cand) }.getOrNull() ?: continue
+                    val from = ServerLabels.displayForKey(app, curKey)
+                    XrayProxyService.start(app, cfg, ServerLabels.full(cand), SubscriptionManager.serverKey(cand))
+                    MonitorLog.switch(app, from, ServerLabels.display(cand), "деградация: кандидат приемлемо быстрее",
+                        "${fmt(passiveDown)} → ${fmt(candMbps)}")
+                    measureAfterConnect(app, cand)
+                    return                                               // шагнули — стоп (ранняя остановка)
+                }
             }
+            MonitorLog.event(app, "monitor", "Никто из кандидатов не лучше — остаюсь",
+                "порог ${fmt(cur.degradationMinMbps)}, сейчас ${fmt(passiveDown)}")
         } finally {
             MonitorCoordinator.monitorSearchRunning = false
         }
