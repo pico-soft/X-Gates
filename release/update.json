@@ -1,29 +1,29 @@
 {
   "_comment": "ОБРАЗЕЦ манифеста обновления (Промпт 70). В КАЖДЫЙ релиз кладётся вложением с именем update.json. Публичный API GitHub versionCode не отдаёт — обновлялка сравнивает версии ТОЛЬКО по versionCode отсюда (строго БОЛЬШЕ установленного). Перед публикацией: (1) versionCode/versionName должны совпасть с app/build.gradle.kts; (2) packageName = имя пакета приложения — обновлялка проверяет, что релиз НАШ, до скачивания APK (Промпт 121.C); (3) в каждый sha256 подставить РЕАЛЬНУЮ SHA-256 собранного APK (shasum -a 256 <файл>); (4) имена в fileName — КОНТРАКТ с обновлялкой (…-arm64-v8a.apk и т.д.), совпадают с именами вложений релиза. Схему имён вложений НЕ меняем при ребренде/переименовании репозитория (Промпт 106.E/121.E). Релиз публиковать ПОЛНЫМ (не draft, не prerelease) — иначе releases/latest его не отдаёт.",
-  "versionCode": 38,
-  "versionName": "0.47 beta",
+  "versionCode": 39,
+  "versionName": "0.48 beta",
   "packageName": "com.picosoft.xrayproxydroid",
-  "notes": "Исправлен сбой при подборе сервера. • Устранено падение приложения (напр. на Android 15) при запросе разрешения на уведомления в момент автоподключения во время теста — запуск туннеля больше не прерывается этой ошибкой.",
+  "notes": "Умнее восстановление связи при обрыве. • Сервер, только что не ответивший на пинг, больше не остаётся в списке «Живые». • При обрыве: сначала пингуем недавние живые серверы; кто откликнулся — сразу подключаемся к нему и меряем (плашка зеленеет без задержки), при ≥2 Мбит/с остаёмся, иначе уходим на самый быстрый. • Если недавние молчат — полный поиск с добором до 10 живых и переходом на самый быстрый.",
   "artifacts": [
     {
       "abi": "arm64-v8a",
-      "fileName": "XrayProxyDroid-0.47-arm64-v8a.apk",
-      "sha256": "89d79650854bf88c1b8529f0aa775fe689f124e83a8191f5331f29c0d38aa2ae"
+      "fileName": "XrayProxyDroid-0.48-arm64-v8a.apk",
+      "sha256": "44e8b237f30b9c584ddb70247ab7fddc03d394dee93132933611701cfc3550cb"
     },
     {
       "abi": "armeabi-v7a",
-      "fileName": "XrayProxyDroid-0.47-armeabi-v7a.apk",
-      "sha256": "a65ffbcd8a6861539918c2d27c7551f419d200a7d8d6d6154907c3da10a17ec6"
+      "fileName": "XrayProxyDroid-0.48-armeabi-v7a.apk",
+      "sha256": "20d47436a865f2054ac44e1f7d16242306f526254845b9e991c9985812d66f3c"
     },
     {
       "abi": "x86_64",
-      "fileName": "XrayProxyDroid-0.47-x86_64.apk",
-      "sha256": "dd44e7e69d8de8ca8efb6dcb40512fae0cd850ffcc678ee04d70fe3603ab1d91"
+      "fileName": "XrayProxyDroid-0.48-x86_64.apk",
+      "sha256": "981a760e0edf8311af6deaf19ddbe3a51f56810ca1dc3d7bdeae014f3097e5a6"
     },
     {
       "abi": "universal",
-      "fileName": "XrayProxyDroid-0.47-universal.apk",
-      "sha256": "d48cd40dad455e343dc48b9ac21ce64db395cc4f5abe90a46558349eee5db223"
+      "fileName": "XrayProxyDroid-0.48-universal.apk",
+      "sha256": "fdd18e718a0daf243a7ba6e138e5ea824bcf9557e66c51037353c67fbebe855b"
     }
   ]
 }
