@@ -21,6 +21,7 @@ import com.picosoft.xrayproxydroid.xray.XrayConfig
 import com.picosoft.xrayproxydroid.xray.XrayConfigBuilder
 import com.picosoft.xrayproxydroid.xray.XrayController
 import kotlinx.coroutines.delay
+import com.picosoft.xrayproxydroid.xray.link.ServerProfile
 import java.net.InetSocketAddress
 import java.net.Socket
 import kotlin.math.roundToInt
@@ -75,12 +76,6 @@ object NetworkMonitor {
     // Пр.146 Ф3.5: после переключения (подбор подключает к первому живому) через столько открываем проход
     // «держать лучший» — чтобы вскоре перейти на самый быстрый стабильный, не ждя обычные 6 ч.
     private const val POST_SWITCH_OPTIMIZE_MS = 90_000L
-    // Пр.149: сколько кандидатов быстро ЗАМЕРЯЕМ в поисках ГОДНОГО при восстановлении (остальное — тщательная
-    // лестница). Замер temp-инстансом дороже пинга, поэтому ограничиваем; список отсортирован (быстрые первее).
-    private const val FAST_MEASURE_CAP = 12
-    // Ниже этого числа «вероятно живых» кандидатов восстановление СНАЧАЛА делает полный пинг-скан (рединдексация),
-    // иначе крутится на 2-3 устаревших. «Самый быстрый» вручную делал ровно это (пинг 146 → нашлось 56).
-    private const val REDISCOVER_WHEN_ALIVE_BELOW = 6
 
     private const val SWITCH_THROTTLE_MS = 60_000L        // в фоне переключаться не чаще раза в 60с
     // Пауза при «НЕТ РАБОЧИХ СЕРВЕРОВ» (интернет есть, но ни один сервер не поднялся): удвоение 10 мин → 4 ч.
@@ -593,50 +588,98 @@ object NetworkMonitor {
     }
 
     /**
-     * ЛЕСТНИЦА ВОССТАНОВЛЕНИЯ (Промпт 95.C / Пр.143), сама, по порядку:
-     *  0) Пр.143 БЫСТРЫЙ ПУТЬ — сразу переключаемся на САМЫЙ БЫСТРЫЙ из живых: гейт ПИНГ (дёшев ~1.5с),
-     *     подтверждение внешним IP на новом сервере. Не тратим ~2 мин на реанимацию мёртвого активного.
-     *  1) ПЕРЕЗАПУСК ЯДРА текущего сервера — ТОЛЬКО как ЗАПАСНОЙ (когда живые не отозвались): при смене сети
-     *     соединения привязаны к ушедшей сети и сами не оживают, а перезапуск ядра их чинит (Промпт 102).
-     *  2–5) перебор всех (probeAlive, без пинг-гейта) → обновить подписки → белые списки → предложить источники.
-     * После каждой ступени — подтверждение ФАКТОМ (внешний IP). Отменяется, если вмешался пользователь.
+     * ЛЕСТНИЦА ВОССТАНОВЛЕНИЯ (Пр.95.C, ТЗ Elyor 2026-09-21). ТОЛЬКО по подтверждённому обрыву активного (grace истёк):
+     *  Фаза 1: пинг НЕДАВНИХ живых. Свежий провал пинга → сервер уходит из «Живых» (ServerFilter.freshPingFailed).
+     *  Фаза 2a (кто-то ОТВЕТИЛ по пингу): СРАЗУ подключаемся к лучшему ответившему + подтверждаем IP (плашка не
+     *      висит серой) + мерим ЖИВОЙ туннель. ≥ порога (degradationMinMbps ≈2) — держим, домеряем остальных живых
+     *      (обновить список). < порога — домеряем всех живых и уходим на самый быстрый.
+     *  Фаза 2b (никто не ответил): пинг ВСЕХ (прунинг) → добираем до [fastTopTarget] живых замерами по топу пинга
+     *      (батчи по 10) → подключаемся к самому быстрому.
+     *  Никого живого — глубокий фолбэк: перезапуск ядра (Пр.102) → обновить подписки → белые списки → предложить.
+     * После подключения — подтверждение ФАКТОМ (внешний IP). Отменяется, если вмешался пользователь (aborted).
      */
     private suspend fun runRecoveryLadder(app: Context, s: AppSettings): SwitchResult {
         MonitorCoordinator.monitorSearchRunning = true
         try {
             val startKey = ProxyState.state.value.serverKey
-            // Пр.146.Ф2: если «вероятно живых» осталось мало (список устарел — типично после рестарта: 2 из 146),
-            // СНАЧАЛА пере-пинг ВСЕХ (рединдексация, как ручной «Самый быстрый»: пинг 146 → нашлось 56), иначе
-            // подбор бесконечно крутится на 2-3 устаревших. Пинг не меняет сервер → монитор не дёргается.
-            val bl0 = BlocklistStore.current()
-            val likelyCount = SubscriptionManager.allServers(app)
-                .filter { SubscriptionManager.serverKey(it) != startKey }
-                .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl0) && !ServerFilter.isPaused(it, bl0) }
-                .count { isLikelyAlive(it) }
-            if (likelyCount < REDISCOVER_WHEN_ALIVE_BELOW) {
-                TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "мало живых ($likelyCount) — полный пинг")
-                MonitorStatus.update(true, "полный пинг: ищу живые серверы", now(), 0)
-                val found = runCatching { refreshAllPings(app, s) }.getOrDefault(0)
-                MonitorLog.event(app, "monitor", "Рединдексация при восстановлении: живых $found", "было вероятно-живых $likelyCount")
-                if (aborted(startKey)) return SwitchResult.ABORTED
-            }
-            // Ступень 0 (Пр.143): быстрый ping-подбор живых по убыванию скорости. Успех → сразу наверх.
-            val fast = fastPingSwitch(app, s, startKey)
-            if (fast != SwitchResult.NO_CANDIDATES) return fast
+            val bl = BlocklistStore.current()
+            val keepThreshold = s.degradationMinMbps.coerceAtLeast(0.1)   // «≥2 Мбит/с» — держим; иначе ищем быстрее
+            val target = s.fastTopTarget.coerceAtLeast(1)                 // стараемся иметь N живых (деф. 10)
+            val pingTimeout = s.pingTimeoutMs.coerceAtMost(1500)
+            fun allowed() = SubscriptionManager.allServers(app)
+                .filter { SubscriptionManager.serverKey(it) != ProxyState.state.value.serverKey }
+                .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl) && !ServerFilter.isPaused(it, bl) }
 
-            // Живые на пинге не ответили (или пинговались, но туннель не прошёл) → ТЩАТЕЛЬНО, аналог «Самый быстрый».
-            // fastPingSwitch мог оставить нас на неудачном кандидате — берём АКТУАЛЬНЫЙ ключ для шага 1.
+            // ── Фаза 1: пинг НЕДАВНИХ живых (по убыв. известной скорости; свежий провал → уходит из «Живых») ──
+            val recent = orderFastCandidates(allowed().filter { isLikelyAlive(it) },
+                isUnstable = { isUnstableKey(SubscriptionManager.serverKey(it)) })
+            val pingUpd = HashMap<String, Int>()
+            val responders = ArrayList<ServerProfile>()
+            for ((i, c) in recent.withIndex()) {
+                if (aborted(startKey)) { SubscriptionManager.applyPingResults(app, pingUpd); return SwitchResult.ABORTED }
+                TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "пингую недавние: ${i + 1}/${recent.size}")
+                MonitorStatus.update(true, "пинг недавних ${i + 1}/${recent.size} · ${ServerLabels.display(c)}", now(), 0)
+                val p = ServerTester.ping(app, c, pingTimeout).toInt()
+                pingUpd[SubscriptionManager.serverKey(c)] = p
+                if (p >= 0) responders.add(c)
+            }
+            SubscriptionManager.applyPingResults(app, pingUpd)   // прунинг: не ответившие уходят из «Живых» (Баг 1)
+
+            // ── Фаза 2a: кто-то ответил → подключаемся СРАЗУ к лучшему, мерим ЖИВОЙ, решаем по порогу ──
+            if (responders.isNotEmpty()) {
+                val order = responders.sortedWith(
+                    compareByDescending<ServerProfile> { it.speedMbps ?: 0.0 }.thenBy { it.pingMs ?: Int.MAX_VALUE })
+                var ownedKey = startKey
+                var connected: ServerProfile? = null
+                var connectedMbps = -1.0
+                for (c in order) {
+                    if (MonitorCoordinator.fullTestRunning) return SwitchResult.ABORTED
+                    if (ProxyState.state.value.serverKey != ownedKey) return SwitchResult.ABORTED   // вмешался пользователь
+                    MonitorStatus.update(true, "обрыв — подключаюсь к недавнему · ${ServerLabels.display(c)}", now(), 0)
+                    val (mbps, ok) = connectMeasureLive(app, c, ownedKey)
+                    ownedKey = ProxyState.state.value.serverKey   // отражаем факт (start мог/не мог взять)
+                    if (ok) { connected = c; connectedMbps = mbps; break }
+                }
+                if (connected != null) {
+                    // Домерить ОСТАЛЬНЫХ живых temp-инстансом (обновить список/«топ»), не трогая активного.
+                    // < порога → мерим ради РАНЖИРОВАНИЯ (до sufficientMbps); ≥ порога → просто обновляем список.
+                    val measCap = if (connectedMbps in 0.0..keepThreshold) s.sufficientMbps.coerceAtLeast(keepThreshold) else keepThreshold
+                    val measured = LinkedHashMap<String, Double>()
+                    measured[SubscriptionManager.serverKey(connected)] = connectedMbps
+                    for (c in order) {
+                        if (SubscriptionManager.serverKey(c) == SubscriptionManager.serverKey(connected)) continue
+                        if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey != ownedKey) return SwitchResult.SWITCHED
+                        val m = ServerSpeedTester.measureSufficiency(app, c, measCap)
+                        measured[SubscriptionManager.serverKey(c)] = m
+                        SubscriptionManager.applySpeedResults(app, mapOf(SubscriptionManager.serverKey(c) to m))
+                    }
+                    if (connectedMbps >= keepThreshold) return SwitchResult.SWITCHED   // годен — держим
+                    // < порога → уйти на самый быстрый из живых
+                    val bestKey = measured.maxByOrNull { it.value }?.key
+                    if (bestKey != null && bestKey != ownedKey && (measured[bestKey] ?: 0.0) > connectedMbps) {
+                        val best = order.firstOrNull { SubscriptionManager.serverKey(it) == bestKey }
+                        if (best != null) {
+                            MonitorStatus.update(true, "медленный — ухожу на самый быстрый · ${ServerLabels.display(best)}", now(), 0)
+                            connectMeasureLive(app, best, ownedKey)
+                        }
+                    }
+                    return SwitchResult.SWITCHED
+                }
+                // никто из ответивших не подтвердил связь → идём в полный поиск (Фаза 2b)
+            }
+
+            // ── Фаза 2b: недавние молчат → пинг ВСЕХ + добор до [target] живых замерами → самый быстрый ──
+            if (aborted(startKey)) return SwitchResult.ABORTED
+            val disc = discoverBuildLive(app, s, startKey, target, keepThreshold)
+            if (disc != SwitchResult.NO_CANDIDATES) return disc
+
+            // ── Никого живого/годного → глубокий фолбэк: перезапуск ядра (Пр.102) → подписки → белые → предложить ──
             val curKey = ProxyState.state.value.serverKey
-            // Ступень 1: перезапуск ядра на ТЕКУЩЕМ сервере — ТОЛЬКО ОДИН РАЗ за эпизод обрыва (Промпт 102).
-            // Если этот сервер уже перезапускали и связь не вернулась — перезапуск бесполезен (сервер мёртв) И
-            // вдобавок убивает лестницу (см. restartedKeySinceOk). Пропускаем шаг 1 → сразу перебор всех серверов.
             val alreadyRestarted = curKey != null && curKey == restartedKeySinceOk
             if (curKey != null && !aborted(curKey) && !alreadyRestarted) {
                 val curSrv = SubscriptionManager.allServers(app).firstOrNull { SubscriptionManager.serverKey(it) == curKey }
                 val cfg = curSrv?.let { runCatching { XrayConfigBuilder.build(it) }.getOrNull() }
                 if (curSrv != null && cfg != null) {
-                    // Отметить ДО start: XrayProxyService.start ставит running=false → монитор (и эта корутина)
-                    // пересоздаётся, код НИЖЕ может не выполниться; флаг object'а переживёт рестарт.
                     restartedKeySinceOk = curKey
                     MonitorLog.event(app, "monitor", "Восстановление: перезапуск ядра (запасной)", ServerLabels.display(curSrv))
                     TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "пробую переподключиться к серверу")
@@ -648,7 +691,6 @@ object NetworkMonitor {
                     if (ExternalIpChecker.fetch() != null) { MonitorLog.event(app, "monitor", "Восстановление: перезапуск ядра помог", ""); return SwitchResult.SWITCHED }
                 }
             }
-            // Ступени 2–5.
             return runSwitchSearchInner(app, s)
         } finally {
             MonitorCoordinator.monitorSearchRunning = false
@@ -656,81 +698,73 @@ object NetworkMonitor {
     }
 
     /**
-     * Пр.149 (было Пр.143): БЫСТРОЕ восстановление с БЫСТРЫМ ЗАМЕРОМ СКОРОСТИ (ТЗ Elyor: «начинаем с быстрого
-     * замера, подключаемся к первому ГОДНОМУ, полный топ строим потом»). Живые по убыв. скорости (стабильные
-     * первее, Ф3): короткий ПИНГ (дёшев) → не отозвался → мёртвый, дальше; ПИНГ ОК → БЫСТРЫЙ медианный замер
-     * скорости temp-инстансом (measureSufficiency, активный туннель НЕ дёргаем) → ГОДНЫЙ (≥ monitorTunnelThreshold)
-     * → подключаемся и подтверждаем живым проходом (probePass). Так НЕ садимся на еле-живой сервер (частая причина
-     * скорого повторного обрыва). Годного нет в первых FAST_MEASURE_CAP → подключаем ЛУЧШИЙ «проходит-но-медленный»
-     * (связь любой ценой, Пр.95); совсем никого — NO_CANDIDATES (наверх, к тщательной). Полный точный топ добираем
-     * фоном (Ф3.5 optimize через ~90с). Свежие пинги+замеры персистятся (список «Живые»/топ).
+     * Подключиться к [c] + СРАЗУ подтвердить IP (плашка зеленеет немедленно, не висит серой — Баг 2) + замерить
+     * ЖИВОЙ туннель. Возврат: (скорость ↓ Мбит/с — 0/-1 если нет throughput/ошибка, подтверждена ли связь фактом
+     * внешнего IP). fromKey — прежний активный (для лога смены).
      */
-    private suspend fun fastPingSwitch(app: Context, s: AppSettings, startKey: String?): SwitchResult {
+    private suspend fun connectMeasureLive(app: Context, c: ServerProfile, fromKey: String?): Pair<Double, Boolean> {
+        val key = SubscriptionManager.serverKey(c)
+        val cfg = runCatching { XrayConfigBuilder.build(c) }.getOrNull()
+            ?: run { MonitorLog.event(app, "error", "Кандидат ${ServerLabels.display(c)}: ошибка конфига", ""); return -1.0 to false }
+        val from = ServerLabels.displayForKey(app, fromKey)
+        XrayProxyService.start(app, cfg, ServerLabels.full(c), key)
+        MonitorLog.switch(app, from, ServerLabels.display(c), "монитор", "обрыв → подключение по пингу")
+        var waited = 0
+        while (waited < 8000 && (!ProxyState.state.value.running || ProxyState.state.value.serverKey != key)) { delay(500); waited += 500 }
+        if (ProxyState.state.value.serverKey != key) return -1.0 to false
+        // Баг 2: подтверждаем факт СРАЗУ → зелёная плашка немедленно, а не серая до следующего цикла монитора.
+        TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "подключился — проверяю связь")
+        val ip = ExternalIpChecker.fetch()
+        val confirmed = ip != null
+        if (confirmed) { TunnelHealth.ok(ip!!, now(), key); onRecovered(app) }
+        delay(800)   // дать туннелю осесть
+        val mbps = ServerSpeedTester.measureActiveDownloadMbps(app)   // сопоставимо с кандидатами (Пр.130)
+        if (mbps > 0) {
+            SubscriptionManager.applySpeedResults(app, mapOf(key to mbps))
+            TunnelSpeed.setProbe(null, mbps, null, now(), key)
+            MonitorLog.event(app, "monitor", "Скорость нового сервера", "${fmt(mbps)}")
+        }
+        return mbps to confirmed
+    }
+
+    /**
+     * Фаза 2b восстановления (ТЗ Elyor): недавние живые молчат → пинг ВСЕХ (прунинг мёртвых) → добираем до [target]
+     * ЖИВЫХ (с ненулевым замером) замерами по топу ПИНГА, батчами по 10 → подключаемся к САМОМУ БЫСТРОМУ (сразу
+     * подтверждаем IP + мерим). NO_CANDIDATES — никого живого по пингу/годного нет (наверх, к глубокому фолбэку).
+     */
+    private suspend fun discoverBuildLive(app: Context, s: AppSettings, startKey: String?, target: Int, keepThreshold: Double): SwitchResult {
+        TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "недавние молчат — полный пинг")
+        MonitorStatus.update(true, "полный пинг: ищу живые серверы", now(), 0)
+        runCatching { refreshAllPings(app, s) }
+        if (aborted(startKey)) return SwitchResult.ABORTED
         val bl = BlocklistStore.current()
-        val candidates = orderFastCandidates(
-            SubscriptionManager.allServers(app)
-                .filter { SubscriptionManager.serverKey(it) != startKey }
-                .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl) && !ServerFilter.isPaused(it, bl) },
-            isUnstable = { isUnstableKey(SubscriptionManager.serverKey(it)) },   // Пр.146 Ф3: нестабильные — в конец
-        )
-        if (candidates.isEmpty()) return SwitchResult.NO_CANDIDATES
-        val scan = candidates.take(FAST_MEASURE_CAP)
-        val pingTimeout = s.pingTimeoutMs.coerceAtMost(1500)
-        val goodThreshold = s.monitorTunnelThreshold.coerceAtLeast(0.1)   // ≥ этого = ГОДНЫЙ → сразу подключаем
-        val pingUpdates = HashMap<String, Int>()      // свежие пинги → persist (в т.ч. −1 для прунинга «Живых»)
-        // Наш ключ активного меняется по ходу (мы сами переключаемся). Вмешательство пользователя ловим сравнением
-        // ФАКТИЧЕСКОГО serverKey с тем, что ПОСТАВИЛИ мы (ownedKey), а не со стартовым (тот уже не активен).
-        var ownedKey = startKey
-        var bestFb: com.picosoft.xrayproxydroid.xray.link.ServerProfile? = null   // проходит, но < порога — запас
-        var bestFbMbps = 0.0
-
-        // Подключиться к [c] и ПОДТВЕРДИТЬ живым проходом (probePass ~4с). true = SWITCHED; false = не подошёл (дальше).
-        suspend fun connectConfirm(c: com.picosoft.xrayproxydroid.xray.link.ServerProfile): Boolean {
-            val key = SubscriptionManager.serverKey(c)
-            val cfg = runCatching { XrayConfigBuilder.build(c) }.getOrNull()
-            if (cfg == null) { MonitorLog.event(app, "error", "Кандидат ${ServerLabels.display(c)}: ошибка конфига", ""); return false }
-            val from = ServerLabels.displayForKey(app, ownedKey)
-            XrayProxyService.start(app, cfg, ServerLabels.full(c), key)
-            ownedKey = key
-            MonitorLog.switch(app, from, ServerLabels.display(c), "монитор", "быстрый замер → подключение")
-            var waited = 0
-            while (waited < 8000 && (!ProxyState.state.value.running || ProxyState.state.value.serverKey != key)) { delay(500); waited += 500 }
-            delay(800)   // дать туннелю осесть
-            if (ProxyState.state.value.serverKey != key) return false   // сменили не мы — обработает верх (aborted)
-            if (ExternalIpChecker.probePass()) { measureAfterConnect(app, c); return true }
-            MonitorLog.event(app, "monitor", "Замерился, но живой проход не подтвердил — дальше", ServerLabels.display(c))
-            return false
-        }
-
-        try {
-            // Пр.149: пинг (дёшев) → БЫСТРЫЙ ЗАМЕР скорости temp-инстансом (не дёргая активный) → ГОДНЫЙ (≥ порога)
-            // → подключаемся. Так не садимся на еле-живой сервер (частая причина скорого повторного обрыва).
-            for ((i, c) in scan.withIndex()) {
-                if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey != ownedKey) return SwitchResult.ABORTED
-                val key = SubscriptionManager.serverKey(c)
-                TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "быстрый замер: ${i + 1}/${scan.size}")
-                MonitorStatus.update(true, "быстрый замер ${i + 1}/${scan.size} · ${ServerLabels.display(c)}", now(), 0)
-                val p = ServerTester.ping(app, c, pingTimeout).toInt()
-                pingUpdates[key] = p
-                if (p < 0) continue   // не отозвался — мимо (из «Живых» уйдёт при persist)
-                val mbps = ServerSpeedTester.measureSufficiency(app, c, goodThreshold)   // temp-инстанс, быстрый+медианный
-                // Замер грубый (короткое окно) — в реестр НЕ пишем (не портим точный топ); он лишь для РЕШЕНИЯ.
-                // Точную скорость поставит measureAfterConnect (подключённому) и полный топ фоном (Ф3.5).
-                if (mbps >= goodThreshold) {
-                    MonitorStatus.update(true, "подключаюсь к годному · ${ServerLabels.display(c)} ↓${fmt(mbps)}", now(), 0)
-                    if (connectConfirm(c)) return SwitchResult.SWITCHED
-                } else if (mbps > bestFbMbps) { bestFbMbps = mbps; bestFb = c }   // проходит, но медленный — запас
+        val liveByPing = SubscriptionManager.allServers(app)
+            .filter { SubscriptionManager.serverKey(it) != startKey }
+            .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl) && !ServerFilter.isPaused(it, bl) }
+            .filter { (it.pingMs ?: -1) >= 0 }
+            .sortedBy { it.pingMs ?: Int.MAX_VALUE }
+        if (liveByPing.isEmpty()) return SwitchResult.NO_CANDIDATES
+        val measCap = s.sufficientMbps.coerceAtLeast(keepThreshold)
+        val liveWithSpeed = ArrayList<Pair<ServerProfile, Double>>()
+        var scanned = 0
+        for (batch in liveByPing.chunked(10)) {
+            val upd = HashMap<String, Double>()
+            for (c in batch) {
+                if (aborted(startKey)) return SwitchResult.ABORTED
+                scanned++
+                TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "замер живых: $scanned/${liveByPing.size}")
+                MonitorStatus.update(true, "замер живых $scanned/${liveByPing.size} · ${ServerLabels.display(c)}", now(), 0)
+                val m = ServerSpeedTester.measureSufficiency(app, c, measCap)
+                upd[SubscriptionManager.serverKey(c)] = m
+                if (m > 0) liveWithSpeed.add(c to m)
             }
-            // Годного (≥ порога) не нашли → подключить ЛУЧШИЙ из «проходит, но медленный» (связь любой ценой, Пр.95).
-            val fb = bestFb
-            if (fb != null && bestFbMbps > 0.0 && !MonitorCoordinator.fullTestRunning && ProxyState.state.value.serverKey == ownedKey) {
-                MonitorStatus.update(true, "быстрых нет — держу лучший доступный · ${ServerLabels.display(fb)} ↓${fmt(bestFbMbps)}", now(), 0)
-                if (connectConfirm(fb)) return SwitchResult.SWITCHED
-            }
-            return SwitchResult.NO_CANDIDATES
-        } finally {
-            SubscriptionManager.applyPingResults(app, pingUpdates)     // обновить живость (в т.ч. прунинг не-ответивших)
+            SubscriptionManager.applySpeedResults(app, upd)
+            if (liveWithSpeed.size >= target) break   // набрали [target] живых — хватит (ТЗ: стараться иметь 10)
         }
+        val best = liveWithSpeed.maxByOrNull { it.second }?.first ?: return SwitchResult.NO_CANDIDATES
+        MonitorStatus.update(true, "подключаюсь к самому быстрому · ${ServerLabels.display(best)}", now(), 0)
+        return if (connectMeasureLive(app, best, ProxyState.state.value.serverKey).second) SwitchResult.SWITCHED
+               else SwitchResult.NO_CANDIDATES
     }
 
     // ---- Перебор кандидатов / переключение ----
@@ -872,7 +906,7 @@ object NetworkMonitor {
 
     /**
      * Пр.143: «вероятно живой» кандидат для быстрого подбора — свежий пинг ≥0 ИЛИ известная скорость >0.
-     * Пинг вслепую по серверам без данных смысла нет: гейтом служит реальный ПИНГ при переборе (fastPingSwitch).
+     * Пинг вслепую по серверам без данных смысла нет: гейтом служит реальный ПИНГ при переборе (Фаза 1 восст.).
      */
     internal fun isLikelyAlive(p: com.picosoft.xrayproxydroid.xray.link.ServerProfile): Boolean =
         (p.pingMs ?: -1) >= 0 || (p.speedMbps ?: 0.0) > 0.0

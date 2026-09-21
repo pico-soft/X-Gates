@@ -59,10 +59,21 @@ object ServerFilter {
         return System.currentTimeMillis() - t <= SPEED_ALIVE_FRESH_MS
     }
 
+    // ТЗ Elyor 2026-09-21: СВЕЖИЙ провал пинга (сервер только что пинговали и он не ответил) → он МЁРТВ СЕЙЧАС и
+    // должен уйти из «Живых», даже если недавно был замер скорости. Иначе (полевой случай) при обрыве монитор
+    // пингует недавних, никто не отвечает, а они всё равно висят в списке (их держал speedFreshAlive ≤2ч). Пр.148
+    // НЕ ломаем: он про СТАРЫЙ/неизвестный пинг (DPI-флап) — там lastTestedTs старый → freshPingFailed=false.
+    private const val PING_FRESH_FAIL_MS = 15 * 60_000L
+    private fun freshPingFailed(p: ServerProfile): Boolean {
+        if ((p.pingMs ?: 0) >= 0) return false                    // не мёртвый по пингу
+        val t = runCatching { speedTsFmt.parse(p.lastTestedTs)?.time }.getOrNull() ?: return false
+        return System.currentTimeMillis() - t <= PING_FRESH_FAIL_MS   // провал СВЕЖИЙ → сервер мёртв сейчас
+    }
+
     @Suppress("UNUSED_PARAMETER")
     fun isVisible(p: ServerProfile, pingMs: Int?, speedMbps: Double?, s: AppSettings, b: Blocklist): Boolean =
         !isBlocked(p, b) && !isPaused(p, b) && protocolAllowed(p, s) &&
-            ((pingMs != null && pingMs >= 0) || speedFreshAlive(p))
+            ((pingMs != null && pingMs >= 0) || (speedFreshAlive(p) && !freshPingFailed(p)))
 
     /** Пригоден для автоподключения/апгрейда: не заблокирован + не на паузе + протокол разрешён + скорость ≥ порога. */
     fun isSelectable(p: ServerProfile, speedMbps: Double?, s: AppSettings, b: Blocklist): Boolean =
