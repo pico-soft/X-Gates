@@ -981,7 +981,13 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
             ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS)
             != PackageManager.PERMISSION_GRANTED
         ) {
-            notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            // startServer() зовётся и из ОТЛОЖЕННЫХ колбэков (connect полного теста через runOnUiThread, автозапуск) —
+            // тогда Compose-лаунчер может быть НЕ зарегистрирован/недоступен (приложение ушло в фон): на Android 15
+            // launch() кидает IllegalStateException «unregistered ActivityResultLauncher» → падал весь запуск туннеля
+            // (полевой краш OPPO CPH2709, A15). Запрос разрешения на уведомления НЕкритичен к запуску сервиса
+            // (FGS-нотификация показывается и так), поэтому проглатываем — попросим позже при прямом действии юзера.
+            runCatching { notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS) }
+                .onFailure { android.util.Log.w("MainActivity", "notif perm launch пропущен: ${it.message}") }
         }
     }
 
