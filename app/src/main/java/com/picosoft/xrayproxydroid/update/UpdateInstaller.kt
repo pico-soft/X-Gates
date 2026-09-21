@@ -112,18 +112,24 @@ object UpdateInstaller {
         // подпись остаётся последним рубежом).
         when (verifySignature(context, dest)) {
             SignatureVerdict.OK -> {}
+            // Полевой случай (авто-Android в машине, 0.45): установленное приложение подписано ДРУГИМ ключом
+            // (ставилось из другого источника/сборки), поэтому Android не даёт обновить ПОВЕРХ. Файл при этом
+            // ПОДЛИННЫЙ — SHA-256 уже сошёлся с манифестом (это НЕ подмена), значит незачем пугать «подменой» и
+            // молча удалять. Сохраняем APK в «Загрузки» и даём ДЕЙСТВЕННУЮ инструкцию: удалить + поставить заново.
             SignatureVerdict.DEBUG_INSTALLED -> {
+                val loc = exportToDownloads(context, dest)
                 dest.delete()
                 return DownloadOutcome.Fail(
                     UpdateErrorKind.SIGNATURE_DEBUG,
-                    "Удалите текущую сборку и установите релиз заново (данные подписок при этом пропадут).",
+                    manualReinstallHint(loc, "на этом устройстве установлена отладочная сборка — релиз поверх неё не встаёт"),
                 )
             }
             SignatureVerdict.MISMATCH -> {
+                val loc = exportToDownloads(context, dest)
                 dest.delete()
                 return DownloadOutcome.Fail(
                     UpdateErrorKind.SIGNATURE_MISMATCH,
-                    "Файл подписан другим ключом — возможна подмена. Установка отменена.",
+                    manualReinstallHint(loc, "приложение на этом устройстве подписано другим ключом (установлено из другого источника)"),
                 )
             }
         }
@@ -170,6 +176,16 @@ object UpdateInstaller {
     /** Запустить системный установщик для проверенного файла (прямой startActivity — только с переднего плана). */
     fun launchInstaller(context: Context, file: File) {
         context.startActivity(buildInstallIntent(context, file))
+    }
+
+    /** Подпись установленного ≠ подпись официального релиза (файл ПОДЛИННЫЙ — SHA-256 сошёлся с манифестом).
+     *  Обновить поверх Android не даёт → честная инструкция вместо «возможна подмена»: удалить и поставить
+     *  заново, APK уже сохранён в «Загрузках» (или скачать со страницы релиза, если сохранить не удалось). */
+    private fun manualReinstallHint(savedLoc: String?, reason: String): String {
+        val head = "Обновить поверх нельзя: $reason. Удалите текущее приложение и установите новую версию заново — данные подписок пропадут, сохраните ссылки."
+        val tail = if (savedLoc != null) " APK уже сохранён: $savedLoc — откройте его в «Загрузках» и нажмите «Установить»."
+                   else " Скачайте APK со страницы релиза на GitHub и установите вручную."
+        return head + tail
     }
 
     /** Пункт 4: копия проверенного APK в общие «Загрузки», чтобы поставить вручную из файлового менеджера.

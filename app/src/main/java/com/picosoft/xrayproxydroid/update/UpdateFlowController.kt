@@ -84,8 +84,10 @@ object UpdateFlowController {
                         _phase.value = phaseFor(tryInstall(app, outcome.file))
                     }
                     is UpdateInstaller.DownloadOutcome.Fail ->
+                        // detail (если есть) несёт ДЕЙСТВЕННОЕ сообщение (напр. при несовпадении подписи — куда
+                        // сохранён APK и что удалить+переустановить); иначе — короткий текст типа ошибки.
                         _phase.value = if (outcome.kind == UpdateErrorKind.CANCELLED) Phase.Idle
-                                       else Phase.Failed(outcome.kind.text)
+                                       else Phase.Failed(outcome.detail.ifBlank { outcome.kind.text })
                 }
             } catch (e: Throwable) {
                 _phase.value = Phase.Failed("Ошибка обновления: ${e.message ?: e.javaClass.simpleName}")
