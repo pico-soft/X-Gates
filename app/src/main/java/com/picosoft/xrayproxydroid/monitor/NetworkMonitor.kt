@@ -52,6 +52,9 @@ object NetworkMonitor {
     private const val WHITE_REFRESH_MS = 30 * 60_000L
     private const val WHITE_EVAL_NORMAL_MS = 30 * 60_000L
     private const val WHITE_EVAL_PROBLEM_MS = 60_000L
+    // Когда режим белых списков АКТИВЕН — проверяем возврат (google вернулся?) ЧАЩЕ обычного, чтобы не сидеть в
+    // сужённом режиме лишние полчаса после разблокировки сети. Дешёвая TCP-проба, не пинг/живость.
+    private const val WHITE_EVAL_ACTIVE_MS = 5 * 60_000L
 
     // Пр.146: в фоновом мониторинге обновляем ВСЕ включённые подписки раз в полчаса (не только белые списки) —
     // чтобы пул серверов не устаревал (мёртвые уходят, новые появляются). Не во время ручного теста/восстановления.
@@ -289,11 +292,37 @@ object NetworkMonitor {
                         .onFailure { MonitorLog.event(app, "error", "Ошибка обновления белых списков", it.message ?: "") }
                 }
                 val problem = ph == TunnelHealth.Phase.NO_SERVERS || ph == TunnelHealth.Phase.RECOVERING || ph == TunnelHealth.Phase.NO_INTERNET
-                val evalDue = now() - lastWhiteEvalMs >= (if (problem) WHITE_EVAL_PROBLEM_MS else WHITE_EVAL_NORMAL_MS)
+                // Часть B: активный белый режим переоцениваем чаще (5 мин) — быстрее вернуться в обычный, когда
+                // google снова доступен. При проблеме — ещё чаще (1 мин, распознать «только белый список»).
+                val whiteInterval = when {
+                    problem -> WHITE_EVAL_PROBLEM_MS
+                    cur.whiteListModeActive -> WHITE_EVAL_ACTIVE_MS
+                    else -> WHITE_EVAL_NORMAL_MS
+                }
+                val evalDue = now() - lastWhiteEvalMs >= whiteInterval
                 if (evalDue) {
                     lastWhiteEvalMs = now()
-                    runCatching { WhiteListDetector.evaluate(app, tunnelForeignOk = false) }
+                    val whiteChanged = runCatching { WhiteListDetector.evaluate(app, tunnelForeignOk = false) }
                         .onFailure { MonitorLog.event(app, "error", "Ошибка оценки белых списков", it.message ?: "") }
+                        .getOrDefault(false)
+                    // Часть A: режим белых списков ТОЛЬКО ЧТО включился → активный (зарубежный) сервер на такой сети
+                    // не поднимется. НЕ ждём провала по grace/восстановлению — СРАЗУ ищем рабочий сервер из белых
+                    // списков (allServers уже сужен до белых источников). Активный УЖЕ белый → не трогаем (живое не
+                    // рвём, Пр.95). Возврат к обычному покрыт периодической evaluate выше (google вернулся).
+                    if (whiteChanged && SettingsStore.current().whiteListModeActive &&
+                        !MonitorCoordinator.fullTestRunning && !MonitorCoordinator.monitorSearchRunning) {
+                        val activeKey = ProxyState.state.value.serverKey
+                        val whiteKeys = SubscriptionManager.allServers(app).map { SubscriptionManager.serverKey(it) }.toSet()
+                        if (activeKey == null || activeKey !in whiteKeys) {
+                            MonitorLog.event(app, "net", "Режим белых списков включён — сразу ищу сервер из белых списков",
+                                if (activeKey == null) "активного нет" else "активный не из белого списка")
+                            TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "белый список: ищу сервер…")
+                            if (runRecoveryLadder(app, SettingsStore.current()) == SwitchResult.SWITCHED) {
+                                lastSwitchMs = now(); lastLiveConfirmedMs = now(); failures = 0; backoffMs = 0
+                            }
+                            continue   // следующий цикл штатно подтвердит живость нового белого сервера
+                        }
+                    }
                 }
             } else if (cur.whiteListModeActive) {
                 // Фичу выключили в настройках, а режим ещё активен → сбросить в обычный.
