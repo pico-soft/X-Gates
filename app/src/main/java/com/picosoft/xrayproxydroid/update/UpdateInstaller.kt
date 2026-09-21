@@ -111,7 +111,9 @@ object UpdateInstaller {
         // SHA-256 уже совпал с манифестом, значит файл тот; расхождение подписи = реальная подмена (Пр.121.C —
         // подпись остаётся последним рубежом).
         when (verifySignature(context, dest)) {
-            SignatureVerdict.OK -> {}
+            // OK — подписи совпали; UNVERIFIABLE — прочитать не смогли, доверяем системному установщику (см.
+            // verifySignature). В обоих случаях идём ставить (файл ПОДЛИННЫЙ — SHA-256 уже сошёлся с манифестом).
+            SignatureVerdict.OK, SignatureVerdict.UNVERIFIABLE -> {}
             // Полевой случай (авто-Android в машине, 0.45): установленное приложение подписано ДРУГИМ ключом
             // (ставилось из другого источника/сборки), поэтому Android не даёт обновить ПОВЕРХ. Файл при этом
             // ПОДЛИННЫЙ — SHA-256 уже сошёлся с манифестом (это НЕ подмена), значит незачем пугать «подменой» и
@@ -229,18 +231,27 @@ object UpdateInstaller {
     }
 
     /** Пункт 1: файл на диске — это ПРОВЕРЕННЫЙ APK именно этой сборки (сумма манифеста + подпись приложения). */
-    private fun isVerifiedApk(context: Context, file: File, artifact: UpdateArtifact): Boolean =
-        file.exists() && file.length() > 0 &&
-            runCatching { sha256Hex(file).equals(artifact.sha256, ignoreCase = true) }.getOrDefault(false) &&
-            verifySignature(context, file) == SignatureVerdict.OK
+    private fun isVerifiedApk(context: Context, file: File, artifact: UpdateArtifact): Boolean {
+        if (!file.exists() || file.length() <= 0) return false
+        if (!runCatching { sha256Hex(file).equals(artifact.sha256, ignoreCase = true) }.getOrDefault(false)) return false
+        // OK и UNVERIFIABLE годятся (файл подлинный по SHA-256; при UNVERIFIABLE решает системный установщик).
+        val v = verifySignature(context, file)
+        return v != SignatureVerdict.MISMATCH && v != SignatureVerdict.DEBUG_INSTALLED
+    }
 
-    private enum class SignatureVerdict { OK, MISMATCH, DEBUG_INSTALLED }
+    // UNVERIFIABLE — подпись хотя бы одной стороны прочитать НАДЁЖНО не удалось (не расхождение, а «не знаем»).
+    private enum class SignatureVerdict { OK, MISMATCH, DEBUG_INSTALLED, UNVERIFIABLE }
 
     /**
-     * Сверяем набор SHA-256 сертификатов подписи скачанного APK с установленным приложением.
-     * Совпал хоть один → OK. Иначе: если установлена ОТЛАДОЧНАЯ сборка (BuildConfig.DEBUG) — это
-     * ожидаемо (debug≠release, поверх не встанет), возвращаем DEBUG_INSTALLED; если релизная — это
-     * настоящее расхождение подписи (возможна подмена), MISMATCH.
+     * Сверяем набор SHA-256 сертификатов подписи скачанного APK с установленным приложением. Совпал хоть один → OK.
+     *
+     * ⚠️ ГРАБЛЯ (полевой случай, авто-Android в машине, установка из GitHub): наши релизы подписаны ТОЛЬКО схемой
+     * v2 (при minSdk 24 AGP отключает v1/JAR). На Android<28 [signaturesOfArchive] читает подпись АРХИВА через
+     * GET_SIGNATURES — а он понимает лишь v1/JAR → набор ПУСТ → раньше это трактовалось как расхождение и обновление
+     * ЛОЖНО блокировалось «подпись не совпадает». Теперь: если подпись хотя бы одной стороны прочитать НЕ удалось —
+     * возвращаем UNVERIFIABLE и НЕ блокируем: системный установщик сверит подпись при установке САМ (авторитетно;
+     * несовпадение он и так не пропустит). Блокируем ТОЛЬКО при УВЕРЕННОМ расхождении (обе стороны прочитаны и не
+     * пересекаются). Сборка теперь v1+v2+v3 → на будущих релизах архив читается и на старых Android.
      */
     private fun verifySignature(context: Context, apk: File): SignatureVerdict {
         val pm = context.packageManager
@@ -250,9 +261,11 @@ object UpdateInstaller {
         val downloaded = try { certHashes(signaturesOfArchive(pm, apk.absolutePath)) } catch (e: Exception) {
             Log.w(TAG, "archive sig read failed", e); emptySet<String>()
         }
-        // Не смогли прочитать подпись скачанного файла — считаем расхождением (не рискуем).
-        if (downloaded.isEmpty()) return if (BuildConfig.DEBUG) SignatureVerdict.DEBUG_INSTALLED else SignatureVerdict.MISMATCH
-        if (installed.isNotEmpty() && installed.intersect(downloaded).isNotEmpty()) return SignatureVerdict.OK
+        if (installed.isEmpty() || downloaded.isEmpty()) {
+            Log.w(TAG, "signature unverifiable (installed=${installed.size}, downloaded=${downloaded.size}) — доверяем системному установщику")
+            return SignatureVerdict.UNVERIFIABLE
+        }
+        if (installed.intersect(downloaded).isNotEmpty()) return SignatureVerdict.OK
         return if (BuildConfig.DEBUG) SignatureVerdict.DEBUG_INSTALLED else SignatureVerdict.MISMATCH
     }
 
@@ -278,8 +291,12 @@ object UpdateInstaller {
 
     private fun signaturesFromInfo(si: android.content.pm.SigningInfo?): Array<Signature> {
         if (si == null) return emptyArray()
-        return if (si.hasMultipleSigners()) si.apkContentsSigners ?: emptyArray()
-        else si.signingCertificateHistory ?: si.apkContentsSigners ?: emptyArray()
+        if (si.hasMultipleSigners()) return si.apkContentsSigners ?: emptyArray()
+        // Одиночный подписант: берём И текущих подписантов, И историю ротации — у архива и у установленного пакета
+        // эти поля заполняются по-разному; объединение надёжнее выбора одного (certHashes дедупит).
+        val current = si.apkContentsSigners ?: emptyArray()
+        val history = si.signingCertificateHistory ?: emptyArray()
+        return current + history
     }
 
     private fun certHashes(sigs: Array<Signature>): Set<String> {

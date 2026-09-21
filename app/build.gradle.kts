@@ -47,6 +47,15 @@ android {
                 storePassword = releaseProp("RELEASE_STORE_PASSWORD")
                 keyAlias = releaseProp("RELEASE_KEY_ALIAS")
                 keyPassword = releaseProp("RELEASE_KEY_PASSWORD")
+                // Раньше релизы были v2-ТОЛЬКО. Это ломало ПРЕД-проверку подписи обновлялки: getPackageArchiveInfo
+                // у архива отдавал пустую историю подписантов → ложное «подпись не совпадает» (полевой случай:
+                // авто-Android в машине, установка из GitHub — а обновление отклонялось). Корневой фикс — в
+                // UpdateInstaller.verifySignature (объединяем подписантов + не блокируем при нечитаемой подписи).
+                // ДОПОЛНИТЕЛЬНО включаем v3: добавляет lineage подписи → архив читается надёжнее и старой обвязкой.
+                // Ключ/сертификат ТОТ ЖЕ (2a2483…cfb63) → обновление поверх прежних установок совместимо. (v1/JAR AGP
+                // при minSdk 24 всё равно не добавляет — и не нужно: система ставит v2/v3 напрямую.)
+                enableV2Signing = true
+                enableV3Signing = true
             }
         }
     }
