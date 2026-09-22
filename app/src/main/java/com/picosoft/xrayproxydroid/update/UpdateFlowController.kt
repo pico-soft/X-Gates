@@ -51,23 +51,30 @@ object UpdateFlowController {
         val app = context.applicationContext
         Thread {
             try {
-                var avail = UpdateStore.live.value as? UpdateCheckResult.Available
-                // Уже скачан этот же код → просто доустановить (без повторной загрузки).
+                // ТЗ Elyor: ВСЕГДА перепроверяем latest перед скачиванием. Баннер мог зафиксировать ПРОМЕЖУТОЧНУЮ
+                // версию (фоновая проверка прошла ДО выхода более свежего релиза) — на Фолде так качалась 0.48, хотя
+                // latest уже 0.50. Качаем ИМЕННО текущий latest, а не запомненный. Если перепроверка не удалась
+                // (сеть), UpdateStore.live держит прежний Available — используем его (лучше, чем ничего).
+                _phase.value = Phase.Checking
+                runCatching { UpdateChecker.check(app, manual = true) }.getOrNull()?.let {
+                    UpdateStore.apply(app, it, System.currentTimeMillis())
+                }
+                val live = UpdateStore.live.value
+                val avail = live as? UpdateCheckResult.Available
+                if (avail == null) {
+                    _phase.value = when (live) {
+                        is UpdateCheckResult.UpToDate -> Phase.Failed("У вас уже последняя версия — обновление не требуется")
+                        else -> Phase.Failed("Обновление недоступно — попробуйте позже")
+                    }
+                    return@Thread
+                }
+                // Уже скачан ИМЕННО этот (текущий latest) код → доустановить без повторной загрузки.
                 readyFile?.let { f ->
-                    if (f.exists() && (avail == null || readyForCode == avail.versionCode)) {
+                    if (f.exists() && readyForCode == avail.versionCode) {
                         _phase.value = phaseFor(tryInstall(app, f))
                         return@Thread
                     }
                 }
-                // Available из последней проверки; если в этой сессии не проверяли — проверить сейчас.
-                if (avail == null) {
-                    _phase.value = Phase.Checking
-                    runCatching { UpdateChecker.check(app, manual = true) }.getOrNull()?.let {
-                        UpdateStore.apply(app, it, System.currentTimeMillis())
-                    }
-                    avail = UpdateStore.live.value as? UpdateCheckResult.Available
-                }
-                if (avail == null) { _phase.value = Phase.Failed("Обновление недоступно — попробуйте позже"); return@Thread }
 
                 _phase.value = Phase.Downloading(0L, avail.sizeBytes)
                 var lastShown = 0L
