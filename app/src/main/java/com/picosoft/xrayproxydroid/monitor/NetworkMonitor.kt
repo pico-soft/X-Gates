@@ -1121,9 +1121,12 @@ object NetworkMonitor {
     }
 
     /**
-     * Шаг 2: пинг ВСЕХ → новый топ по пингу → ПОЛНЫЙ замер «новичков» (у кого нет свежего сохранённого ≥ порога —
-     * фиксация не перемеряется) → выгружаем свежий топ на главную (applySpeedResults). Активный тут НЕ переключаем
-     * (это дело «держать лучший»/восстановления) — только держим список свежим. ≥ порога экономим (не трогаем).
+     * Шаг 2: пинг ВСЕХ → замер живых по пингу, у кого НЕТ годной скорости. ТЗ Elyor (2026-09-22): агрессивность по
+     * питанию/сети — ЗАРЯДКА+Wi-Fi (не ограничены ни батареей, ни трафиком) → мерим ВСЕХ живых по пингу; иначе
+     * (зарядка+моб / батарея) → держим [fastTopTarget] живых-по-скорости (добор до 10 по возрастанию пинга).
+     * ПРИНЦИП: сервер, уже измеренный ≥ порога (degradationMinMbps) И живой по пингу — СТАБИЛЕН, скорость НЕ
+     * перемеряем (отдал пинг → считаем скорость прежней). Перестал пинговаться → уходит из «Живых» (freshPingFailed),
+     * освобождает слот → добираем замену следующим по пингу. Активный тут НЕ переключаем (это «держать лучший»/восст.).
      */
     private suspend fun rebuildAndRateTop(app: Context, s: AppSettings) {
         if (MonitorCoordinator.fullTestRunning) return
@@ -1132,30 +1135,30 @@ object NetworkMonitor {
             runCatching { refreshAllPings(app, s) }   // пинг всех: ловим воскресших/новичков, чистим мёртвых
             val bl = BlocklistStore.current()
             fun key(p: com.picosoft.xrayproxydroid.xray.link.ServerProfile) = SubscriptionManager.serverKey(p)
-            val n = s.fastTopTarget.coerceAtLeast(1)
-            val threshold = s.sufficientMbps.coerceAtLeast(0.1)
-            val freshHours = (s.topFreshSec.coerceAtLeast(3600) / 3600).coerceAtLeast(1)
-            val lockedInKeys = runCatching {
-                SubscriptionManager.recentWorkingServers(app, freshHours)
-                    .filter { (it.speedMbps ?: 0.0) >= threshold }.map { key(it) }.toSet()
-            }.getOrDefault(emptySet())
-            val topByPing = SubscriptionManager.allServers(app)
+            val keepThreshold = s.degradationMinMbps.coerceAtLeast(0.1)   // ≥ этого = «живой по скорости», стабилен
+            val target = s.fastTopTarget.coerceAtLeast(1)
+            val measureAll = isCharging(app) && !EconomyNet.lastKnownMobile   // зарядка+Wi-Fi → мерим ВСЕХ живых
+            val aliveByPing = SubscriptionManager.allServers(app)
                 .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl) && !ServerFilter.isPaused(it, bl) }
                 .filter { (it.pingMs ?: -1) >= 0 }
                 .distinctBy { key(it) }
                 .sortedBy { it.pingMs ?: Int.MAX_VALUE }
-                .take(n)
+            // Уже измеренные годные (≥ порога) и живые по пингу → СТАБИЛЬНЫ, НЕ перемеряем (ТЗ: отдал пинг = скорость та же).
+            val goodMeasured = aliveByPing.count { (it.speedMbps ?: 0.0) >= keepThreshold }
+            // Кандидаты на замер: живые по пингу без годной скорости (не мерены / < порога), по возрастанию пинга.
+            val needMeasure = aliveByPing.filter { (it.speedMbps ?: 0.0) < keepThreshold }
+            val toMeasure = if (measureAll) needMeasure
+                            else needMeasure.take((target - goodMeasured).coerceAtLeast(0))   // добор до [target]
             val results = HashMap<String, Double>()
             var measured = 0
-            for (p in topByPing) {
+            for (p in toMeasure) {
                 if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey == null) break
-                if (key(p) in lockedInKeys) continue   // фиксация — свежий ≥ порога не перемеряем
-                val mbps = ServerSpeedTester.measureSpeed(app, p)   // полный замер новичка
-                results[key(p)] = mbps
+                results[key(p)] = ServerSpeedTester.measureSpeed(app, p)   // полный замер
                 measured++
             }
-            if (results.isNotEmpty()) SubscriptionManager.applySpeedResults(app, results)   // выгрузка топа на главную
-            MonitorLog.event(app, "monitor", "Фон: топ обновлён", "замерено новичков $measured, зафиксировано ${lockedInKeys.size}")
+            if (results.isNotEmpty()) SubscriptionManager.applySpeedResults(app, results)
+            MonitorLog.event(app, "monitor", "Фон: топ обновлён",
+                "режим ${if (measureAll) "все живые (шнур+Wi-Fi)" else "до $target"}: замерено $measured, годных живых $goodMeasured")
         } finally {
             MonitorCoordinator.monitorSearchRunning = false
         }

@@ -866,7 +866,9 @@ private fun buildDiscriminators(servers: List<ServerProfile>, bl: Blocklist): Ma
     return result
 }
 
-// Промпт 123.E: давность замера скорости в списке — «24 Мбит/с минутной давности» ≠ «двухдневной».
+// Промпт 123.E: давность пинга/замера в списке (в МИНУТАХ/часах — как удобнее) — «24 Мбит/с минутной давности»
+// ≠ «двухдневной». Показываем ДВЕ отдельные метки: слева «пинг NNN мс · N мин» (когда пинговали), справа
+// скорость + «N мин» (когда мерили) — чтобы видеть и свежесть пинга, и свежесть замера отдельно (ТЗ Elyor).
 private val speedTsFmt = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
 private fun speedAgeText(ts: String?): String {
     if (ts.isNullOrBlank()) return ""
