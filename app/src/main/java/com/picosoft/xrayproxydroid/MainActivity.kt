@@ -2319,8 +2319,9 @@ private fun ServerRow(
                     }
                     if (pingStr != null) {
                         val pingAge = speedAgeText(profile.lastTestedTs)
+                        // Тире (не «·»): читается как «пинг 81 мс — 9 мин назад» (ТЗ Elyor: «пинг такой-то — N мин назад»).
                         Text(
-                            pingStr + (if (pingAge.isNotEmpty()) " · $pingAge" else ""),
+                            pingStr + (if (pingAge.isNotEmpty()) " — $pingAge" else ""),
                             fontSize = TABLE_FONT_SUB, color = TABLE_GRAY, maxLines = 1,
                         )
                     }
