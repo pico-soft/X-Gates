@@ -1078,8 +1078,16 @@ object NetworkMonitor {
     // ---- Фоновый рейтинг топа (ТЗ Elyor): шнур/батарея × сеть ----
 
     /** Телефон на зарядке (шнур)? На шнуре рейтинг агрессивнее (батарея не тратится). minSdk 24 → isCharging всегда есть. */
+    // «На шнуре» для агрессивного фон-рейтинга. ⚠️ ГРАБЛЯ (полевой случай S908E, ночь на зарядке): голый
+    // BatteryManager.isCharging при статусе FULL (100%) возвращает FALSE, хотя шнур воткнут → монитор ночью, дозарядившись,
+    // считал себя «на батарее» и переставал держать топ свежим (при экране-выкл — вообще без пинга топа). Определяем
+    // питание по ФАКТУ ПОДКЛЮЧЕНИЯ (EXTRA_PLUGGED: AC/USB/Wireless) ИЛИ isCharging: на шнуре при 100% батарея не тратится,
+    // держим агрессивный режим.
     private fun isCharging(app: Context): Boolean = runCatching {
-        (app.getSystemService(Context.BATTERY_SERVICE) as? android.os.BatteryManager)?.isCharging ?: false
+        val bm = app.getSystemService(Context.BATTERY_SERVICE) as? android.os.BatteryManager
+        if (bm?.isCharging == true) return@runCatching true
+        val intent = app.registerReceiver(null, android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))
+        (intent?.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0) ?: 0) != 0   // AC/USB/Wireless — шнур воткнут
     }.getOrDefault(false)
 
     /**
