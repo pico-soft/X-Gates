@@ -877,9 +877,9 @@ private fun speedAgeText(ts: String?): String {
     return when {
         min < 0 -> ""
         min < 1 -> "сейчас"
-        min < 60 -> "$min мин"
-        min < 1440 -> "${min / 60} ч"
-        else -> "${min / 1440} дн"
+        min < 60 -> "$min мин назад"
+        min < 1440 -> "${min / 60} ч назад"
+        else -> "${min / 1440} дн назад"
     }
 }
 
