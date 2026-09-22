@@ -870,9 +870,7 @@ private fun buildDiscriminators(servers: List<ServerProfile>, bl: Blocklist): Ma
 // ≠ «двухдневной». Показываем ДВЕ отдельные метки: слева «пинг NNN мс · N мин» (когда пинговали), справа
 // скорость + «N мин» (когда мерили) — чтобы видеть и свежесть пинга, и свежесть замера отдельно (ТЗ Elyor).
 private val speedTsFmt = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
-private fun speedAgeText(ts: String?): String {
-    if (ts.isNullOrBlank()) return ""
-    val t = runCatching { speedTsFmt.parse(ts)?.time }.getOrNull() ?: return ""
+private fun speedAgeTextMs(t: Long): String {
     val min = (System.currentTimeMillis() - t) / 60_000
     return when {
         min < 0 -> ""
@@ -881,6 +879,11 @@ private fun speedAgeText(ts: String?): String {
         min < 1440 -> "${min / 60} ч назад"
         else -> "${min / 1440} дн назад"
     }
+}
+private fun speedAgeText(ts: String?): String {
+    if (ts.isNullOrBlank()) return ""
+    val t = runCatching { speedTsFmt.parse(ts)?.time }.getOrNull() ?: return ""
+    return speedAgeTextMs(t)
 }
 
 /** Компактная ячейка скорости (число: ≥10 → целое, <10 → 1 знак; единица «Мбит/с» — в шапке). */
@@ -933,6 +936,9 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
     var allServersExpanded by rememberSaveable { mutableStateOf(false) }
 
     var pingResults by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
+    // Когда пришёл СЕССИОННЫЙ пинг (из «Самый быстрый»): значение в pingResults метки времени не несёт, а
+    // profile.lastTestedTs синхронизируется лишь по завершении теста → без этого пинг показывался БЕЗ времени.
+    var pingResultsAt by remember { mutableStateOf<Map<String, Long>>(emptyMap()) }
 
     var speedResults by remember { mutableStateOf<Map<String, Double>>(emptyMap()) }
 
@@ -998,6 +1004,15 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
 
     fun effPing(p: ServerProfile): Int? = pingResults[SubscriptionManager.serverKey(p)] ?: p.pingMs
     fun effSpeed(p: ServerProfile): Double? = speedResults[SubscriptionManager.serverKey(p)] ?: p.speedMbps
+    // Давность пинга ВСЕГДА в паре со значением: сессионный пинг (из pingResults) → его время из pingResultsAt;
+    // иначе сохранённый lastTestedTs; а если пинг есть, но метки нет (легаси-данные) — честно «давно» (уточнится
+    // при следующем пере-пинге монитора). Так строка НИКОГДА не показывает пинг без времени (ТЗ Elyor).
+    fun effPingAge(p: ServerProfile): String {
+        val key = SubscriptionManager.serverKey(p)
+        if (pingResults.containsKey(key)) return speedAgeTextMs(pingResultsAt[key] ?: System.currentTimeMillis())
+        val age = speedAgeText(p.lastTestedTs)
+        return if (age.isNotEmpty()) age else if (p.pingMs != null) "давно" else ""   // пинг был (в т.ч. ✗) → время всегда
+    }
 
     fun startServer(p: ServerProfile) {
         val cfg = runCatching { XrayConfigBuilder.build(p) }.getOrElse {
@@ -1120,7 +1135,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
         MonitorCoordinator.wake()                   // прервать возможный перебор/паузу монитора
         CrashContext.set("полный тест: старт")
         TestProgress.startIndeterminate("запуск…")   // до первого done/total — indeterminate
-        pingResults = emptyMap(); speedResults = emptyMap()
+        pingResults = emptyMap(); pingResultsAt = emptyMap(); speedResults = emptyMap()
 
         fullHandle = FullTestRunner.run(
             context = context,
@@ -1129,7 +1144,8 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
             onPhase = { ph -> TestProgress.phase(ph); CrashContext.set("тест: $ph") },
             emitProgress = { done, total -> TestProgress.progress(done, total) },
             onPingResult = { p, ms ->
-                activity.runOnUiThread { pingResults = pingResults + (SubscriptionManager.serverKey(p) to ms) }
+                val k = SubscriptionManager.serverKey(p)
+                activity.runOnUiThread { pingResults = pingResults + (k to ms); pingResultsAt = pingResultsAt + (k to System.currentTimeMillis()) }
             },
             onSpeedResult = { p, mbps ->
                 activity.runOnUiThread { speedResults = speedResults + (SubscriptionManager.serverKey(p) to mbps) }
@@ -1646,7 +1662,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
             Box(Modifier.fillMaxWidth().background(liveBg).then(rowMod)) {
                 ServerRow(
                     profile = p, name = displayName(p, blocklist), isActive = isActive,
-                    speedMbps = effSpeed(p), number = index + 1, pingMs = effPing(p), caption = discriminators[SubscriptionManager.serverKey(p)] ?: "",
+                    speedMbps = effSpeed(p), number = index + 1, pingMs = effPing(p), pingAge = effPingAge(p), caption = discriminators[SubscriptionManager.serverKey(p)] ?: "",
                     onConnect = { connectServer(p, "ручной выбор") },
                     onDetails = { detailProfile = p; remeasureStatus = "" },
                     showUseToggle = true,
@@ -1680,7 +1696,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                 Box(Modifier.fillMaxWidth().background(allBg).then(rowMod)) {
                     ServerRow(
                         profile = p, name = displayName(p, blocklist), isActive = isActive,
-                        speedMbps = effSpeed(p), pingMs = effPing(p), caption = discriminators[SubscriptionManager.serverKey(p)] ?: "",
+                        speedMbps = effSpeed(p), pingMs = effPing(p), pingAge = effPingAge(p), caption = discriminators[SubscriptionManager.serverKey(p)] ?: "",
                         onConnect = { connectServer(p, "ручной выбор") },
                         onDetails = { detailProfile = p; remeasureStatus = "" },
                         showUseToggle = true,
@@ -2276,6 +2292,7 @@ private fun ServerRow(
     speedMbps: Double?,
     number: Int = 0,                   // номер в списке «Живые» (1-based); 0 = не показывать. Виден и в плашке.
     pingMs: Int? = null,               // Пр.146: ЭФФЕКТИВНЫЙ пинг (effPing = сессионный ?: сохранённый), как и speed
+    pingAge: String = "",              // ТЗ Elyor: давность пинга В ПАРЕ со значением (effPingAge) — всегда есть, если пинг есть
     caption: String,
     onConnect: () -> Unit,
     onDetails: () -> Unit,
@@ -2318,8 +2335,8 @@ private fun ServerRow(
                         else -> "пинг $pingMs мс"
                     }
                     if (pingStr != null) {
-                        val pingAge = speedAgeText(profile.lastTestedTs)
-                        // Тире (не «·»): читается как «пинг 81 мс — 9 мин назад» (ТЗ Elyor: «пинг такой-то — N мин назад»).
+                        // Давность — из переданного [pingAge] (effPingAge: сессионное время ?: lastTestedTs ?: «давно»),
+                        // ВСЕГДА в паре со значением. Тире: «пинг 81 мс — 9 мин назад» (ТЗ Elyor).
                         Text(
                             pingStr + (if (pingAge.isNotEmpty()) " — $pingAge" else ""),
                             fontSize = TABLE_FONT_SUB, color = TABLE_GRAY, maxLines = 1,
