@@ -2346,12 +2346,12 @@ private fun ServerRow(
                         else -> "пинг $pingMs мс"
                     }
                     if (pingStr != null) {
-                        // Давность — из переданного [pingAge] (effPingAge: сессионное время ?: lastTestedTs ?: «давно»),
-                        // ВСЕГДА в паре со значением. Тире: «пинг 81 мс — 9 мин назад» (ТЗ Elyor).
-                        Text(
-                            pingStr + (if (pingAge.isNotEmpty()) " — $pingAge" else ""),
-                            fontSize = TABLE_FONT_SUB, color = TABLE_GRAY, maxLines = 1,
-                        )
+                        // ДВЕ явные строки: значение пинга и под ним давность (effPingAge). Колонка узкая (~319px) —
+                        // одной строкой «пинг 81 мс — 28 мин назад» РЕЗАЛОСЬ (жалоба «после тире цифра/ничего»). Раздельно
+                        // каждая короткая → всегда видна целиком. Давность ВСЕГДА в паре со значением (ТЗ Elyor).
+                        Text(pingStr, fontSize = TABLE_FONT_SUB, color = TABLE_GRAY, maxLines = 1)
+                        if (pingAge.isNotEmpty())
+                            Text(pingAge, fontSize = TABLE_FONT_SUB, color = TABLE_GRAY, maxLines = 1)
                     }
                 }
             }
