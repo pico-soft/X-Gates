@@ -1,29 +1,29 @@
 {
   "_comment": "ОБРАЗЕЦ манифеста обновления (Промпт 70). В КАЖДЫЙ релиз кладётся вложением с именем update.json. Публичный API GitHub versionCode не отдаёт — обновлялка сравнивает версии ТОЛЬКО по versionCode отсюда (строго БОЛЬШЕ установленного). Перед публикацией: (1) versionCode/versionName должны совпасть с app/build.gradle.kts; (2) packageName = имя пакета приложения — обновлялка проверяет, что релиз НАШ, до скачивания APK (Промпт 121.C); (3) в каждый sha256 подставить РЕАЛЬНУЮ SHA-256 собранного APK (shasum -a 256 <файл>); (4) имена в fileName — КОНТРАКТ с обновлялкой (…-arm64-v8a.apk и т.д.), совпадают с именами вложений релиза. Схему имён вложений НЕ меняем при ребренде/переименовании репозитория (Промпт 106.E/121.E). Релиз публиковать ПОЛНЫМ (не draft, не prerelease) — иначе releases/latest его не отдаёт.",
-  "versionCode": 42,
-  "versionName": "0.51 beta",
+  "versionCode": 43,
+  "versionName": "0.52 beta",
   "packageName": "com.picosoft.xrayproxydroid",
-  "notes": "Обновление всегда качает самую свежую версию. • Раньше баннер «доступно обновление» мог скачать промежуточную версию, зафиксированную при фоновой проверке (если позже вышел релиз новее). Теперь при нажатии на баннер приложение заново узнаёт последнюю версию и скачивает именно её.",
+  "notes": "Добавлена подписка «Yzewe» (включена по умолчанию). • В список подписок автоматически добавляется «Yzewe» (https://vpn.yzewe.ru/sub), включённая по умолчанию — и на новых установках, и на существующих при обновлении. Если вы её удалите, обратно она не вернётся. Серверы подтянутся при ближайшем обновлении списка.",
   "artifacts": [
     {
       "abi": "arm64-v8a",
-      "fileName": "XrayProxyDroid-0.51-arm64-v8a.apk",
-      "sha256": "abf35fb7812b009b990ac5e19663d0e97fef4728b3bb4d0fc4602e63a80e0196"
+      "fileName": "XrayProxyDroid-0.52-arm64-v8a.apk",
+      "sha256": "99f56b362017435b6d1f073a8a55ebef7468708e2c5c0d12772b1b26fe2980e5"
     },
     {
       "abi": "armeabi-v7a",
-      "fileName": "XrayProxyDroid-0.51-armeabi-v7a.apk",
-      "sha256": "0ca49b3c034c3788bd9485b7c1fc6210bbe624420e069126032debe22d67aa69"
+      "fileName": "XrayProxyDroid-0.52-armeabi-v7a.apk",
+      "sha256": "0ecbd028388b24e155af2dfb105aa0d2c569112e64018170066c8b59c6a2c5a4"
     },
     {
       "abi": "x86_64",
-      "fileName": "XrayProxyDroid-0.51-x86_64.apk",
-      "sha256": "884630443a8a694d16b815ce23f9ca48a8815cb0d39ab3c31f394de8cc6d71b8"
+      "fileName": "XrayProxyDroid-0.52-x86_64.apk",
+      "sha256": "809469a5f0540b0a0809696816fff773fc5ab0fe441593891ef4a97fd32f0753"
     },
     {
       "abi": "universal",
-      "fileName": "XrayProxyDroid-0.51-universal.apk",
-      "sha256": "a5dada901869a362e0ebe7d65b46798d907f473d730a29cbb4b0d475b45b1858"
+      "fileName": "XrayProxyDroid-0.52-universal.apk",
+      "sha256": "ce23fd1ad5d7e75865470f2653e2dc665db1b923ae1d9d4b9daa9044d2f1f8db"
     }
   ]
 }
