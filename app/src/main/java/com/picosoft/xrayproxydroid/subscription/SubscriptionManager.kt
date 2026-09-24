@@ -53,6 +53,10 @@ object SubscriptionManager {
     const val DEFAULT_SOURCE_URL = "https://raw.githack.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS_mobile.txt"
     const val DEFAULT_SOURCE_NAME = "Обход ограничений в РФ по-умолчанию"
 
+    /** Дефолтная подписка «Yzewe» — ВКЛючена по умолчанию, добавляется всем (свежим и существующим при обновлении). */
+    const val YZEWE_SOURCE_URL = "https://vpn.yzewe.ru/sub"
+    const val YZEWE_SOURCE_NAME = "Yzewe"
+
     /** Пр.140: источники «белого списка РФ» — сеются ВЫКЛ, авто-обновляются раз в полчаса (безакцептно), используются
      *  только в режиме белых списков (или если юзер включит их вручную). Дедуп по URL (не плодим дубли). Каждую
      *  пробуем каждые полчаса: на GitHub файлы меняются — какой-то может временно отдавать 404 (напр. `…-2.txt`
@@ -104,6 +108,9 @@ object SubscriptionManager {
         // Пр.140: добавить источники белого списка (ВЫКЛ) существующим установкам, у кого их ещё нет. Только
         // метаданные (URL) — тела подтянет авто-рефреш раз в полчаса. На свежей установке их сеет trySeedDefaultSource.
         runCatching { ensureWhiteListSources(context) }
+        // Yzewe: добавить дефолтную подписку (ВКЛ) существующим установкам — разово (флаг seededYzewe). Тела
+        // подтянет ближайший рефреш (автозапуск/«Самый быстрый»/авто раз в полчаса). На свежей — в trySeedDefaultSource.
+        runCatching { ensureYzewe(context) }
         // Промпт 85.E: самопроверка — неполные (осиротевшие) профили пересобрать из сырья + записать в журнал.
         runCatching { verifyAndHeal(context) }
         // Пр.136: восстановить статус посева для UI (переживает перезапуск) — чтобы карточка «не загрузилось»
@@ -153,10 +160,13 @@ object SubscriptionManager {
         val whiteSources = WHITE_LIST_SOURCES.map { (nm, u) ->
             SubSource(id = newId(), name = nm, url = normalizeUrl(u), enabled = false, whiteList = true)
         }
+        // Yzewe (ВКЛ) сеем ВМЕСТЕ с дефолтом — тело подтянет ближайший рефреш enabled-источников (автозапуск).
+        val yzewe = SubSource(id = newId(), name = YZEWE_SOURCE_NAME, url = normalizeUrl(YZEWE_SOURCE_URL), enabled = true)
         SubscriptionStore.save(context, f2.copy(
             seededDefaultRuBypass = true,
+            seededYzewe = true,
             seedLastError = "",                                // успех — чистим прежнюю ошибку
-            sources = listOf(SubSource(id = id, name = DEFAULT_SOURCE_NAME, url = url, enabled = true)) + whiteSources,
+            sources = listOf(SubSource(id = id, name = DEFAULT_SOURCE_NAME, url = url, enabled = true), yzewe) + whiteSources,
         ))
         importInto(context, id, cascade.result!!.body, "Дефолтная подписка (первый успешный фетч)")
         _seedStatus.value = SeedStatus(attempted = true, error = "")
@@ -175,6 +185,20 @@ object SubscriptionManager {
         if (missing.isEmpty()) return
         SubscriptionStore.save(context, file.copy(sources = file.sources + missing))
         Log.i(TAG, "добавлены источники белого списка (ВЫКЛ): ${missing.size}")
+    }
+
+    /** Yzewe: добавить дефолтную подписку (ВКЛ) РАЗОВО, если ещё не добавляли (флаг seededYzewe) и её URL ещё нет.
+     *  Уважает удаление пользователем (флаг остаётся → повторно не вернётся). Только метаданные — тело подтянет
+     *  ближайший рефреш enabled-источников. Идемпотентно. */
+    fun ensureYzewe(context: Context) {
+        val file = SubscriptionStore.load(context)
+        if (file.seededYzewe) return
+        val url = normalizeUrl(YZEWE_SOURCE_URL)
+        val already = file.sources.any { it.url == url }
+        val sources = if (already) file.sources
+                      else file.sources + SubSource(id = newId(), name = YZEWE_SOURCE_NAME, url = url, enabled = true)
+        SubscriptionStore.save(context, file.copy(seededYzewe = true, sources = sources))
+        if (!already) Log.i(TAG, "добавлена дефолтная подписка Yzewe (ВКЛ)")
     }
 
     /** Пр.140: id источников белого списка. */

@@ -71,6 +71,9 @@ data class ServerRecord(
 data class SourcesFile(
     val migratedLegacy: Boolean = false,
     val seededDefaultRuBypass: Boolean = false,
+    // Дефолтную подписку «Yzewe» (ВКЛ) добавляем разово каждому — на свежую установку и существующим при
+    // обновлении. Флаг не даёт ей вернуться после удаления пользователем (как seededDefaultRuBypass выше).
+    val seededYzewe: Boolean = false,
     val sources: List<SubSource> = emptyList(),
     val servers: List<ServerRecord> = emptyList(),
     // Промпт 85: СЫРОЙ ответ каждого источника (sourceId → тело). Позволяет ПЕРЕСОБРАТЬ реестр целиком из
