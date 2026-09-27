@@ -4158,14 +4158,23 @@ private fun UpdateCheckSection() {
     }
 
     fun install(file: File) {
-        if (!UpdateInstaller.canInstall(context)) {
-            message = "Нужно разрешить установку приложений из этого источника — открываю системный экран. После разрешения нажмите «Установить»."
-            UpdateInstaller.openInstallPermissionSettings(context)
-            return
+        // startInstall сам справляется с грантом источника (системный установщик/session спрашивают инлайн), поэтому
+        // НЕ гейтим заранее canInstall — иначе на магнитолах уходили на несуществующий экран настроек. Пробуем начать
+        // установку, а на экран разрешения отправляем только если НИ ОДИН путь не стартовал.
+        when (UpdateInstaller.startInstall(context, file)) {
+            UpdateInstaller.InstallStart.VIEW, UpdateInstaller.InstallStart.SESSION -> {
+                message = "Открывается системный установщик — подтвердите установку. Если окно не появилось, нажмите «Другой способ установки» ниже."
+                NotificationHelper.cancelUpdate(context); UpdateStore.markDismissed(context)
+            }
+            UpdateInstaller.InstallStart.FAILED -> {
+                if (!UpdateInstaller.canInstall(context)) {
+                    message = "Нужно разрешить установку приложений из этого источника — открываю системный экран. После разрешения нажмите «Установить»."
+                    UpdateInstaller.openInstallPermissionSettings(context)
+                } else {
+                    message = "На этом устройстве не открылся системный установщик. Нажмите «Сохранить APK в Загрузки» и установите через файловый менеджер."
+                }
+            }
         }
-        UpdateInstaller.launchInstaller(context, file)
-        // Промпт 93.J: обновление устанавливается → снять уведомление и полосу для этой версии.
-        NotificationHelper.cancelUpdate(context); UpdateStore.markDismissed(context)
     }
 
     fun startDownload(available: UpdateCheckResult.Available) {
@@ -4258,6 +4267,21 @@ private fun UpdateCheckSection() {
                 avail != null -> ButtonLabel(UiIcon.PLAY, "Скачать и установить")
                 else -> ButtonLabel(UiIcon.REFRESH, "Проверить обновление")
             }
+        }
+
+        // Магнитолы/head unit: если по кнопке «Установить» системное окно так и не появилось (нет обработчика
+        // ACTION_VIEW ИЛИ он «молчит»), даём ДРУГОЙ способ — системный PackageInstaller (session API), который окно
+        // подтверждения возвращает сам. Один тап, без файлового менеджера.
+        if (readyFile != null) {
+            OutlinedButton(
+                onClick = {
+                    val f = readyFile ?: return@OutlinedButton
+                    val ok = UpdateInstaller.installViaSession(context, f)
+                    message = if (ok) "Запускаю установку другим способом — подтвердите в системном окне. Если и оно не появилось, сохраните APK в Загрузки (кнопка ниже)."
+                              else "Другой способ тоже не сработал. Сохраните APK в Загрузки и поставьте через файловый менеджер."
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) { ButtonLabel(UiIcon.PLAY, "Другой способ установки (системный)") }
         }
 
         // Пункт 4: если окно установки так и не появилось — запасной ручной путь. Сохраняем ПРОВЕРЕННЫЙ APK

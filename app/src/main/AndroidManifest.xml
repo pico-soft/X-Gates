@@ -82,6 +82,12 @@
             </intent-filter>
         </receiver>
 
+        <!-- Статус установки через системный PackageInstaller (session API — запасной путь для устройств без
+             активити-обработчика ACTION_VIEW, напр. автомагнитолы). Не экспортируем: адресуем по компоненту. -->
+        <receiver
+            android:name=".update.UpdateInstallReceiver"
+            android:exported="false" />
+
         <!-- Отдаём скачанный APK обновления системному установщику через content:// (Промпт 70).
              Файл лежит в приватном filesDir/updates (не в общих загрузках). -->
         <provider

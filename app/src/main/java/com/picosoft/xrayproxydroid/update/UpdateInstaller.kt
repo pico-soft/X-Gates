@@ -1,7 +1,10 @@
 package com.picosoft.xrayproxydroid.update
 
+import android.app.PendingIntent
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
 import android.content.pm.Signature
 import android.net.Uri
@@ -175,9 +178,60 @@ object UpdateInstaller {
         }
     }
 
-    /** Запустить системный установщик для проверенного файла (прямой startActivity — только с переднего плана). */
-    fun launchInstaller(context: Context, file: File) {
-        context.startActivity(buildInstallIntent(context, file))
+    /** Как именно удалось запустить установку (для честного сообщения пользователю). */
+    enum class InstallStart { VIEW, SESSION, FAILED }
+
+    /**
+     * Запустить установку максимально надёжно (передний план). Сначала штатный ACTION_VIEW (как на телефонах —
+     * поведение НЕ меняем). Если системе нечем открыть файловую установку (ActivityNotFoundException — полевой
+     * случай автомагнитол/Android head unit) — падаем на системный PackageInstaller (session API), которому не
+     * нужен сторонний обработчик и который спрашивает подтверждение/грант источника инлайн. Возврат сообщает, каким
+     * путём пошло (или FAILED — не удалось начать НИ ОДНИМ способом → зовущий даёт ручной путь).
+     */
+    fun startInstall(context: Context, file: File): InstallStart {
+        try {
+            context.startActivity(buildInstallIntent(context, file))
+            return InstallStart.VIEW
+        } catch (e: ActivityNotFoundException) {
+            Log.w(TAG, "ACTION_VIEW install: нет обработчика — пробую PackageInstaller session", e)
+        } catch (e: Exception) {
+            Log.w(TAG, "ACTION_VIEW install не удался — пробую PackageInstaller session", e)
+        }
+        return if (installViaSession(context, file)) InstallStart.SESSION else InstallStart.FAILED
+    }
+
+    /** Совместимость: true, если установка начата любым способом (не FAILED). */
+    fun launchInstaller(context: Context, file: File): Boolean = startInstall(context, file) != InstallStart.FAILED
+
+    /**
+     * Установка через системный PackageInstaller (session API) — без стороннего активити-обработчика. Пишем APK в
+     * сессию и коммитим; статус/подтверждение приходят в [UpdateInstallReceiver] (там же открывается системное окно
+     * подтверждения и грант источника). true — сессия создана и закоммичена (окно подтверждения последует);
+     * false — не удалось даже начать (например, нет службы установки — крайне редко).
+     */
+    fun installViaSession(context: Context, file: File): Boolean {
+        if (!file.exists() || file.length() <= 0) return false
+        return try {
+            val installer = context.packageManager.packageInstaller
+            val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
+            runCatching { params.setAppPackageName(context.packageName) }
+            val sessionId = installer.createSession(params)
+            installer.openSession(sessionId).use { session ->
+                val out = session.openWrite("base.apk", 0, file.length())
+                file.inputStream().use { it.copyTo(out) }
+                session.fsync(out)
+                out.close()
+                val statusIntent = Intent(context, UpdateInstallReceiver::class.java)
+                val piFlags = PendingIntent.FLAG_UPDATE_CURRENT or
+                    (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0)
+                val pi = PendingIntent.getBroadcast(context, sessionId, statusIntent, piFlags)
+                session.commit(pi.intentSender)
+            }
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "PackageInstaller session install failed", e)
+            false
+        }
     }
 
     /** Подпись установленного ≠ подпись официального релиза (файл ПОДЛИННЫЙ — SHA-256 сошёлся с манифестом).

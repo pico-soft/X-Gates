@@ -122,8 +122,10 @@ object UpdateFlowController {
             return InstallLaunch.NEED_PERMISSION
         }
         if (appInForeground) {
-            val ok = runCatching { UpdateInstaller.launchInstaller(app, file) }.isSuccess
-            if (ok) {
+            // startInstall: ACTION_VIEW, а если системе нечем открыть (магнитолы) — PackageInstaller session.
+            val started = runCatching { UpdateInstaller.startInstall(app, file) }
+                .getOrDefault(UpdateInstaller.InstallStart.FAILED)
+            if (started != UpdateInstaller.InstallStart.FAILED) {
                 NotificationHelper.cancelUpdate(app); NotificationHelper.cancelInstall(app)
                 UpdateStore.markDismissed(app)
                 return InstallLaunch.LAUNCHED
