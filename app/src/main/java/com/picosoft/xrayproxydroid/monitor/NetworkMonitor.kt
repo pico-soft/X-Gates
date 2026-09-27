@@ -121,7 +121,24 @@ object NetworkMonitor {
     private const val PING_JITTER_ABS_MS = 80         // абсолютный порог «скачка» пинга, мс
     private const val PING_JITTER_FRAC_PCT = 60       // ИЛИ относительный: изменение > 60% прежнего
     // Q2 Elyor: при ВЫКЛЮЧЕННОМ экране и здоровой связи будим реже (было 60с) — меньше пробуждений = батарея.
-    private const val SCREEN_OFF_IDLE_MS = 300_000L   // 5 мин
+    private const val SCREEN_OFF_IDLE_MS = 300_000L   // 5 мин (экран выкл < 1 ч)
+    // ТЗ Elyor 2026-09-27: ЛЕСТНИЦА интервалов простоя на батарее+экран выкл — чем дольше экран не включают (ночь),
+    // тем реже будим. Отзывчивость не страдает: включение экрана будит монитор СОБЫТИЕМ (ACTION_SCREEN_ON) мгновенно.
+    private const val SCREEN_OFF_MED_MS = 60 * 60_000L         // экран выкл > 1 ч
+    private const val SCREEN_OFF_LONG_MS = 3 * 3600_000L       // экран выкл > 3 ч
+    private const val SCREEN_OFF_IDLE_MED_MS = 10 * 60_000L    // > 1 ч → пинг раз в 10 мин
+    private const val SCREEN_OFF_IDLE_LONG_MS = 15 * 60_000L   // > 3 ч → раз в 15 мин
+    // ЯРУСЫ ПО ЗАРЯДУ (чтение уровня — БЕСПЛАТНО, sticky broadcast, без пробуждения/радио): ≤15% на батарее — без
+    // скоростных замеров (только пинг-живость); ≤5% — фон почти спит (редкий пинг), вся отзывчивость на СОБЫТИЕ
+    // включения экрана. ПОЧЕМУ так (Elyor): «на последнем издыхании» важнее ОТПРАВИТЬ (proxy поднимется по требованию
+    // при включении экрана за ~1-2с по пингу), чем держать фоновый приём — а батарея первична, без заряда нет ничего.
+    private const val LOW_BATTERY_PCT = 15
+    private const val CRITICAL_BATTERY_PCT = 5
+    private const val CRITICAL_IDLE_MS = 30 * 60_000L          // ≤5% заряда → пинг раз в 30 мин (фон почти спит)
+    // Утренний рейтинг: раз в сутки к ~6:00 освежаем топ-N живых ОДНОЙ короткой серией (вместо всеночной молотьбы),
+    // чтобы к пробуждению был свежий быстрый сервер. Только если заряд выше порога (≤15% — пропускаем).
+    private const val MORNING_RATE_HOUR = 6
+    private const val MORNING_RATE_COUNT = 5
 
     // ── ФОНОВЫЙ РЕЙТИНГ ТОПА (ТЗ Elyor): развилка ШНУР/БАТАРЕЯ × сеть. На шнуре агрессивно (держим топ-N свежим —
     // батарея не тратится), на батарее экономно (в основном по событию «отвалилось >50% топа»). ≥ порога не перемеряем. ──
@@ -144,6 +161,9 @@ object NetworkMonitor {
     // делает шаг 1 → ВЕЧНЫЙ ЦИКЛ на мёртвом сервере (подтверждено логами P102). Поле object'а переживает рестарт
     // монитора: один и тот же сервер повторно НЕ перезапускаем — сразу к перебору живых. Сбрасывается при OK.
     @Volatile private var restartedKeySinceOk: String? = null
+    // Утренний рейтинг: день года (Calendar.DAY_OF_YEAR), в который он уже отработал (чтобы раз в сутки). Object-поле
+    // переживает пересоздание корутины монитора (иначе рестарт сервиса дал бы повторный прогон в тот же день).
+    @Volatile private var lastMorningRateDay = -1
     // Пр.127.C: когда последний раз делали ШАГ по деградации (throttle между шагами). Object-поле — переживает
     // пересоздание корутины монитора (как restartedKeySinceOk), чтобы throttle не сбрасывался при рестарте.
     @Volatile private var lastDegradationMs = 0L
@@ -212,6 +232,7 @@ object NetworkMonitor {
         var lastTopPingMs = 0L             // фоновый рейтинг: когда последний раз пинговали ТОП (держим его живость)
         var lastTopRateMs = 0L             // фоновый рейтинг: когда последний раз делали ПОЛНЫЙ замер топа (перестройка)
         var lastIpRefreshMs = 0L           // Пр.150: когда последний раз тянули внешний IP для ПОКАЗА на плашке
+        var screenOffSinceMs = 0L          // лестница интервалов: когда экран ПОГАС (0 = экран включён/ещё не гас)
         val cycleLock = MonitorAlarm.newWakeLock(app)   // держит CPU на время ОДНОГО цикла (иначе уснёт посреди пробы)
         Log.i(TAG, "monitor loop started")
 
@@ -223,6 +244,8 @@ object NetworkMonitor {
             // Прерываемый wake() — событийные триггеры (сеть/экран/передний план) поднимают ДОСРОЧНО.
             val s = SettingsStore.current()
             val ph = TunnelHealth.snapshot().phase
+            // Лестница интервалов: отмечаем момент, когда экран погас (сброс при включении). Чтение экрана — бесплатно.
+            if (screenInteractive(app)) screenOffSinceMs = 0L else if (screenOffSinceMs == 0L) screenOffSinceMs = now()
             val waitMs = when {
                 // Нет интернета — переспрашиваем прямой канал по экспоненте (1→2→…→30 мин), не чаще.
                 ph == TunnelHealth.Phase.NO_INTERNET -> noNetBackoffMs.coerceAtLeast(NO_NET_BACKOFF_START_MS)
@@ -231,10 +254,10 @@ object NetworkMonitor {
                 // Пр.150: в grace-окне (проверка не прошла, но связь была недавно) перепроверяем ЧАЩЕ.
                 graceRecheck -> GRACE_RECHECK_MS
                 else -> {
-                    // Q2 Elyor: здоровая связь + экран ВЫКЛЮЧЕН → будим реже (батарея). На ШНУРЕ не растягиваем — держим
-                    // топ свежим (батарея не тратится). Экран включён / шнур / проблема → обычный интервал.
+                    // Q2 Elyor + лестница: здоровая связь + экран ВЫКЛ на батарее → будим реже (5→10→15 мин по времени
+                    // без экрана; ≤5% заряда → 30 мин). На ШНУРЕ/экран вкл — обычный интервал (топ свежий, батарея цела).
                     val base = s.connectionCheckIntervalSec.coerceAtLeast(15) * 1000L
-                    if (!screenInteractive(app) && !isCharging(app)) maxOf(base, SCREEN_OFF_IDLE_MS) else base
+                    idleIntervalMs(app, base, screenOffSinceMs)
                 }
             }
             // ── СОН (Промпт 118): отпустить CPU, поставить ТОЧНЫЙ будильник (срабатывает и в Doze), ждать его ИЛИ
@@ -267,12 +290,9 @@ object NetworkMonitor {
             // выключен → 300с, включён → connectionCheckIntervalSec. Дешёвое пробуждение просто спит дальше. Проблемные
             // фазы (нет интернета/восстановление/нет серверов) и grace НЕ дебаунсим — реагируем немедленно.
             if (ph == TunnelHealth.Phase.OK && !graceRecheck) {
-                // На ШНУРЕ не растягиваем цикл (нужен свежий топ, батарея не тратится); на батарее+экран выкл — 300с.
-                val everyMs = when {
-                    isCharging(app) -> cur.connectionCheckIntervalSec.coerceAtLeast(15) * 1000L
-                    !screenInteractive(app) -> SCREEN_OFF_IDLE_MS
-                    else -> cur.connectionCheckIntervalSec.coerceAtLeast(15) * 1000L
-                }
+                // Дорогую работу цикла делаем НЕ ЧАЩЕ эффективного интервала (та же лестница, что и у сна): на шнуре/
+                // экран вкл — обычный; на батарее+экран выкл — 5→10→15 мин; ≤5% — 30 мин. Дешёвое пробуждение спит дальше.
+                val everyMs = idleIntervalMs(app, cur.connectionCheckIntervalSec.coerceAtLeast(15) * 1000L, screenOffSinceMs)
                 if (now() - lastFullCycleMs < everyMs) continue   // паразитное пробуждение — не тратим пинг/IP/батарею
             }
             lastFullCycleMs = now()
@@ -388,7 +408,8 @@ object NetworkMonitor {
                     lastActivePingMs = pm
                     val measureDue = now() - lastLivenessMeasureMs >=
                         (if (jumped) LIVENESS_MEASURE_UNSTABLE_MS else LIVENESS_MEASURE_STABLE_MS)
-                    if (measureDue && !MonitorCoordinator.monitorSearchRunning && !MonitorCoordinator.fullTestRunning) {
+                    // Батарея: на «экран выкл + батарея» скоростной замер откладываем — пинг уже подтвердил живость.
+                    if (measureDue && heavyMeasureAllowed(app) && !MonitorCoordinator.monitorSearchRunning && !MonitorCoordinator.fullTestRunning) {
                         // Порог замера = порог деградации: короткий замер (бюджет под этот порог) уверенно отвечает на
                         // вопрос «активный ниже порога?». Быстрый сервер подтвердит порог за доли МБ и остановится.
                         val mbps = ServerSpeedTester.measureSufficiency(app, curSrv0, cur.degradationMinMbps.coerceAtLeast(0.1))
@@ -440,7 +461,7 @@ object NetworkMonitor {
                 // кандидата несопоставимы, решения шли бы по шуму. Пр.125.E: в экономии тоже выкл. Когда пользователь
                 // включил — предохранители Пр.126.A (Wi-Fi / давно-нет-трафика / текущий-уже-быстрый) + не во время
                 // активной загрузки (чтобы не делить канал и не портить замер).
-                if (!cur.trafficSaveMode && cur.monitorEnabled && cur.activeOptimizeSec > 0 && now() - lastOptimizeMs >= cur.activeOptimizeSec * 1000L) {
+                if (!cur.trafficSaveMode && cur.monitorEnabled && cur.activeOptimizeSec > 0 && heavyMeasureAllowed(app) && now() - lastOptimizeMs >= cur.activeOptimizeSec * 1000L) {
                     lastOptimizeMs = now()
                     val skip = optimizeSkipReason(app, cur, lastUserTrafficMs)
                     when {
@@ -454,6 +475,7 @@ object NetworkMonitor {
                 // если ниже порога деградации, шагаем на лучшего кандидата (переиспользуем maybeStepFromDegraded).
                 val recheckKey = ProxyState.state.value.serverKey
                 if (cur.trafficSaveMode && cur.economyRecheckSec > 0 && !userTrafficActive() && recheckKey != null &&
+                    heavyMeasureAllowed(app) &&   // батарея: не мерить активный ночью на батарее (пинг держит живость)
                     now() - lastEconomyRecheckMs >= cur.economyRecheckSec * 1000L) {
                     lastEconomyRecheckMs = now()
                     val curSrv = SubscriptionManager.allServers(app).firstOrNull { SubscriptionManager.serverKey(it) == recheckKey }
@@ -463,10 +485,29 @@ object NetworkMonitor {
                         if (mbps in 0.0..cur.degradationMinMbps) maybeStepFromDegraded(app, cur, recheckKey, mbps)
                     }.onFailure { MonitorLog.event(app, "error", "Ошибка ре-чека экономии", it.message ?: "") }
                 }
+                // ── УТРЕННИЙ РЕЙТИНГ (~6:00, ТЗ Elyor): раз в сутки одной короткой серией освежаем топ-N живых, чтобы
+                // к пробуждению был свежий быстрый сервер — ВМЕСТО всеночной молотьбы. Идёт ДАЖЕ при экране выкл на
+                // батарее (это разрешённый единичный всплеск), но пропускается при ≤15% заряда (ярус экономии).
+                run {
+                    val cal = java.util.Calendar.getInstance()
+                    val hour = cal.get(java.util.Calendar.HOUR_OF_DAY)
+                    val doy = cal.get(java.util.Calendar.DAY_OF_YEAR)
+                    val batteryOk = isCharging(app) || batteryLevel(app) > LOW_BATTERY_PCT
+                    if (hour == MORNING_RATE_HOUR && lastMorningRateDay != doy && batteryOk && !userTrafficActive() &&
+                        !MonitorCoordinator.monitorSearchRunning && !MonitorCoordinator.fullTestRunning) {
+                        lastMorningRateDay = doy
+                        runCatching { morningRateTop(app, cur) }
+                            .onFailure { MonitorLog.event(app, "error", "Ошибка утреннего рейтинга", it.message ?: "") }
+                    }
+                }
                 // ── ФОНОВЫЙ РЕЙТИНГ ТОПА (ТЗ Elyor): держим топ-N свежим. Развилка ШНУР/БАТАРЕЯ × сеть: на шнуре
                 // агрессивно (батарея не тратится), на батарее — в основном по событию «отвалилось >50% топа». Не во
                 // время загрузки пользователя и не во время подбора монитором.
-                if (!userTrafficActive() && !MonitorCoordinator.monitorSearchRunning && !MonitorCoordinator.fullTestRunning) {
+                // Батарея: весь фон-рейтинг (пинг топа + полный замер) — оптимизация «держать лучший», НЕ связь.
+                // На «экран выкл + батарея» откладываем целиком до зарядки/экрана (гейт был только у интервала цикла —
+                // а сам rebuildAndRateTop на батарея+Wi-Fi крутился каждые 30 мин и сажал батарею; см. heavyMeasureAllowed).
+                if (!userTrafficActive() && heavyMeasureAllowed(app) &&
+                    !MonitorCoordinator.monitorSearchRunning && !MonitorCoordinator.fullTestRunning) {
                     val charging = isCharging(app)
                     val mobile = EconomyNet.lastKnownMobile
                     val screenOn = screenInteractive(app)
@@ -601,6 +642,11 @@ object NetworkMonitor {
     private suspend fun runRecoveryLadder(app: Context, s: AppSettings): SwitchResult {
         MonitorCoordinator.monitorSearchRunning = true
         try {
+            // Ночь/батарея (экран выкл + не на шнуре): восстановление ТОЛЬКО пингом+подтверждением IP, без скоростных
+            // замеров (иначе Фаза 2a домеряет остальных, 2b мерит всех живых → полевой факт: ~210 MB за 34 мин на
+            // деградировавшем пуле). Связь (Пр.95) держим фактом: ping-alive + внешний IP подтверждён = сервер рабочий;
+            // ранжирование по скорости откладываем до зарядки/утреннего рейтинга. См. [[battery-drain-0.52-night-measures]].
+            val doMeasure = heavyMeasureAllowed(app)
             val startKey = ProxyState.state.value.serverKey
             val bl = BlocklistStore.current()
             val keepThreshold = s.degradationMinMbps.coerceAtLeast(0.1)   // «≥2 Мбит/с» — держим; иначе ищем быстрее
@@ -636,11 +682,14 @@ object NetworkMonitor {
                     if (MonitorCoordinator.fullTestRunning) return SwitchResult.ABORTED
                     if (ProxyState.state.value.serverKey != ownedKey) return SwitchResult.ABORTED   // вмешался пользователь
                     MonitorStatus.update(true, "обрыв — подключаюсь к недавнему · ${ServerLabels.display(c)}", now(), 0)
-                    val (mbps, ok) = connectMeasureLive(app, c, ownedKey)
+                    val (mbps, ok) = connectMeasureLive(app, c, ownedKey, doMeasure)
                     ownedKey = ProxyState.state.value.serverKey   // отражаем факт (start мог/не мог взять)
                     if (ok) { connected = c; connectedMbps = mbps; break }
                 }
                 if (connected != null) {
+                    // Ночь/батарея: подключились по пингу и IP подтверждён → сервер рабочий, этого достаточно.
+                    // Не домеряем остальных и не ранжируем по скорости (это оптимизация, а не связь).
+                    if (!doMeasure) return SwitchResult.SWITCHED
                     // Домерить ОСТАЛЬНЫХ живых temp-инстансом (обновить список/«топ»), не трогая активного.
                     // < порога → мерим ради РАНЖИРОВАНИЯ (до sufficientMbps); ≥ порога → просто обновляем список.
                     val measCap = if (connectedMbps in 0.0..keepThreshold) s.sufficientMbps.coerceAtLeast(keepThreshold) else keepThreshold
@@ -670,7 +719,7 @@ object NetworkMonitor {
 
             // ── Фаза 2b: недавние молчат → пинг ВСЕХ + добор до [target] живых замерами → самый быстрый ──
             if (aborted(startKey)) return SwitchResult.ABORTED
-            val disc = discoverBuildLive(app, s, startKey, target, keepThreshold)
+            val disc = discoverBuildLive(app, s, startKey, target, keepThreshold, doMeasure)
             if (disc != SwitchResult.NO_CANDIDATES) return disc
 
             // ── Никого живого/годного → глубокий фолбэк: перезапуск ядра (Пр.102) → подписки → белые → предложить ──
@@ -702,7 +751,7 @@ object NetworkMonitor {
      * ЖИВОЙ туннель. Возврат: (скорость ↓ Мбит/с — 0/-1 если нет throughput/ошибка, подтверждена ли связь фактом
      * внешнего IP). fromKey — прежний активный (для лога смены).
      */
-    private suspend fun connectMeasureLive(app: Context, c: ServerProfile, fromKey: String?): Pair<Double, Boolean> {
+    private suspend fun connectMeasureLive(app: Context, c: ServerProfile, fromKey: String?, doMeasure: Boolean = true): Pair<Double, Boolean> {
         val key = SubscriptionManager.serverKey(c)
         val cfg = runCatching { XrayConfigBuilder.build(c) }.getOrNull()
             ?: run { MonitorLog.event(app, "error", "Кандидат ${ServerLabels.display(c)}: ошибка конфига", ""); return -1.0 to false }
@@ -717,6 +766,8 @@ object NetworkMonitor {
         val ip = ExternalIpChecker.fetch()
         val confirmed = ip != null
         if (confirmed) { TunnelHealth.ok(ip!!, now(), key); onRecovered(app) }
+        // Ночь/батарея: живость = подтверждённый внешний IP; скорость НЕ мерим (экономим батарею/трафик).
+        if (!doMeasure) return -1.0 to confirmed
         delay(800)   // дать туннелю осесть
         val mbps = ServerSpeedTester.measureActiveDownloadMbps(app)   // сопоставимо с кандидатами (Пр.130)
         if (mbps > 0) {
@@ -732,7 +783,7 @@ object NetworkMonitor {
      * ЖИВЫХ (с ненулевым замером) замерами по топу ПИНГА, батчами по 10 → подключаемся к САМОМУ БЫСТРОМУ (сразу
      * подтверждаем IP + мерим). NO_CANDIDATES — никого живого по пингу/годного нет (наверх, к глубокому фолбэку).
      */
-    private suspend fun discoverBuildLive(app: Context, s: AppSettings, startKey: String?, target: Int, keepThreshold: Double): SwitchResult {
+    private suspend fun discoverBuildLive(app: Context, s: AppSettings, startKey: String?, target: Int, keepThreshold: Double, doMeasure: Boolean = true): SwitchResult {
         TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "недавние молчат — полный пинг")
         MonitorStatus.update(true, "полный пинг: ищу живые серверы", now(), 0)
         runCatching { refreshAllPings(app, s) }
@@ -744,6 +795,15 @@ object NetworkMonitor {
             .filter { (it.pingMs ?: -1) >= 0 }
             .sortedBy { it.pingMs ?: Int.MAX_VALUE }
         if (liveByPing.isEmpty()) return SwitchResult.NO_CANDIDATES
+        // Ночь/батарея: не мерим скорость всех живых — берём лучшего по ПИНГУ и подтверждаем связь фактом IP.
+        if (!doMeasure) {
+            for (best in liveByPing) {
+                if (aborted(startKey)) return SwitchResult.ABORTED
+                MonitorStatus.update(true, "подключаюсь к живому по пингу · ${ServerLabels.display(best)}", now(), 0)
+                if (connectMeasureLive(app, best, ProxyState.state.value.serverKey, doMeasure = false).second) return SwitchResult.SWITCHED
+            }
+            return SwitchResult.NO_CANDIDATES
+        }
         val measCap = s.sufficientMbps.coerceAtLeast(keepThreshold)
         val liveWithSpeed = ArrayList<Pair<ServerProfile, Double>>()
         var scanned = 0
@@ -1091,6 +1151,57 @@ object NetworkMonitor {
     }.getOrDefault(false)
 
     /**
+     * Разрешены ли БАЙТ-ТЯЖЁЛЫЕ замеры скорости прямо сейчас (measureSpeed/measureSufficiency/фон-рейтинг/апгрейд)?
+     * ⚠️ ГРАБЛЯ (замер фактом adb, оба телефона на 0.52, 2026-09-27): ночью на батарее при выключенном экране эти
+     * замеры сажали батарею В НОЛЬ и лили трафик — Fold на мобильной ~1.1 ГБ/ночь (модем активен 96.8%, wakelock
+     * 4ч10м), S908E на Wi-Fi ~915 MB за 1.7ч (~4 ГБ/ночь). Корень: под «экран выкл» был спрятан лишь интервал цикла
+     * и пинг топа, а САМИ замеры (temp-инстанс Xray + скачивание спид-теста) крутились каждый цикл, особенно на
+     * деградировавшем пуле (активный вечно «медленный» → апгрейд/рейтинг мерят снова и снова).
+     * ФИКС: на «экран выкл + на батарее» откладываем ВСЕ оптимизационные замеры до зарядки/включения экрана.
+     * Continuity (Пр.95 [[connection-continuity-principle]]) НЕ страдает: живость держит ПИНГ (реальный 204 через
+     * туннель = трафик реально проходит, килобайты), а recovery-лестница — ping-first. Откладываем только СКОРОСТНЫЕ
+     * замеры (мегабайты) и апгрейд «с живого-но-медленного» (это оптимизация, не связь).
+     * Ярусы по заряду: на шнуре — всегда да; на батарее ≤15% — нет (даже при экране вкл); иначе — по экрану.
+     */
+    private fun heavyMeasureAllowed(app: Context): Boolean {
+        if (isCharging(app)) return true                       // на шнуре батарея не тратится — мерим свободно
+        if (batteryLevel(app) <= LOW_BATTERY_PCT) return false // ≤15% на батарее — никаких скоростных замеров
+        return screenInteractive(app)                          // иначе — только при включённом экране
+    }
+
+    /** Уровень заряда 0..100. ЧТЕНИЕ БЕСПЛАТНО (BatteryManager property / sticky broadcast — без пробуждения/радио).
+     *  При ошибке чтения → 100 (не блокируем работу мнимо-низким зарядом). */
+    private fun batteryLevel(app: Context): Int = runCatching {
+        val bm = app.getSystemService(Context.BATTERY_SERVICE) as? android.os.BatteryManager
+        val p = bm?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1
+        if (p in 0..100) return@runCatching p
+        val intent = app.registerReceiver(null, android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))
+        val l = intent?.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1) ?: -1
+        val sc = intent?.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, -1) ?: -1
+        if (l >= 0 && sc > 0) l * 100 / sc else 100
+    }.getOrDefault(100)
+
+    /** ≤5% на батарее — критический заряд: фон почти спит (реакция на включение экрана всё равно мгновенная). */
+    private fun criticalBattery(app: Context): Boolean = !isCharging(app) && batteryLevel(app) <= CRITICAL_BATTERY_PCT
+
+    /**
+     * Интервал сна в простое (здоровая связь). На шнуре/экран вкл — base. На батарее+экран выкл — ЛЕСТНИЦА по времени
+     * «экран не включали»: <1ч → 5 мин, >1ч → 10 мин, >3ч → 15 мин. Критический заряд (≤5%) → 30 мин. Отзывчивость
+     * не страдает: включение экрана будит монитор событием ACTION_SCREEN_ON (см. XrayProxyService).
+     */
+    private fun idleIntervalMs(app: Context, baseMs: Long, screenOffSinceMs: Long): Long {
+        if (isCharging(app) || screenInteractive(app)) return baseMs
+        if (criticalBattery(app)) return maxOf(baseMs, CRITICAL_IDLE_MS)
+        val off = if (screenOffSinceMs > 0) now() - screenOffSinceMs else 0L
+        val idle = when {
+            off >= SCREEN_OFF_LONG_MS -> SCREEN_OFF_IDLE_LONG_MS
+            off >= SCREEN_OFF_MED_MS -> SCREEN_OFF_IDLE_MED_MS
+            else -> SCREEN_OFF_IDLE_MS
+        }
+        return maxOf(baseMs, idle)
+    }
+
+    /**
      * Шаг 1: пингуем ТЕКУЩИЙ топ (по сохранённой скорости) — дёшево, держим его живость свежей.
      * true = топ «поредел» (>50% не отозвались на пинг) → повод перестроить (шаг 2).
      */
@@ -1128,6 +1239,36 @@ object NetworkMonitor {
      * перемеряем (отдал пинг → считаем скорость прежней). Перестал пинговаться → уходит из «Живых» (freshPingFailed),
      * освобождает слот → добираем замену следующим по пингу. Активный тут НЕ переключаем (это «держать лучший»/восст.).
      */
+    /**
+     * Утренний рейтинг (~6:00): пинг всех → короткий замер (measureSufficiency) топ-[MORNING_RATE_COUNT] живых по пингу.
+     * Одна серия раз в сутки — чтобы к пробуждению был свежий быстрый сервер, без всеночных замеров. Активного НЕ
+     * переключаем (это освежение списка, не подбор). Вызывается только когда заряд выше порога (проверка у вызова).
+     */
+    private suspend fun morningRateTop(app: Context, s: AppSettings) {
+        if (MonitorCoordinator.fullTestRunning) return
+        MonitorCoordinator.monitorSearchRunning = true
+        try {
+            runCatching { refreshAllPings(app, s) }
+            val bl = BlocklistStore.current()
+            val cap = s.sufficientMbps.coerceAtLeast(s.degradationMinMbps.coerceAtLeast(0.1))
+            val top = SubscriptionManager.allServers(app)
+                .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl) && !ServerFilter.isPaused(it, bl) }
+                .filter { (it.pingMs ?: -1) >= 0 }
+                .distinctBy { SubscriptionManager.serverKey(it) }
+                .sortedBy { it.pingMs ?: Int.MAX_VALUE }
+                .take(MORNING_RATE_COUNT)
+            val results = HashMap<String, Double>()
+            for (p in top) {
+                if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey == null) break
+                results[SubscriptionManager.serverKey(p)] = ServerSpeedTester.measureSufficiency(app, p, cap)
+            }
+            if (results.isNotEmpty()) SubscriptionManager.applySpeedResults(app, results)
+            MonitorLog.event(app, "monitor", "Утренний рейтинг топ-${MORNING_RATE_COUNT}", "замерено ${results.size}")
+        } finally {
+            MonitorCoordinator.monitorSearchRunning = false
+        }
+    }
+
     private suspend fun rebuildAndRateTop(app: Context, s: AppSettings) {
         if (MonitorCoordinator.fullTestRunning) return
         MonitorCoordinator.monitorSearchRunning = true
