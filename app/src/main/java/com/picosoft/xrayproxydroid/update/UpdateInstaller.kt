@@ -304,6 +304,52 @@ object UpdateInstaller {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) pi.longVersionCode else pi.versionCode.toLong()
     }.getOrNull()
 
+    private val EXPORT_NAME_RE = Regex("""XrayProxyDroid-([0-9]+(?:\.[0-9]+)*)-.*\.apk""", RegexOption.IGNORE_CASE)
+
+    /**
+     * Уборка НАКОПЛЕННЫХ экспортов в общих «Загрузках»: копии, что клал [exportToDownloads] при ручном сохранении/
+     * фолбэке подписи (полевой случай магнитол — за 50+ обновлений могло скопиться много APK по 50-122 МБ).
+     * Оставляем ТОЛЬКО самую свежую версию (актуальный «последний скачанный»), старые — удаляем. Удаляем ЛИШЬ СВОИ
+     * записи MediaStore (созданные нами — мы их владельцы); чужие/скачанные браузером scoped storage трогать не даёт
+     * (их только вручную через файловый менеджер). API 29+ (Downloads collection). БЛОКИРУЮЩАЯ — звать в фоне.
+     */
+    fun pruneExportedDownloads(context: Context) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        val resolver = context.contentResolver
+        val collection = android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI
+        val proj = arrayOf(android.provider.MediaStore.Downloads._ID, android.provider.MediaStore.Downloads.DISPLAY_NAME)
+        val sel = "${android.provider.MediaStore.Downloads.DISPLAY_NAME} LIKE ?"
+        data class E(val id: Long, val ver: Int)
+        val entries = ArrayList<E>()
+        runCatching {
+            resolver.query(collection, proj, sel, arrayOf("XrayProxyDroid-%.apk"), null)?.use { c ->
+                val idCol = c.getColumnIndexOrThrow(android.provider.MediaStore.Downloads._ID)
+                val nameCol = c.getColumnIndexOrThrow(android.provider.MediaStore.Downloads.DISPLAY_NAME)
+                while (c.moveToNext()) {
+                    val name = c.getString(nameCol) ?: continue
+                    val m = EXPORT_NAME_RE.matchEntire(name) ?: continue
+                    entries.add(E(c.getLong(idCol), versionKey(m.groupValues[1])))
+                }
+            }
+        }.onFailure { Log.w(TAG, "prune exports: запрос не удался", it) }
+        if (entries.size <= 1) return
+        val maxVer = entries.maxOf { it.ver }   // самая свежая = актуальный «последний скачанный»
+        var removed = 0
+        for (e in entries) {
+            if (e.ver >= maxVer) continue        // актуальную версию оставляем (даже несколько ABI одной версии)
+            val uri = android.content.ContentUris.withAppendedId(collection, e.id)
+            // Наши записи удалятся; чужие кинут SecurityException → пропускаем (не наши, трогать нельзя).
+            if (runCatching { resolver.delete(uri, null, null) }.getOrDefault(0) > 0) removed++
+        }
+        if (removed > 0) Log.i(TAG, "prune exports: удалено $removed старых APK из «Загрузок» (оставлена актуальная)")
+    }
+
+    /** «0.54» → сравнимое число (major*1000+minor), чтобы находить самую свежую версию по имени файла. */
+    private fun versionKey(v: String): Int {
+        val p = v.split('.')
+        return (p.getOrNull(0)?.toIntOrNull() ?: 0) * 1000 + (p.getOrNull(1)?.toIntOrNull() ?: 0)
+    }
+
     // ─────────────────────── проверки ───────────────────────
 
     private fun hostOf(url: String): String = runCatching { java.net.URL(url).host }.getOrNull() ?: url
