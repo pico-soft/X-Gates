@@ -267,6 +267,43 @@ object UpdateInstaller {
         }
     }
 
+    // ─────────────────────── уборка старых скачанных APK ───────────────────────
+
+    /**
+     * Удаляет старые скачанные APK авто-обновления из filesDir/updates, ОСТАВЛЯЯ только «последний скачанный»,
+     * ещё не установленный. Каталог и так вытирается перед каждой закачкой, но ПОСЛЕ УСТАНОВКИ проверенный APK
+     * (до 122 МБ у universal) лежит там до следующего обновления. Зовём на СТАРТЕ приложения (после успешного
+     * самообновления процесс перезапускается — тут и чистим; сразу после запуска установщика удалять нельзя:
+     * при ACTION_VIEW система читает файл во время установки).
+     *
+     * Правило: versionCode APK ≤ уже установленного (BuildConfig.VERSION_CODE) → своё отработал, удаляем. Строго
+     * новее — кандидат «последний скачанный», оставляем ОДИН наибольший (прочие новые-дубли тоже удаляем). Чужой
+     * пакет → удаляем. Версию не удалось прочитать → НЕ трогаем (осторожность). БЛОКИРУЮЩАЯ — звать в фоне.
+     */
+    fun pruneObsoleteApks(context: Context) {
+        val dir = File(context.filesDir, UPDATES_DIR)
+        val apks = dir.listFiles { f -> f.isFile && f.name.endsWith(".apk", ignoreCase = true) } ?: return
+        if (apks.isEmpty()) return
+        val installed = BuildConfig.VERSION_CODE.toLong()
+        val codes: Map<File, Long?> = apks.associateWith { archiveVersionCode(context, it) }
+        // «Последний скачанный» = наибольший versionCode среди строго новее установленного (ещё не поставлен).
+        val keep = codes.entries.filter { (it.value ?: -1L) > installed }.maxByOrNull { it.value ?: -1L }?.key
+        for ((f, code) in codes) {
+            if (f == keep) continue
+            if (code == null) continue   // версию не определили — оставляем (не удаляем вслепую)
+            if (!f.delete()) Log.w(TAG, "prune: не удалил ${f.name}")
+            else Log.i(TAG, "prune: удалён старый APK ${f.name} (code=$code, installed=$installed)")
+        }
+    }
+
+    /** versionCode APK-архива (или null, если не прочитать); чужой пакет → 0 (будет удалён как устаревший). */
+    private fun archiveVersionCode(context: Context, file: File): Long? = runCatching {
+        val pi = context.packageManager.getPackageArchiveInfo(file.absolutePath, 0) ?: return null
+        if (pi.packageName != context.packageName) return 0L
+        @Suppress("DEPRECATION")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) pi.longVersionCode else pi.versionCode.toLong()
+    }.getOrNull()
+
     // ─────────────────────── проверки ───────────────────────
 
     private fun hostOf(url: String): String = runCatching { java.net.URL(url).host }.getOrNull() ?: url
