@@ -350,6 +350,43 @@ object UpdateInstaller {
         return (p.getOrNull(0)?.toIntOrNull() ?: 0) * 1000 + (p.getOrNull(1)?.toIntOrNull() ?: 0)
     }
 
+    /** URIs НАШИХ экспортов в «Загрузках» СТАРЕЕ самой свежей версии (кандидаты на удаление). Пусто — нечего чистить. */
+    fun oldExportUris(context: Context): List<Uri> {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return emptyList()
+        val resolver = context.contentResolver
+        val collection = android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI
+        val proj = arrayOf(android.provider.MediaStore.Downloads._ID, android.provider.MediaStore.Downloads.DISPLAY_NAME)
+        data class E(val uri: Uri, val ver: Int)
+        val entries = ArrayList<E>()
+        runCatching {
+            resolver.query(collection, proj, "${android.provider.MediaStore.Downloads.DISPLAY_NAME} LIKE ?", arrayOf("XrayProxyDroid-%.apk"), null)?.use { c ->
+                val idCol = c.getColumnIndexOrThrow(android.provider.MediaStore.Downloads._ID)
+                val nameCol = c.getColumnIndexOrThrow(android.provider.MediaStore.Downloads.DISPLAY_NAME)
+                while (c.moveToNext()) {
+                    val name = c.getString(nameCol) ?: continue
+                    val m = EXPORT_NAME_RE.matchEntire(name) ?: continue
+                    entries.add(E(android.content.ContentUris.withAppendedId(collection, c.getLong(idCol)), versionKey(m.groupValues[1])))
+                }
+            }
+        }.onFailure { Log.w(TAG, "oldExportUris query failed", it) }
+        if (entries.size <= 1) return emptyList()
+        val maxVer = entries.maxOf { it.ver }
+        return entries.filter { it.ver < maxVer }.map { it.uri }
+    }
+
+    /**
+     * Системный запрос на удаление НАКОПЛЕННЫХ старых экспортов (все XrayProxyDroid-*.apk в «Загрузках», кроме самой
+     * свежей версии). Android 30+: одно окно-подтверждение, удаляет НЕЗАВИСИМО ОТ ВЛАДЕЛЬЦА (в т.ч. созданные до
+     * переустановки — то, что pruneExportedDownloads не может). null — нечего удалять. Запускать через
+     * StartIntentSenderForResult (см. MainActivity). На <30 API нет — там только свои чистятся авто + файл-менеджер.
+     */
+    @androidx.annotation.RequiresApi(Build.VERSION_CODES.R)
+    fun buildDeleteOldExportsRequest(context: Context): PendingIntent? {
+        val uris = oldExportUris(context)
+        if (uris.isEmpty()) return null
+        return android.provider.MediaStore.createDeleteRequest(context.contentResolver, uris)
+    }
+
     // ─────────────────────── проверки ───────────────────────
 
     private fun hostOf(url: String): String = runCatching { java.net.URL(url).host }.getOrNull() ?: url

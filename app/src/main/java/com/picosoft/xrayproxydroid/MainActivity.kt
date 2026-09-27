@@ -15,6 +15,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
@@ -4143,6 +4144,11 @@ private fun UpdateCheckSection() {
     var readyFile by remember { mutableStateOf<File?>(null) }
     var message by remember { mutableStateOf<String?>(null) }
     var detailsExpanded by remember { mutableStateOf(false) }
+    // Очистка исторической кучи скачанных APK в «Загрузках» (в т.ч. от прежних установок — не наших по владельцу):
+    // системный запрос createDeleteRequest показывает одно окно-подтверждение и удаляет независимо от владельца.
+    val deleteOldApksLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { res ->
+        message = if (res.resultCode == android.app.Activity.RESULT_OK) "Старые скачанные APK удалены." else "Очистка отменена."
+    }
 
     fun startCheck() {
         if (checking || downloading) return
@@ -4267,6 +4273,21 @@ private fun UpdateCheckSection() {
                 avail != null -> ButtonLabel(UiIcon.PLAY, "Скачать и установить")
                 else -> ButtonLabel(UiIcon.REFRESH, "Проверить обновление")
             }
+        }
+
+        // Очистка накопленных старых скачанных APK в «Загрузках» (в т.ч. от прежних установок). Одно системное
+        // окно-подтверждение (createDeleteRequest, Android 10+), оставляет самую свежую версию. На <30 API нет —
+        // там свои чистятся автоматически на старте, единичные старые — файловым менеджером.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            OutlinedButton(
+                onClick = {
+                    val pi = UpdateInstaller.buildDeleteOldExportsRequest(context)
+                    if (pi != null) deleteOldApksLauncher.launch(IntentSenderRequest.Builder(pi.intentSender).build())
+                    else message = "Старых скачанных APK не найдено — чистить нечего."
+                },
+                enabled = !checking && !downloading,
+                modifier = Modifier.fillMaxWidth(),
+            ) { ButtonLabel(UiIcon.REFRESH, "Очистить старые скачанные APK") }
         }
 
         // Магнитолы/head unit: если по кнопке «Установить» системное окно так и не появилось (нет обработчика
