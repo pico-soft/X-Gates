@@ -12,8 +12,7 @@ object UpdateNotifier {
     fun maybeNotify(context: Context) {
         val on = SettingsStore.current().notifyNewVersions
         if (!UpdateStore.shouldNotify(on)) return
-        val rec = UpdateStore.record.value
-        NotificationHelper.notifyUpdate(context, rec.availName, UpdateStore.availNotesFirstLine())
+        NotificationHelper.notifyUpdate(context, UpdateStore.availNotesFirstLine())
         UpdateStore.markNotified(context)
     }
 }

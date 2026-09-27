@@ -26,9 +26,9 @@ object NotificationHelper {
     private const val UPDATE_CHANNEL_ID = "xray_updates"
     private const val UPDATE_CHANNEL_NAME = "Обновления"
 
-    /** Уведомление о новой версии (Промпт 93.J): версия + первая строка описания, тап → «О приложении».
-     *  Одно на версию (гейтит вызывающий через UpdateStore). Без размера файла. Ничего не скачивает. */
-    fun notifyUpdate(context: Context, versionName: String, firstLine: String) {
+    /** Уведомление о новой версии (Промпт 93.J): первая строка описания, тап → «О приложении». Номер версии НЕ
+     *  пишем (часто уже вышли релизы новее). Одно на версию (гейтит вызывающий через UpdateStore). Ничего не качает. */
+    fun notifyUpdate(context: Context, firstLine: String) {
         ensureUpdateChannel(context)
         val intent = Intent(context, MainActivity::class.java)
             .putExtra(MainActivity.EXTRA_OPEN, MainActivity.OPEN_UPDATE)
@@ -37,7 +37,7 @@ object NotificationHelper {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val n = NotificationCompat.Builder(context, UPDATE_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_proxy)
-            .setContentTitle("Доступна новая версия $versionName")
+            .setContentTitle("Доступна новая версия")
             .setContentText(firstLine.ifBlank { "Откройте приложение, чтобы обновить" })
             .setStyle(NotificationCompat.BigTextStyle().bigText(firstLine.ifBlank { "Откройте приложение, чтобы обновить" }))
             .setAutoCancel(true)

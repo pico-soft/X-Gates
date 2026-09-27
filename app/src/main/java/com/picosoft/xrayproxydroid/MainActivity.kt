@@ -341,7 +341,6 @@ private fun SettingsTab(modifier: Modifier = Modifier) {
         if (settings.notifyNewVersions && updateRec.availCode > BuildConfig.VERSION_CODE && updateRec.availCode != updateRec.dismissedCode) {
             item {
                 UpdateBanner(
-                    versionName = updateRec.availName,
                     onDismiss = { UpdateStore.markDismissed(context); NotificationHelper.cancelUpdate(context) },
                 )
             }
@@ -1481,7 +1480,6 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                 // Полоса «новая версия» (Промпт 93.K): новее текущей, не отклонена, настройка вкл.
                 if (settings.notifyNewVersions && updateRec.availCode > BuildConfig.VERSION_CODE && updateRec.availCode != updateRec.dismissedCode) {
                     UpdateBanner(
-                        versionName = updateRec.availName,
                         onDismiss = { UpdateStore.markDismissed(context); NotificationHelper.cancelUpdate(context) },
                     )
                 }
@@ -3782,7 +3780,7 @@ private fun CrashBanner(onDismiss: () -> Unit) {
  * Одно событие в двух местах (главная+настройки) — состояние в UpdateStore, отклонение снимает обе + уведомление.
  */
 @Composable
-private fun UpdateBanner(versionName: String, onDismiss: () -> Unit) {
+private fun UpdateBanner(onDismiss: () -> Unit) {
     // ОДИН ТАП по плашке = скачать и установить (без лишних тапов): контроллер проверит при необходимости,
     // скачает, сверит сумму+подпись и откроет системный установщик. Прогресс/отмена — прямо на плашке.
     val context = LocalContext.current
@@ -3809,7 +3807,7 @@ private fun UpdateBanner(versionName: String, onDismiss: () -> Unit) {
                     is UpdateFlowController.Phase.NeedPermission -> "Разрешите установку и нажмите ещё раз"
                     is UpdateFlowController.Phase.ReadyToInstall -> "Скачано — нажмите, чтобы установить"
                     is UpdateFlowController.Phase.Failed -> p.message
-                    else -> "$versionName · нажмите, чтобы обновить"
+                    else -> "Нажмите, чтобы обновить"   // номер версии НЕ пишем (часто уже вышли релизы новее)
                 }
                 Text(sub, style = MaterialTheme.typography.bodySmall, color = fg)
             }
@@ -4327,7 +4325,8 @@ private fun UpdateCheckSection() {
         // Подтверждённое обновление (update.json): версия, размер, сеть, изменения + прогресс скачивания.
         // Сами кнопки скачивания/установки убраны — действие на ЕДИНОЙ кнопке выше.
         if (avail != null) {
-            Text("Новая версия: ${avail.versionName}",
+            // Номер версии НЕ пишем: часто уже вышли релизы новее найденной этой проверкой → цифра путает.
+            Text("Вышла новая версия",
                 style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
             if (avail.notes.isNotBlank()) Text(avail.notes, style = MaterialTheme.typography.bodySmall)
 

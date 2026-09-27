@@ -63,7 +63,7 @@ object UpdateFlowController {
                 val avail = live as? UpdateCheckResult.Available
                 if (avail == null) {
                     _phase.value = when (live) {
-                        is UpdateCheckResult.UpToDate -> Phase.Failed("У вас уже последняя версия — обновление не требуется")
+                        is UpdateCheckResult.UpToDate -> Phase.Failed("Новее версии не найдено — обновление не требуется")
                         else -> Phase.Failed("Обновление недоступно — попробуйте позже")
                     }
                     return@Thread

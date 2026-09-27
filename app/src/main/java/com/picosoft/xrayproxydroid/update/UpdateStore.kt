@@ -127,9 +127,13 @@ object UpdateStore {
     private fun summarize(result: UpdateCheckResult): String = when (result) {
         is UpdateCheckResult.NoReleases -> "Релизов пока нет"
         is UpdateCheckResult.UpToDate ->
-            "У вас последняя версия (${result.latestName})" + if (result.via.isNotBlank()) " · ${result.via}" else ""
+            // НЕ утверждаем «последняя» (проверка сравнивает лишь с прочитанным манифестом — он мог быть недоступен/
+            // устареть → ложное «последняя»). Номер версии НЕ пишем (запутывает — могли выйти релизы новее).
+            "Новее версии не найдено" + if (result.via.isNotBlank()) " · ${result.via}" else ""
         is UpdateCheckResult.Available ->
-            "Доступно обновление: ${result.versionName}" + (if (result.usingUniversal) " (универсальная сборка)" else "") +
+            // Номер версии НЕ показываем: часто на GitHub уже вышли релизы новее той, что нашла эта проверка → цифра
+            // путает. Достаточно факта «есть обновление» (обновлялка всё равно тянет самый свежий latest при скачивании).
+            "Доступно обновление" + (if (result.usingUniversal) " (универсальная сборка)" else "") +
                 if (result.via.isNotBlank()) " · ${result.via}" else ""
         is UpdateCheckResult.AvailableUnverified ->
             "Есть версия новее по метке ${result.tag}, но без update.json — проверить нельзя"
