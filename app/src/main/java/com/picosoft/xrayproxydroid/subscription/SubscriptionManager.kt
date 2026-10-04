@@ -140,7 +140,7 @@ object SubscriptionManager {
         val directT = settings.subTimeoutSec * 1000
         val proxyT = settings.subTimeoutSec * 1000 + 10_000
         val totalT = directT + proxyT + 5_000
-        val cascade = CascadeFetch.fetch(context, url, settings.subUserAgent, directT, proxyT, totalT,
+        val cascade = cascadeWithMirrors(context, url, settings.subUserAgent, directT, proxyT, totalT,
             acceptBody = { it.ok && hasSupportedLinks(it.body) })
         // Пр.136: НЕУДАЧА не помечается как выполненная (флаг seededDefaultRuBypass НЕ ставим → повторим позже),
         // но фиксируем ПРИЧИНУ в лог + persist + StateFlow — чтобы человек видел «список не загрузился, почему»,
@@ -431,6 +431,49 @@ object SubscriptionManager {
 
     // ─────────────────────────── обновление ───────────────────────────
 
+    /** Репо-относительный путь файла в igareck/vpn-configs-for-russia (после ветки main), или null — не наш репо.
+     *  github/githack: …/igareck/vpn-configs-for-russia/main/<rel>; gitlab: …/-/raw/main/<rel>. */
+    private fun igareckRelPath(url: String): String? =
+        Regex("""igareck/vpn-configs-for-russia/(?:-/raw/)?(?:refs/heads/)?main/(.+?)\s*$""")
+            .find(url)?.groupValues?.get(1)?.trim()?.ifBlank { null }
+
+    /**
+     * ЗЕРКАЛА одного и того же файла подписки igareck на разных CDN. ЗАЧЕМ: githack (на нём сидят зашитые дефолты)
+     * нестабилен — даёт стойкие TLS-таймауты, и подписка «не обновляется», хотя файл жив на GitHub. Возвращаем тот
+     * же файл по нескольким CDN в порядке НАДЁЖНОСТИ (github raw → jsdelivr → githack → gitlab) — это один и тот же
+     * контент, не разные подписки (дублей не создаёт: фетчим ТЕЛО, сам источник/URL в списке не меняем). Для НЕ-igareck
+     * URL (Yzewe, пользовательские) возвращаем только сам URL — поведение ровно прежнее. */
+    private fun mirrorUrls(url: String): List<String> {
+        val rel = igareckRelPath(url) ?: return listOf(url)
+        return listOf(
+            "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/$rel",
+            "https://cdn.jsdelivr.net/gh/igareck/vpn-configs-for-russia@main/$rel",
+            "https://raw.githack.com/igareck/vpn-configs-for-russia/main/$rel",
+            "https://gitlab.com/igareck/vpn-configs-for-russia/-/raw/main/$rel",
+        ).distinct()
+    }
+
+    /**
+     * Каскадный фетч С ЗЕРКАЛАМИ: пробуем кандидатов из [mirrorUrls] по очереди (для igareck — тот же файл на разных
+     * CDN; иначе — один URL), ПЕРВЫЙ успешный каскад возвращаем. Все неуспешны → каскад ПЕРВОГО кандидата (связное
+     * сообщение об ошибке). Каждый кандидат сам проходит прямой→SOCKS→temp (CascadeFetch). */
+    private fun cascadeWithMirrors(
+        context: Context, url: String, ua: String, directT: Int, proxyT: Int, totalT: Int,
+        acceptBody: (FetchResult) -> Boolean,
+    ): CascadeResult {
+        val candidates = mirrorUrls(url)
+        var first: CascadeResult? = null
+        for (u in candidates) {
+            val c = CascadeFetch.fetch(context, u, ua, directT, proxyT, totalT, acceptBody = acceptBody)
+            if (first == null) first = c
+            if (c.ok) {
+                if (u != candidates.first()) Log.i(TAG, "подписка: зеркало сработало → $u")
+                return c
+            }
+        }
+        return first!!
+    }
+
     /** Скачать + импортировать ОДИН источник по его url. БЛОКИРУЮЩИЙ. Локальные (url пустой) пропускаем. */
     fun refreshOne(context: Context, id: String): RefreshSummary {
         val settings = SettingsStore.current()
@@ -449,8 +492,8 @@ object SubscriptionManager {
         val directTimeout = settings.subTimeoutSec * 1000
         val proxyTimeout = settings.subTimeoutSec * 1000 + 10_000
         val totalTimeout = directTimeout + proxyTimeout + 5_000
-        log("── refresh «${src.name}» url=$url UA=${settings.subUserAgent} timeout=${settings.subTimeoutSec}s (каскад)")
-        val cascade = CascadeFetch.fetch(
+        log("── refresh «${src.name}» url=$url UA=${settings.subUserAgent} timeout=${settings.subTimeoutSec}s (каскад+зеркала)")
+        val cascade = cascadeWithMirrors(
             context, url, settings.subUserAgent, directTimeout, proxyTimeout, totalTimeout,
             acceptBody = { it.ok && hasSupportedLinks(it.body) },
         )
