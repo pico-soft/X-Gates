@@ -7,6 +7,7 @@ import com.picosoft.xrayproxydroid.net.CascadeResult
 import com.picosoft.xrayproxydroid.settings.BlocklistStore
 import com.picosoft.xrayproxydroid.settings.SettingsStore
 import com.picosoft.xrayproxydroid.xray.ServerFilter
+import com.picosoft.xrayproxydroid.xray.link.JsonConfigParser
 import com.picosoft.xrayproxydroid.xray.link.ParseResult
 import com.picosoft.xrayproxydroid.xray.link.ServerLinkParser
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
@@ -561,9 +562,10 @@ object SubscriptionManager {
         return importInto(context, id, res.body, detail)
     }
 
-    /** Есть ли в теле хотя бы одна распознаваемая ссылка (для предиката каскада «ответ пригоден»). */
+    /** Есть ли в теле хотя бы одна распознаваемая ссылка ИЛИ JSON-конфиг (для предиката каскада «ответ пригоден»). */
     private fun hasSupportedLinks(body: String): Boolean {
         if (body.isBlank()) return false
+        if (JsonConfigParser.parse(body).isNotEmpty()) return true   // формат «JSON-конфиги Xray» (напр. Furk)
         for (line in SubscriptionDecoder.decode(body)) {
             if (ServerLinkParser.parse(line) is ParseResult.Supported) return true
         }
@@ -627,6 +629,19 @@ object SubscriptionManager {
             setStatus(context, id, ok = false, error = err, detail = detail)
             log("  → $err")
             return RefreshSummary(ok = false, error = err)
+        }
+
+        // Формат «JSON-конфиги Xray» (напр. Furk отдаёт массив готовых конфигов, а не ссылки vless://). Построчный
+        // парсер ниже такое НЕ видит (всё тело = одна строка → 0 ссылок → раньше ложный «ссылок не найдено»).
+        // Разбираем JSON ПЕРВЫМ; успех → сохраняем сырьё и пересобираем реестр (rebuildRegistry тоже JSON-aware).
+        val jsonProfiles = JsonConfigParser.parse(body)
+        if (jsonProfiles.isNotEmpty()) {
+            val seenJson = HashSet<String>()
+            var added = 0; var dup = 0
+            for (p in jsonProfiles) if (seenJson.add(serverKey(p))) added++ else dup++
+            log("  JSON-конфиги Xray: серверов=$added дубли=$dup (тело $bytes б)")
+            storeRawAndRebuild(context, id, body, detail)
+            return RefreshSummary(ok = true, added = added, duplicates = dup)
         }
 
         val lines = SubscriptionDecoder.decode(body)
@@ -719,6 +734,13 @@ object SubscriptionManager {
     private fun parseProfiles(body: String): List<ServerProfile> {
         val out = ArrayList<ServerProfile>()
         val seen = HashSet<String>()
+        // Формат «JSON-конфиги Xray» (напр. платный Furk отдаёт массив готовых конфигов, а не ссылки vless://).
+        // Если тело — такой JSON, берём серверы из него; ссылочный парсер к JSON неприменим.
+        val jsonProfiles = JsonConfigParser.parse(body)
+        if (jsonProfiles.isNotEmpty()) {
+            for (p in jsonProfiles) if (seen.add(serverKey(p))) out.add(p)
+            return out
+        }
         for (line in SubscriptionDecoder.decode(body)) {
             val r = ServerLinkParser.parse(line)
             if (r is ParseResult.Supported && seen.add(serverKey(r.profile))) out.add(r.profile)
