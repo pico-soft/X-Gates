@@ -344,7 +344,7 @@ object SubscriptionManager {
         SubscriptionStore.save(context, file.copy(servers = servers))
     }
 
-    /** Обновить speedMbps (ключ→Mbps) в реестре и сохранить ОДИН раз. */
+    /** Обновить speedMbps (ключ→Mbps) в реестре и сохранить ОДИН раз. speedFull НЕ трогаем (легаси/неизвестно). */
     fun applySpeedResults(context: Context, speedByKey: Map<String, Double>) {
         if (speedByKey.isEmpty()) return
         val ts = now()
@@ -357,6 +357,24 @@ object SubscriptionManager {
                 // провале temp-инстансов). Обновляем измерение только валидным результатом (≥0) или если раньше данных не было.
                 mbps < 0 && (rec.profile.speedMbps ?: -1.0) >= 0.0 -> rec
                 else -> rec.copy(profile = rec.profile.copy(speedMbps = mbps, speedTestedTs = ts))
+            }
+        }
+        SubscriptionStore.save(context, file.copy(servers = servers))
+    }
+
+    /** Как [applySpeedResults], но с КАЧЕСТВОМ замера: ключ→(Mbps, full). full=true — полный/точный замер,
+     *  false — минимальный/быстрый («≈» в UI). Для различения в «Живых» быстро- и полностью-померянных. */
+    fun applySpeedResultsTagged(context: Context, speedByKey: Map<String, Pair<Double, Boolean>>) {
+        if (speedByKey.isEmpty()) return
+        val ts = now()
+        val file = SubscriptionStore.load(context)
+        val servers = file.servers.map { rec ->
+            val pair = speedByKey[serverKey(rec.profile)]
+            when {
+                pair == null -> rec
+                // Тот же guard: провал (-1) не затирает прежнюю валидную скорость (и её качество).
+                pair.first < 0 && (rec.profile.speedMbps ?: -1.0) >= 0.0 -> rec
+                else -> rec.copy(profile = rec.profile.copy(speedMbps = pair.first, speedTestedTs = ts, speedFull = pair.second))
             }
         }
         SubscriptionStore.save(context, file.copy(servers = servers))

@@ -80,4 +80,7 @@ data class ServerProfile(
     val speedMbps: Double? = null,
     /** Метка времени последнего замера скорости; null — не тестировался. */
     val speedTestedTs: String? = null,
+    /** Качество последнего замера скорости: true — ПОЛНЫЙ (точный), false — МИНИМАЛЬНЫЙ (быстрый, «≈»),
+     *  null — неизвестно/легаси (в UI трактуем как полный). backward-compat: дефолт + ignoreUnknownKeys. */
+    val speedFull: Boolean? = null,
 )
