@@ -1150,6 +1150,10 @@ object NetworkMonitor {
         (intent?.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0) ?: 0) != 0   // AC/USB/Wireless — шнур воткнут
     }.getOrDefault(false)
 
+    /** ТЗ Elyor: на ШНУРЕ и одновременно Wi-Fi (не мобильная) мерим ВСЕХ без лимита 10/3 (батарея/трафик не жмут).
+     *  На мобильной или на батарее — лимит действует. Тот же критерий, что measureAll в rebuildAndRateTop. */
+    fun chargingAndWifi(app: Context): Boolean = isCharging(app) && !EconomyNet.lastKnownMobile
+
     /**
      * Разрешены ли БАЙТ-ТЯЖЁЛЫЕ замеры скорости прямо сейчас (measureSpeed/measureSufficiency/фон-рейтинг/апгрейд)?
      * ⚠️ ГРАБЛЯ (замер фактом adb, оба телефона на 0.52, 2026-09-27): ночью на батарее при выключенном экране эти

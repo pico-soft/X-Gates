@@ -125,6 +125,15 @@ object ServerSpeedTester {
             warmupBudgetOverride = warmupBudget, measureBudgetOverride = measureBudget).let { if (it.ok) it.mbps else -1.0 }
     }
 
+    /**
+     * МИНИМАЛЬНЫЙ замер кандидата (temp-инстанс), ~100 КБ — как первая ступень активного staged. Цель: ДЁШЕВО
+     * узнать «есть ли throughput» (для порога минимальный→полный при переборе всех живых), а НЕ точная скорость.
+     * Прогрев крошечный (мелочь не должна уходить целиком в прогрев). >0 валидно, -1 провал. Трафик → «Тест».
+     */
+    fun measureSpeedMinimal(context: Context, profile: ServerProfile): Double =
+        measureSpeedDetailed(context, profile, warmupMs = 100, measureMs = 800,
+            warmupBudgetOverride = 16 * 1024L, measureBudgetOverride = 100 * 1024L).let { if (it.ok) it.mbps else -1.0 }
+
     /** Как [measureSpeed], но с исходом/причиной (для диалога «Перемерить»). */
     fun measureSpeedDetailed(
         context: Context,
