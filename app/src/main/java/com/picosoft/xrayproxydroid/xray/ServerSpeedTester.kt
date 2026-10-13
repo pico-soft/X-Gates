@@ -80,8 +80,10 @@ object ServerSpeedTester {
     )
 
     /** Исход замера: УСПЕХ (валидная скорость) или ПРОВАЛ (замер не состоялся — НЕ маленькая скорость).
-     *  [bytes] — фактически скачано (для учёта ТЕСТОВОГО трафика, [TrafficTracker]). */
-    data class Measurement(val mbps: Double, val ok: Boolean, val reason: String, val bytes: Long = 0)
+     *  [bytes] — фактически скачано (для учёта ТЕСТОВОГО трафика, [TrafficTracker]).
+     *  [windowMs] — фактическое окно измерения, мс (для этапного замера: если мелкая ступень скачалась слишком
+     *  быстро — окно короткое и шумное — добираем бо́льшую ступень). */
+    data class Measurement(val mbps: Double, val ok: Boolean, val reason: String, val bytes: Long = 0, val windowMs: Long = 0)
 
     /** Минимум байт, ниже которого замер считаем несостоявшимся (backstop к «измерено==0»). */
     private const val MIN_TOTAL_BYTES = 16 * 1024
@@ -518,7 +520,7 @@ object ServerSpeedTester {
         val mbps = if (subRates.size >= 3) median(subRates) else overallMbps
         val rounded = (mbps * 100).roundToInt() / 100.0
         log("«$name» probe=$probe → $rounded Mbps (медиана ${subRates.size} под-окон, общее ${(overallMbps * 100).roundToInt() / 100.0}) | $diag")
-        return Measurement(rounded, true, "ok/$measureEndReason", bytes = totalBytes)
+        return Measurement(rounded, true, "ok/$measureEndReason", bytes = totalBytes, windowMs = actualWindowMs)
     }
 
     // ══════════════ Промпт 90: замеры АКТИВНОГО туннеля (сопоставимо с кандидатами) + ОТДАЧА ══════════════
@@ -537,6 +539,52 @@ object ServerSpeedTester {
     // прекратился, а не перебирал оставшиеся адреса (иначе отмена ждёт весь перебор). Reset — в начале проверки.
     fun abortCurrentMeasure() { measureAborted = true; runCatching { currentMeasureConn?.disconnect() } }
     fun resetMeasureAbort() { measureAborted = false }
+
+    // ══════════════ Этапный замер (Cloudflare-style): маленький файл → больше, пока окно не станет точным ══════════════
+    // Cloudflare SpeedTest качает сначала мелочь (~100 КБ), потом крупнее (1/10/25 МБ), подбирая размер под канал:
+    // на МЕДЛЕННОМ 100 КБ достаточно (быстрый ответ, мало трафика); на БЫСТРОМ 100 КБ скачиваются за миллисекунды →
+    // окно измерения слишком короткое и шумное → добираем бо́льшую ступень. Ступени ограничены бюджетом трафика
+    // активного замера (activeMeasureBudgetBytes), чтобы не раздувать расход. Прогрев крошечный (мелкая ступень
+    // не должна уходить целиком в прогрев). Критерий «добирать»: окно измерения < MIN_RELIABLE_WINDOW_MS.
+    private val STAGED_BUDGETS = longArrayOf(100 * 1024L, 1 * 1_048_576L, 4 * 1_048_576L)
+    private const val STAGED_WARMUP_MS = 100
+    private const val STAGED_WARMUP_BUDGET = 16 * 1024L
+    private const val MIN_RELIABLE_WINDOW_MS = 400L
+
+    /**
+     * Этапный замер СКАЧИВАНИЯ активного туннеля (Cloudflare-style). >0 — валидно, -1 — провал.
+     * Ступени объёма STAGED_BUDGETS (100 КБ → 1 МБ → 4 МБ), ограниченные [activeMeasureBudgetBytes]: качаем от
+     * мелкой к крупной, останавливаемся, как только окно измерения ≥ [MIN_RELIABLE_WINDOW_MS] (точно) — медленному
+     * каналу хватит первой ступени, быстрому доберём до крупной. Трафик → «Тест». Отмена рвёт перебор немедленно.
+     */
+    fun measureActiveDownloadStaged(context: Context): Double {
+        XrayController.ensureEnv(context)
+        val s = SettingsStore.current()
+        val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", XrayConfig.SOCKS_PORT))
+        val probes = (listOf(s.speedProbeUrl) + fallbackProbes).distinct()
+        val cap = s.activeMeasureBudgetBytes.coerceAtLeast(STAGED_BUDGETS.first())
+        val stages = STAGED_BUDGETS.filter { it <= cap }.ifEmpty { listOf(STAGED_BUDGETS.first()) }
+        var testBytes = 0L
+        for (probe in probes) {
+            if (measureAborted) break   // Промпт 101.B: отмена — не перебираем оставшиеся пробники
+            var best = -1.0
+            var probeFailed = false
+            for (budget in stages) {
+                if (measureAborted) break
+                val m = downloadMbps(probe, proxy, STAGED_WARMUP_MS, s.speedWindowMs,
+                    STAGED_WARMUP_BUDGET, budget, "активный↓${budget / 1024}КБ", s.verboseLogs)
+                testBytes += m.bytes
+                if (!m.ok) { probeFailed = true; break }   // пробник не отдал → следующий пробник
+                best = m.mbps
+                if (m.windowMs >= MIN_RELIABLE_WINDOW_MS) break   // окно достаточно длинное → точно, не добираем
+                // иначе канал быстрый (мелкая ступень скачалась мгновенно) → бо́льшая ступень
+            }
+            if (measureAborted) break
+            if (!probeFailed && best > 0) { TrafficTracker.addTest(testBytes); return best }
+        }
+        TrafficTracker.addTest(testBytes)
+        return -1.0
+    }
 
     /** Скорость СКАЧИВАНИЯ активного туннеля, Mbps (>0 валидно, -1 провал). Трафик → «Тест». */
     fun measureActiveDownloadMbps(context: Context): Double {
