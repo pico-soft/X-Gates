@@ -59,15 +59,18 @@ object SubscriptionManager {
     const val YZEWE_SOURCE_NAME = "Yzewe"
 
     /** Пр.140: источники «белого списка РФ» — сеются ВЫКЛ, авто-обновляются раз в полчаса (безакцептно), используются
-     *  только в режиме белых списков (или если юзер включит их вручную). Дедуп по URL (не плодим дубли). Каждую
-     *  пробуем каждые полчаса: на GitHub файлы меняются — какой-то может временно отдавать 404 (напр. `…-2.txt`
-     *  сейчас 404), а `WHITE-CIDR-RU-all.txt` вопреки имени содержит рабочие vless-конфиги. В режиме белых списков
-     *  прямой путь к githack закрыт — обновление идёт ЧЕРЕЗ ТУННЕЛЬ рабочего белого сервера (CascadeFetch, ступень SOCKS). */
+     *  только в режиме белых списков (или если юзер включит их вручную). Дедуп по URL (не плодим дубли).
+     *  `WHITE-CIDR-RU-all.txt` вопреки имени содержит рабочие vless-конфиги. В режиме белых списков прямой путь к
+     *  githack закрыт — обновление идёт ЧЕРЕЗ ТУННЕЛЬ рабочего белого сервера (CascadeFetch, ступень SOCKS).
+     *  ⛔ Источник `…-Mobile-2.txt` (ВЕЧНО 404 на GitHub) убран из дефолта (просьба Elyor) — см. [DEAD_WHITE_LIST_URL]. */
     val WHITE_LIST_SOURCES = listOf(
         "Серверы для белых списков РФ" to "https://raw.githack.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
-        "Серверы для белых списков РФ (2)" to "https://raw.githack.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt",
         "Белые списки РФ (CIDR)" to "https://raw.githack.com/igareck/vpn-configs-for-russia/main/WHITE-CIDR-RU-all.txt",
     )
+
+    /** Вечно-мёртвый (404) источник белого списка — убран из дефолта. Чистим его и у существующих установок (init),
+     *  т.к. он был засеян ensureWhiteListSources ранее. Сравниваем по хвосту файла (устойчиво к normalizeUrl). */
+    private const val DEAD_WHITE_LIST_URL = "Vless-Reality-White-Lists-Rus-Mobile-2.txt"
 
     /** Пр.136: состояние посева дефолтной подписки для UI. [attempted]=пробовали хоть раз; [error] пуст = успех/не
      *  пробовали, непуст = последняя попытка не удалась (показываем причину + «Повторить», не пустой экран). */
@@ -109,6 +112,8 @@ object SubscriptionManager {
         // Пр.140: добавить источники белого списка (ВЫКЛ) существующим установкам, у кого их ещё нет. Только
         // метаданные (URL) — тела подтянет авто-рефреш раз в полчаса. На свежей установке их сеет trySeedDefaultSource.
         runCatching { ensureWhiteListSources(context) }
+        // Убрать вечно-мёртвый (404) источник белого списка `…-Mobile-2.txt` у существующих установок (просьба Elyor).
+        runCatching { pruneDeadWhiteListSources(context) }
         // Yzewe: добавить дефолтную подписку (ВКЛ) существующим установкам — разово (флаг seededYzewe). Тела
         // подтянет ближайший рефреш (автозапуск/«Самый быстрый»/авто раз в полчаса). На свежей — в trySeedDefaultSource.
         runCatching { ensureYzewe(context) }
@@ -186,6 +191,16 @@ object SubscriptionManager {
         if (missing.isEmpty()) return
         SubscriptionStore.save(context, file.copy(sources = file.sources + missing))
         Log.i(TAG, "добавлены источники белого списка (ВЫКЛ): ${missing.size}")
+    }
+
+    /** Убрать ВЕЧНО-МЁРТВЫЙ (404) источник белого списка [DEAD_WHITE_LIST_URL] у существующих установок (просьба
+     *  Elyor). Идемпотентно: удаляем источник, чей URL оканчивается на мёртвый файл. На свежей — его и не сеем. */
+    fun pruneDeadWhiteListSources(context: Context) {
+        val file = SubscriptionStore.load(context)
+        val kept = file.sources.filterNot { it.whiteList && it.url.endsWith(DEAD_WHITE_LIST_URL) }
+        if (kept.size == file.sources.size) return
+        SubscriptionStore.save(context, file.copy(sources = kept))
+        Log.i(TAG, "убран вечно-мёртвый источник белого списка: ${file.sources.size - kept.size}")
     }
 
     /** Yzewe: добавить дефолтную подписку (ВКЛ) РАЗОВО, если ещё не добавляли (флаг seededYzewe) и её URL ещё нет.
