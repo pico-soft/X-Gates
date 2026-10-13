@@ -63,7 +63,7 @@ object FullTestRunner {
         marginRatio: Double = SettingsStore.current().marginRatio,   // живой порог из настроек
         onPhase: (String) -> Unit,
         onPingResult: (ServerProfile, Int) -> Unit = { _, _ -> },
-        onSpeedResult: (ServerProfile, Double) -> Unit = { _, _ -> },
+        onSpeedResult: (ServerProfile, Double, Boolean) -> Unit = { _, _, _ -> },   // full=true полный замер, false минимальный («≈»)
         emitProgress: (done: Int, total: Int) -> Unit = { _, _ -> },  // числовой прогресс наружу (для бара)
         connect: (ServerProfile) -> Unit,
         onDone: (Result) -> Unit,
@@ -170,7 +170,7 @@ object FullTestRunner {
                             val mbps = ServerSpeedTester.measureSpeed(appCtx, p)
                             if (cancelled.get()) break
                             measured++
-                            onSpeedResult(p, mbps)
+                            onSpeedResult(p, mbps, true)   // measureSpeed — полный замер
                             if (mbps > bestSpeed) { bestSpeed = mbps; best = p; hbBest.set(p) }
                             emitProgress(measured, order.size); beat()
                         }
@@ -181,7 +181,7 @@ object FullTestRunner {
                             MonitorLog.switch(appCtx, from, ServerLabels.display(pick), "экономия: лучший из проб вслепую", "${fmt(bestSpeed)} Мбит/с")
                             val act = connectAndMeasureActive(pick)
                             connected = pick; connectedSpeed = if (act > 0) act else bestSpeed; hbConnected.set(pick)
-                            if (act > 0) onSpeedResult(pick, act)
+                            if (act > 0) onSpeedResult(pick, act, true)   // активный замер — полный
                         }
                     } else {
                         // Пр.125.B: по одному, от быстрых по ПРОШЛЫМ замерам; первый ≥ порога — стоп.
@@ -197,7 +197,7 @@ object FullTestRunner {
                             val mbps = connectAndMeasureActive(p)
                             if (cancelled.get()) break
                             measured++
-                            onSpeedResult(p, mbps)
+                            onSpeedResult(p, mbps, true)   // активный замер — полный
                             connected = p; connectedSpeed = mbps; hbConnected.set(p)
                             if (mbps > bestSpeed) { bestSpeed = mbps; best = p; hbBest.set(p) }
                             emitProgress(measured, order.size); beat()
@@ -330,7 +330,7 @@ object FullTestRunner {
                     val activeProfile = allServers.firstOrNull { key(it) == activeServerKey }
                     val activeMbps = if (activeProfile != null && !cancelled.get())
                         ServerSpeedTester.measureSpeed(appCtx, activeProfile) else -1.0
-                    if (activeProfile != null && activeMbps > 0.0) onSpeedResult(activeProfile, activeMbps)   // сопоставимое число — в «Живые»
+                    if (activeProfile != null && activeMbps > 0.0) onSpeedResult(activeProfile, activeMbps, true)   // measureSpeed — полный; в «Живые»
                     beat()
                     if (activeProfile != null && activeMbps >= s.monitorTunnelThreshold) {
                         connected = activeProfile; connectedSpeed = activeMbps; hbConnected.set(activeProfile); keepActive = true
@@ -359,7 +359,7 @@ object FullTestRunner {
                     if (cancelled.get()) break   // Промпт 103: сторож/отмена сработали во время замера — не действуем по нему
                     measured++
                     if (mbps >= threshold) goodAbove++   // набор ≥ порога (для остановки на fastTarget)
-                    onSpeedResult(p, mbps)   // результат сохраняем всегда
+                    onSpeedResult(p, mbps, savedFast)   // savedFast=точный замок-ин (полный); иначе measureSufficiency (быстрый «≈»)
                     if (ServerFilter.isSelectable(p, mbps, s, blocklist)) {
                         selectable++
                         goodOnes.add(p)   // Пр.151: годный — в кандидаты на точный замер (Этап 3)
@@ -417,7 +417,7 @@ object FullTestRunner {
                         val full = if (savedFast3) (p.speedMbps ?: 0.0)
                                    else ServerSpeedTester.measureSpeed(appCtx, p)   // полный замер (точная скорость)
                         if (cancelled.get()) break
-                        if (!savedFast3) onSpeedResult(p, full)
+                        if (!savedFast3) onSpeedResult(p, full, true)   // measureSpeed — полный/точный замер (Этап 3)
                         if (full > bestSpeed) { bestSpeed = full; best = p; hbBest.set(p) }
                         beat()
                     }

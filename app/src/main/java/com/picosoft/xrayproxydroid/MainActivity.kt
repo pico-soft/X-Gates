@@ -942,6 +942,9 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
     var pingResultsAt by remember { mutableStateOf<Map<String, Long>>(emptyMap()) }
 
     var speedResults by remember { mutableStateOf<Map<String, Double>>(emptyMap()) }
+    // Качество сессионного замера: ключ→full (true полный/точный, false минимальный/быстрый «≈»). Параллельно
+    // speedResults — чтобы в «Живых» различать быстро- и полностью-померянных ещё до персиста (live-обновления теста).
+    var speedResultsFull by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
 
     var fullTesting by remember { mutableStateOf(false) }  // меняется только на старт/стоп (не на тик)
     var fullHandle by remember { mutableStateOf<FullTestRunner.Handle?>(null) }
@@ -1005,6 +1008,9 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
 
     fun effPing(p: ServerProfile): Int? = pingResults[SubscriptionManager.serverKey(p)] ?: p.pingMs
     fun effSpeed(p: ServerProfile): Double? = speedResults[SubscriptionManager.serverKey(p)] ?: p.speedMbps
+    // Качество замера для показа: сессионное (speedResultsFull) → сохранённое (speedFull). null = легаси/неизвестно
+    // (трактуем как полный — без «≈», жирным). false → минимальный замер («≈», обычный шрифт).
+    fun effSpeedFull(p: ServerProfile): Boolean? = speedResultsFull[SubscriptionManager.serverKey(p)] ?: p.speedFull
     // Давность пинга ВСЕГДА в паре со значением: сессионный пинг (из pingResults) → его время из pingResultsAt;
     // иначе сохранённый lastTestedTs; а если пинг есть, но метки нет (легаси-данные) — честно «давно» (уточнится
     // при следующем пере-пинге монитора). Так строка НИКОГДА не показывает пинг без времени (ТЗ Elyor).
@@ -1118,7 +1124,8 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
         if (fullTesting) return
         // Пр.142: «Самый быстрый» БЕЗАКЦЕПТНО перебивает идущую проверку (не заставляем «сначала прервите»).
         // «Проверить» теперь только мерит активный туннель и не переключает — двух подборов одновременно нет.
-        if (checking) { checkCancel = true; ServerSpeedTester.abortCurrentMeasure(); checking = false; MonitorCoordinator.fullTestRunning = false; checkStatus = "" }
+        if (checking) { checkCancel = true; ServerSpeedTester.abortCurrentMeasure(); checking = false; MonitorCoordinator.fullTestRunning = false }
+        checkStatus = ""   // начинается подбор/смена сервера → прежний результат «Проверить» больше не про активный сервер (не залипает)
         // Свежий список из реестра (не застаревший снимок): учитывает вкл/выкл источников, сделанные на
         // вкладке «Подписки» (Промпт 82). Сервер входит, если он в ЛЮБОМ включённом источнике.
         val all = SubscriptionManager.allServers(context).also { servers = it }
@@ -1136,7 +1143,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
         MonitorCoordinator.wake()                   // прервать возможный перебор/паузу монитора
         CrashContext.set("полный тест: старт")
         TestProgress.startIndeterminate("запуск…")   // до первого done/total — indeterminate
-        pingResults = emptyMap(); pingResultsAt = emptyMap(); speedResults = emptyMap()
+        pingResults = emptyMap(); pingResultsAt = emptyMap(); speedResults = emptyMap(); speedResultsFull = emptyMap()
 
         fullHandle = FullTestRunner.run(
             context = context,
@@ -1148,16 +1155,18 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                 val k = SubscriptionManager.serverKey(p)
                 activity.runOnUiThread { pingResults = pingResults + (k to ms); pingResultsAt = pingResultsAt + (k to System.currentTimeMillis()) }
             },
-            onSpeedResult = { p, mbps ->
-                activity.runOnUiThread { speedResults = speedResults + (SubscriptionManager.serverKey(p) to mbps) }
+            onSpeedResult = { p, mbps, full ->
+                val k = SubscriptionManager.serverKey(p)
+                activity.runOnUiThread { speedResults = speedResults + (k to mbps); speedResultsFull = speedResultsFull + (k to full) }
             },
             connect = { p -> activity.runOnUiThread { startServer(p) } },
             onDone = { r ->
                 activity.runOnUiThread {
-                    val pSnap = pingResults; val sSnap = speedResults        // снимок state на main
+                    val pSnap = pingResults; val sSnap = speedResults; val sfSnap = speedResultsFull   // снимок state на main
                     Thread {
                         SubscriptionManager.applyPingResults(context, pSnap) // персист пинга
-                        SubscriptionManager.applySpeedResults(context, sSnap) // персист скорости
+                        // персист скорости С КАЧЕСТВОМ (full из сессии; если метки нет — трактуем как полный)
+                        SubscriptionManager.applySpeedResultsTagged(context, sSnap.mapValues { (k, v) -> v to (sfSnap[k] ?: true) })
                         activity.runOnUiThread {
                             fullTesting = false; fullHandle = null
                             runCatching { fullTestWakeLock[0]?.let { if (it.isHeld) it.release() }; fullTestWakeLock[0] = null }   // а: снять wakelock
@@ -1259,12 +1268,13 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                 val up = ServerSpeedTester.measureActiveUploadMbps(context)
                 if (checkCancel) { ui { checkStatus = "" }; return@Thread }
                 if (down > 0) {
-                    // Туннель РАБОТАЕТ: сохранить скорость + подтвердить живость активного (плашка → зелёная/по-скорости).
-                    SubscriptionManager.applySpeedResults(context, mapOf(curKey to down))
+                    // Туннель РАБОТАЕТ: сохранить скорость (ПОЛНЫЙ замер) + подтвердить живость активного (плашка → зелёная).
+                    SubscriptionManager.applySpeedResultsTagged(context, mapOf(curKey to (down to true)))
                     TunnelSpeed.setLive(down, if (up > 0) up else 0.0, System.currentTimeMillis(), curKey)
                     TunnelHealth.ok(TunnelHealth.snapshot().ip, System.currentTimeMillis(), curKey)
                     ui {
                         speedResults = speedResults + (curKey to down)
+                        speedResultsFull = speedResultsFull + (curKey to true)
                         activeUploadMbps = if (up > 0) up else null
                         checkStatus = "Соединение в норме: ↓${fmt(down)} / ↑${fmt(up)} Мбит/с (пинг ${pingMs} мс)"
                     }
@@ -1385,6 +1395,13 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
             kotlinx.coroutines.delay(12_000)
             if (UpdateFlowController.appInForeground && ProxyState.state.value.running && !checking) refreshIp()
         }
+    }
+    // Жалоба Elyor: внизу залипала надпись «Соединение в норме ↓8.x» от кнопки «Проверить», а плашка/сервер тем
+    // временем менялись (монитор/полный тест переключали сервер) → результат проверки оказывался НЕ про текущий
+    // сервер = нелогично. Гасим результат проверки при СМЕНЕ активного сервера (кроме момента самой проверки —
+    // там текстом управляет onCheck). Срабатывает на реальную смену serverKey.
+    LaunchedEffect(proxy.serverKey) {
+        if (!checking) checkStatus = ""
     }
     // #2 (жалоба Elyor «серая плашка»): при ВОЗВРАЩЕНИИ в приложение (resumeTick) сразу освежаем IP — иначе после
     // фона подтверждение связи устарело и плашка серела бы до ~12с (следующей периодической пробы). Теперь зелёная сразу.
@@ -1694,7 +1711,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
             Box(Modifier.fillMaxWidth().background(liveBg).then(rowMod)) {
                 ServerRow(
                     profile = p, name = displayName(p, blocklist), isActive = isActive,
-                    speedMbps = effSpeed(p), number = index + 1, pingMs = effPing(p), pingAge = effPingAge(p), caption = discriminators[SubscriptionManager.serverKey(p)] ?: "",
+                    speedMbps = effSpeed(p), number = index + 1, pingMs = effPing(p), pingAge = effPingAge(p), speedFull = effSpeedFull(p), caption = discriminators[SubscriptionManager.serverKey(p)] ?: "",
                     onConnect = { connectServer(p, "ручной выбор") },
                     onDetails = { detailProfile = p; remeasureStatus = "" },
                     showUseToggle = true,
@@ -1728,7 +1745,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                 Box(Modifier.fillMaxWidth().background(allBg).then(rowMod)) {
                     ServerRow(
                         profile = p, name = displayName(p, blocklist), isActive = isActive,
-                        speedMbps = effSpeed(p), pingMs = effPing(p), pingAge = effPingAge(p), caption = discriminators[SubscriptionManager.serverKey(p)] ?: "",
+                        speedMbps = effSpeed(p), pingMs = effPing(p), pingAge = effPingAge(p), speedFull = effSpeedFull(p), caption = discriminators[SubscriptionManager.serverKey(p)] ?: "",
                         onConnect = { connectServer(p, "ручной выбор") },
                         onDetails = { detailProfile = p; remeasureStatus = "" },
                         showUseToggle = true,
@@ -2325,6 +2342,7 @@ private fun ServerRow(
     number: Int = 0,                   // номер в списке «Живые» (1-based); 0 = не показывать. Виден и в плашке.
     pingMs: Int? = null,               // Пр.146: ЭФФЕКТИВНЫЙ пинг (effPing = сессионный ?: сохранённый), как и speed
     pingAge: String = "",              // ТЗ Elyor: давность пинга В ПАРЕ со значением (effPingAge) — всегда есть, если пинг есть
+    speedFull: Boolean? = null,        // качество замера: true полный (жирный, точный), false минимальный («≈», обычный), null легаси=полный
     caption: String,
     onConnect: () -> Unit,
     onDetails: () -> Unit,
@@ -2396,10 +2414,14 @@ private fun ServerRow(
             // Скорость + под ней ДАВНОСТЬ замера тем же мелким шрифтом (Промпт 123.E): цифра без давности
             // вводит в заблуждение (24 Мбит/с минутной и двухдневной давности выглядят одинаково).
             Column(modifier = Modifier.width(COL_SPEED), horizontalAlignment = Alignment.End) {
+                // Различаем замеры (ТЗ Elyor): МИНИМАЛЬНЫЙ (быстрый) — обычный шрифт + «≈» (приблизительно);
+                // ПОЛНЫЙ (точный) / легаси — жирный без «≈». Цвет оставляем = величина скорости (не конфликтует).
+                val quick = speedFull == false
+                val hasNum = speedMbps != null && speedMbps > 0.0
                 Text(
-                    speedCell(speedMbps),
+                    if (quick && hasNum) "≈" + speedCell(speedMbps) else speedCell(speedMbps),
                     fontSize = TABLE_FONT,
-                    fontWeight = FontWeight.Bold,
+                    fontWeight = if (quick) FontWeight.Normal else FontWeight.Bold,
                     color = speedColor(speedMbps),
                     textAlign = TextAlign.End,
                     maxLines = 1,
