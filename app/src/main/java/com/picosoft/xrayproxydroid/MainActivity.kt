@@ -157,6 +157,7 @@ import com.picosoft.xrayproxydroid.xray.ExternalIpChecker
 import com.picosoft.xrayproxydroid.xray.FullTestRunner
 import com.picosoft.xrayproxydroid.xray.ServerFilter
 import com.picosoft.xrayproxydroid.xray.ServerSpeedTester
+import com.picosoft.xrayproxydroid.xray.ServerTester
 import com.picosoft.xrayproxydroid.xray.BlocklistLog
 import com.picosoft.xrayproxydroid.xray.XrayConfig
 import com.picosoft.xrayproxydroid.xray.XrayConfigBuilder
@@ -1217,10 +1218,13 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
         }.start()
     }
 
-    // Кнопка «Проверить» (ПЕРЕРАБОТАНО Пр.142): ТОЛЬКО перемер АКТИВНОГО туннеля (↓/↑) + подтверждение живости.
-    // НИКОГДА не переключает сервер и не перебирает кандидатов — из-за прежней лестницы возникала «пляска»
-    // (проверка дралась с полным тестом и переключалась на плохой/исключённый сервер). Переключение теперь
-    // только «Самый быстрый» + авто-восстановление. Результат сразу виден на плашке (живая скорость + цвет).
+    // Кнопка «Проверить» (ПЕРЕРАБОТАНО: пинг-первый). Жалоба Elyor: кнопка «молчала», пока не домерит ↓/↑ целиком —
+    // хотя жив/мёртв видно СРАЗУ по пингу. Теперь:
+    //   1) быстрый ПИНГ текущего сервера → мгновенный ответ «жив (NNN мс)» / «не отвечает»;
+    //   2) ЖИВ → этапный замер скорости (Cloudflare-style 100 КБ→1 МБ, measureActiveDownloadStaged) + отдача;
+    //   3) МЁРТВ → честно + СРАЗУ ищем рабочий через onFullTest (единая безопасная точка выбора, её же зовёт
+    //      «Убрать текущий»). Это держит связь (⭐ Пр.95), НЕ плодя прежнюю «пляску» Пр.142: переключение идёт
+    //      тем же путём, что «Самый быстрый», а не собственной лестницей кнопки, дравшейся с монитором/полным тестом.
     fun onCheck() {
         if (checking) return
         if (fullTesting || refreshingSubs) { checkStatus = "идёт другой тест — подождите"; return }
@@ -1228,16 +1232,30 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
         if (!ProxyState.state.value.running || curKey == null) {
             checkStatus = "Прокси не запущен — нажмите «Самый быстрый»"; return
         }
-        checking = true; checkCancel = false; checkStatus = "Замер текущего соединения…"
+        checking = true; checkCancel = false; checkStatus = "Проверяю сервер…"
         ServerSpeedTester.resetMeasureAbort()
         MonitorCoordinator.fullTestRunning = true   // монитор молчит, пока меряем активный
         fun fmt(v: Double) = if (v < 0) "—" else "${(v * 10).roundToInt() / 10.0}"
         fun ui(block: () -> Unit) = activity.runOnUiThread(block)
+        val cur = servers.firstOrNull { SubscriptionManager.serverKey(it) == curKey }
         Thread {
+            var recover = false   // текущий мёртв → в finally запускаем поиск рабочего (onFullTest)
             try {
                 if (!NetworkMonitor.directAlive()) { ui { checkStatus = "Нет интернета — проверка невозможна" }; return@Thread }
-                val down = ServerSpeedTester.measureActiveDownloadMbps(context)
-                if (checkCancel) { ui { checkStatus = "" }; return@Thread }   // отмена — не залипаем «Проверка прервана» над рабочим туннелем
+                // 1) БЫСТРЫЙ пинг текущего сервера — мгновенная обратная связь жив/мёртв (не ждём полного замера).
+                val pingMs = if (cur != null) ServerTester.ping(context, cur) else -1L
+                if (checkCancel) { ui { checkStatus = "" }; return@Thread }
+                SubscriptionManager.applyPingResults(context, mapOf(curKey to pingMs.toInt()))   // обновить «Живые»
+                if (pingMs < 0) {
+                    // 3) МЁРТВ по пингу → честно + сразу ищем рабочий (onFullTest в finally, ⭐ Пр.95 непрерывность).
+                    ui { checkStatus = "Текущий сервер не отвечает — ищу рабочий…" }
+                    recover = true
+                    return@Thread
+                }
+                // 2) ЖИВ — показываем пинг сразу, затем меряем скорость этапами (100 КБ → 1 МБ).
+                ui { checkStatus = "Сервер жив (пинг ${pingMs} мс) — меряю скорость…" }
+                val down = ServerSpeedTester.measureActiveDownloadStaged(context)
+                if (checkCancel) { ui { checkStatus = "" }; return@Thread }   // отмена — не залипаем «прервано» над рабочим туннелем
                 val up = ServerSpeedTester.measureActiveUploadMbps(context)
                 if (checkCancel) { ui { checkStatus = "" }; return@Thread }
                 if (down > 0) {
@@ -1248,16 +1266,20 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                     ui {
                         speedResults = speedResults + (curKey to down)
                         activeUploadMbps = if (up > 0) up else null
-                        checkStatus = "Соединение в норме: ↓${fmt(down)} / ↑${fmt(up)} Мбит/с"
+                        checkStatus = "Соединение в норме: ↓${fmt(down)} / ↑${fmt(up)} Мбит/с (пинг ${pingMs} мс)"
                     }
                 } else {
-                    // Туннель не ответил — НЕ переключаем сами (Пр.142), честно предлагаем «Самый быстрый».
-                    ui { checkStatus = "Туннель не отвечает — нажмите «Самый быстрый»" }
+                    // Пинг прошёл, но трафик не идёт (сервер отвечает на 204, но туннель не тянет) → ищем рабочий.
+                    ui { checkStatus = "Сервер жив (пинг ${pingMs} мс), но трафик не идёт — ищу рабочий…" }
+                    recover = true
                 }
             } catch (e: Exception) {
                 ui { checkStatus = "Ошибка проверки: ${e.message}" }
             } finally {
-                ui { checking = false; MonitorCoordinator.fullTestRunning = false; reloadServers() }
+                ui {
+                    checking = false; MonitorCoordinator.fullTestRunning = false; reloadServers()
+                    if (recover && !checkCancel) onFullTest()   // единая точка выбора (без «пляски» Пр.142)
+                }
             }
         }.start()
     }
@@ -2023,8 +2045,8 @@ private fun StatusBox(
                 }
             }
         }
-        // Тонкий индикатор процесса замера текущего соединения (кнопка «Проверить»). Неопределённый: проверка —
-        // это последовательность шагов (замер активного туннеля → перебор кандидатов), чистой доли нет.
+        // Тонкий индикатор процесса проверки (кнопка «Проверить»). Неопределённый: проверка — последовательность
+        // шагов (пинг текущего → этапный замер скорости, либо поиск рабочего, если мёртв), чистой доли нет.
         if (checking) {
             Spacer(Modifier.height(6.dp))
             LinearProgressIndicator(
