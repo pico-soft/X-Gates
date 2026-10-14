@@ -1353,30 +1353,16 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
         .filter { (effPing(it) ?: -1) >= 0 }
     val hiddenLiveProtocols = hiddenLiveByProto.map { it.protocol }.distinct()
 
-    // Сортировка: ПОДТВЕРЖДЁННО живые СЕЙЧАС (свежий пинг≥0) — всегда ВЫШЕ «призраков» (пинг ✗, видны лишь по
-    // старой скорости ≤2ч, Пр.148). Иначе мёртвый-но-быстрый сервер (напр. «Польша 22 Мбит/с · 30 мин, пинг ✗»)
-    // всплывал НАД живым-но-медленным (напр. активный «Australia ↓0.7, пинг ok») и путал: «сверху быстрые, а сижу
-    // на медленном» — хотя верхние сейчас НЕДОСТУПНЫ (полевой случай S908E на деградированном пуле). Пр.148 не
-    // ломаем: призраки остаются в «Живых» (со строкой «пинг ✗»), но опускаются НИЖЕ реально доступных.
-    // Внутри «живых сейчас»: скорость>0 убыв. → без скорости по пингу возр. Призраки — по скорости убыв.
+    // Сортировка (ТЗ Elyor 2026-10-14): ТОП по РЕАЛЬНОЙ замеренной СКОРОСТИ — быстрые сверху. Все видимые уже
+    // живы по пингу (ServerFilter.isVisible требует pingMs≥0, «призраков без пинга» больше нет). Измеренные (speed>0)
+    // идут ВЫШЕ непомеренных (только пинг); среди измеренных — по скорости убыв.; непомеренные — по пингу возр.
     val shown = allowedServers.sortedWith(Comparator { a, b ->
-        fun rank(p: ServerProfile): Int {
-            val s = effSpeed(p) ?: 0.0
-            val pg = effPing(p) ?: -1
-            return when {
-                pg >= 0 && s > 0 -> 0    // жив пингом СЕЙЧАС и есть замер — верх
-                pg >= 0          -> 1    // жив пингом СЕЙЧАС, скорость не мерена
-                s > 0            -> 2    // пинг ✗/нет, но жив по свежей скорости (Пр.148) — призрак, ниже живых
-                else             -> 3
-            }
-        }
-        val ra = rank(a); val rb = rank(b)
-        if (ra != rb) ra - rb
-        else when (ra) {
-            0 -> effSpeed(b)!!.compareTo(effSpeed(a)!!)   // скорость убыв.
-            1 -> effPing(a)!!.compareTo(effPing(b)!!)     // пинг возр.
-            2 -> effSpeed(b)!!.compareTo(effSpeed(a)!!)   // призраки — по (старой) скорости убыв.
-            else -> 0
+        val sa = effSpeed(a) ?: 0.0; val sb = effSpeed(b) ?: 0.0
+        val hasA = sa > 0.0; val hasB = sb > 0.0
+        when {
+            hasA && hasB -> sb.compareTo(sa)                               // оба измерены — по скорости убыв.
+            hasA != hasB -> if (hasA) -1 else 1                            // измеренный выше непомеренного
+            else -> (effPing(a) ?: Int.MAX_VALUE).compareTo(effPing(b) ?: Int.MAX_VALUE)   // оба без замера — по пингу возр.
         }
     })
 
