@@ -595,6 +595,25 @@ object ServerSpeedTester {
         return -1.0
     }
 
+    /** МИНИМАЛЬНЫЙ замер активного туннеля (~100 КБ) — дёшево узнать «есть ли throughput» (кнопка «Проверить»:
+     *  пинг→минимальный→полный). >0 валидно, -1 провал. Трафик → «Тест». */
+    fun measureActiveDownloadMinimal(context: Context): Double {
+        XrayController.ensureEnv(context)
+        val s = SettingsStore.current()
+        val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", XrayConfig.SOCKS_PORT))
+        val probes = (listOf(s.speedProbeUrl) + fallbackProbes).distinct()
+        var testBytes = 0L
+        for (probe in probes) {
+            if (measureAborted) break
+            val m = downloadMbps(probe, proxy, STAGED_WARMUP_MS, s.speedWindowMs,
+                STAGED_WARMUP_BUDGET, STAGED_BUDGETS.first(), "активный↓мин", s.verboseLogs)
+            testBytes += m.bytes
+            if (m.ok) { TrafficTracker.addTest(testBytes); return m.mbps }
+        }
+        TrafficTracker.addTest(testBytes)
+        return -1.0
+    }
+
     /** Скорость СКАЧИВАНИЯ активного туннеля, Mbps (>0 валидно, -1 провал). Трафик → «Тест». */
     fun measureActiveDownloadMbps(context: Context): Double {
         XrayController.ensureEnv(context)

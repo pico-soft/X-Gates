@@ -1119,8 +1119,10 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
     // ОТДЕЛЬНУЮ вкладку «Подписки» ([SubscriptionsScreen]). Здесь остаётся только onRefreshAll (кнопка
     // «↻ Подписки» на панели действий + автозапуск).
 
-    // Полный адаптивный тест: ping → speed по живым → early-connect первого рабочего → апгрейд.
-    fun onFullTest() {
+    // Полный адаптивный тест: ping → минимальный замер всех → полный топ → early-connect → апгрейд.
+    // [serverList] != null → тест по ЗАДАННОМУ списку (перебор known-alive из «Проверить»), без смены видимого списка;
+    // null → весь реестр (кнопка «Самый быстрый»).
+    fun onFullTest(serverList: List<ServerProfile>? = null) {
         if (fullTesting) return
         // Пр.142: «Самый быстрый» БЕЗАКЦЕПТНО перебивает идущую проверку (не заставляем «сначала прервите»).
         // «Проверить» теперь только мерит активный туннель и не переключает — двух подборов одновременно нет.
@@ -1128,7 +1130,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
         checkStatus = ""   // начинается подбор/смена сервера → прежний результат «Проверить» больше не про активный сервер (не залипает)
         // Свежий список из реестра (не застаревший снимок): учитывает вкл/выкл источников, сделанные на
         // вкладке «Подписки» (Промпт 82). Сервер входит, если он в ЛЮБОМ включённом источнике.
-        val all = SubscriptionManager.allServers(context).also { servers = it }
+        val all = serverList ?: SubscriptionManager.allServers(context).also { servers = it }
         if (all.isEmpty()) { subStatus = "нет серверов"; return }
         fullTesting = true
         MonitorCoordinator.fullTestRunning = true   // монитор молчит, пока идёт ручной тест
@@ -1227,13 +1229,13 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
         }.start()
     }
 
-    // Кнопка «Проверить» (ПЕРЕРАБОТАНО: пинг-первый). Жалоба Elyor: кнопка «молчала», пока не домерит ↓/↑ целиком —
-    // хотя жив/мёртв видно СРАЗУ по пингу. Теперь:
-    //   1) быстрый ПИНГ текущего сервера → мгновенный ответ «жив (NNN мс)» / «не отвечает»;
-    //   2) ЖИВ → этапный замер скорости (Cloudflare-style 100 КБ→1 МБ, measureActiveDownloadStaged) + отдача;
-    //   3) МЁРТВ → честно + СРАЗУ ищем рабочий через onFullTest (единая безопасная точка выбора, её же зовёт
-    //      «Убрать текущий»). Это держит связь (⭐ Пр.95), НЕ плодя прежнюю «пляску» Пр.142: переключение идёт
-    //      тем же путём, что «Самый быстрый», а не собственной лестницей кнопки, дравшейся с монитором/полным тестом.
+    // Кнопка «Проверить» (ТЗ Elyor — трёхступенчатая лестница: пинг → минимальный → полный → перебор):
+    //   1) ПИНГ текущего → мгновенный ответ жив/мёртв;
+    //   2) ЖИВ → МИНИМАЛЬНЫЙ замер (~100 КБ): есть ли throughput (порог 0.5 Мбит/с);
+    //   3) минимальный ≥0.5 → ПОЛНЫЙ точный замер: ≥1 Мбит/с → ДЕРЖИМ (плашка зелёная); <1 → слишком медленный;
+    //   4) мёртв / throughput нет / медленный <1 → ПЕРЕБОР ПОСЛЕДНИХ ЖИВЫХ (кроме текущего): <3 живых → полный
+    //      тест как «Самый быстрый» (с фетчем подписок); иначе FullTestRunner по known-alive (пинг→минимальный
+    //      всех→полный топ 10/3 — тот же принцип). Переключение — единым путём FullTestRunner, без «пляски» Пр.142.
     fun onCheck() {
         if (checking) return
         if (fullTesting || refreshingSubs) { checkStatus = "идёт другой тест — подождите"; return }
@@ -1248,27 +1250,33 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
         fun ui(block: () -> Unit) = activity.runOnUiThread(block)
         val cur = servers.firstOrNull { SubscriptionManager.serverKey(it) == curKey }
         Thread {
-            var recover = false   // текущий мёртв → в finally запускаем поиск рабочего (onFullTest)
+            var iterate = false   // текущий мёртв/без трафика/медленный → в finally перебор последних живых
             try {
                 if (!NetworkMonitor.directAlive()) { ui { checkStatus = "Нет интернета — проверка невозможна" }; return@Thread }
-                // 1) БЫСТРЫЙ пинг текущего сервера — мгновенная обратная связь жив/мёртв (не ждём полного замера).
+                // 1) ПИНГ текущего — мгновенный ответ жив/мёртв.
                 val pingMs = if (cur != null) ServerTester.ping(context, cur) else -1L
                 if (checkCancel) { ui { checkStatus = "" }; return@Thread }
                 SubscriptionManager.applyPingResults(context, mapOf(curKey to pingMs.toInt()))   // обновить «Живые»
                 if (pingMs < 0) {
-                    // 3) МЁРТВ по пингу → честно + сразу ищем рабочий (onFullTest в finally, ⭐ Пр.95 непрерывность).
-                    ui { checkStatus = "Текущий сервер не отвечает — ищу рабочий…" }
-                    recover = true
-                    return@Thread
+                    ui { checkStatus = "Текущий сервер не отвечает — перебираю живые…" }
+                    iterate = true; return@Thread
                 }
-                // 2) ЖИВ — показываем пинг сразу, затем меряем скорость этапами (100 КБ → 1 МБ).
-                ui { checkStatus = "Сервер жив (пинг ${pingMs} мс) — меряю скорость…" }
+                // 2) ЖИВ → МИНИМАЛЬНЫЙ замер (~100 КБ): есть ли throughput вообще (порог 0.5 — ниже финального «держим» 1).
+                ui { checkStatus = "Сервер жив (пинг ${pingMs} мс) — быстрый замер…" }
+                val minimal = ServerSpeedTester.measureActiveDownloadMinimal(context)
+                if (checkCancel) { ui { checkStatus = "" }; return@Thread }
+                if (minimal < 0.5) {
+                    ui { checkStatus = "Сервер жив (пинг ${pingMs} мс), но трафик не идёт — перебираю живые…" }
+                    iterate = true; return@Thread
+                }
+                // 3) Минимальный показал живую скорость → ПОЛНЫЙ точный замер + отдача.
+                ui { checkStatus = "Сервер жив (пинг ${pingMs} мс, ~${fmt(minimal)}) — точный замер…" }
                 val down = ServerSpeedTester.measureActiveDownloadStaged(context)
                 if (checkCancel) { ui { checkStatus = "" }; return@Thread }   // отмена — не залипаем «прервано» над рабочим туннелем
                 val up = ServerSpeedTester.measureActiveUploadMbps(context)
                 if (checkCancel) { ui { checkStatus = "" }; return@Thread }
-                if (down > 0) {
-                    // Туннель РАБОТАЕТ: сохранить скорость (ПОЛНЫЙ замер) + подтвердить живость активного (плашка → зелёная).
+                if (down >= 1.0) {
+                    // ≥1 Мбит/с → ДЕРЖИМ. Сохранить скорость (ПОЛНЫЙ замер) + подтвердить живость (плашка зелёная).
                     SubscriptionManager.applySpeedResultsTagged(context, mapOf(curKey to (down to true)))
                     TunnelSpeed.setLive(down, if (up > 0) up else 0.0, System.currentTimeMillis(), curKey)
                     TunnelHealth.ok(TunnelHealth.snapshot().ip, System.currentTimeMillis(), curKey)
@@ -1279,16 +1287,26 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                         checkStatus = "Соединение в норме: ↓${fmt(down)} / ↑${fmt(up)} Мбит/с (пинг ${pingMs} мс)"
                     }
                 } else {
-                    // Пинг прошёл, но трафик не идёт (сервер отвечает на 204, но туннель не тянет) → ищем рабочий.
-                    ui { checkStatus = "Сервер жив (пинг ${pingMs} мс), но трафик не идёт — ищу рабочий…" }
-                    recover = true
+                    // Полный замер < 1 Мбит/с → слишком медленный, ищем лучше среди живых.
+                    SubscriptionManager.applySpeedResultsTagged(context, mapOf(curKey to (down to true)))
+                    ui { checkStatus = "Текущий медленный (↓${fmt(down)} < 1 Мбит/с) — перебираю живые…" }
+                    iterate = true
                 }
             } catch (e: Exception) {
                 ui { checkStatus = "Ошибка проверки: ${e.message}" }
             } finally {
                 ui {
                     checking = false; MonitorCoordinator.fullTestRunning = false; reloadServers()
-                    if (recover && !checkCancel) onFullTest()   // единая точка выбора (без «пляски» Пр.142)
+                    if (iterate && !checkCancel) {
+                        // Перебор ПОСЛЕДНИХ ЖИВЫХ (кроме текущего): <3 → полный тест как «Самый быстрый» (с фетчем);
+                        // иначе FullTestRunner по known-alive (пинг→минимальный всех→полный топ — тот же принцип, Этап 2).
+                        val known = servers.filter {
+                            val k = SubscriptionManager.serverKey(it)
+                            k != curKey && (effPing(it)?.let { p -> p >= 0 } == true) &&
+                                !ServerFilter.isBlocked(it, blocklist) && !ServerFilter.isPaused(it, blocklist)
+                        }.distinctBy { SubscriptionManager.serverKey(it) }
+                        if (known.size < 3) onFastest() else onFullTest(known)
+                    }
                 }
             }
         }.start()
