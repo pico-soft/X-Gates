@@ -31,14 +31,28 @@ object TunnelSpeed {
         val source: Source = Source.NONE,
         // Промпт 123.B: serverKey сервера, чья это скорость. Сменился активный — числа НЕ его, UI их не показывает.
         val serverKey: String = "",
+        // ЖИВОЙ пинг активного (мс; -1/✗; null неизвестно) — монитор ставит КАЖДЫЙ цикл (через активный туннель). Плашка
+        // берёт пинг ОТСЮДА, а не из сессионного pingResults (тот затеняет свежий монитора старым -1 из полного теста).
+        val pingMs: Int? = null,
+        val pingAtMs: Long = 0L,              // wall-clock живого пинга (для «N сек/мин назад» на плашке)
     )
 
     private val _state = MutableStateFlow(Speed())
     val state: StateFlow<Speed> = _state.asStateFlow()
 
-    /** Активная проба: свежие прямой канал + туннель ↓/↑ для сервера [serverKey]. */
+    /** Активная проба: свежие прямой канал + туннель ↓/↑ для сервера [serverKey]. Живой пинг сохраняем (если тот же сервер). */
     fun setProbe(directDownMbps: Double?, tunnelDownMbps: Double?, tunnelUpMbps: Double?, nowMs: Long, serverKey: String) {
-        _state.value = Speed(directDownMbps, tunnelDownMbps, tunnelUpMbps, nowMs, Source.PROBE, serverKey)
+        val sameSrv = _state.value.serverKey == serverKey
+        val prevPing = if (sameSrv) _state.value.pingMs else null
+        val prevPingAt = if (sameSrv) _state.value.pingAtMs else 0L
+        _state.value = Speed(directDownMbps, tunnelDownMbps, tunnelUpMbps, nowMs, Source.PROBE, serverKey, prevPing, prevPingAt)
+    }
+
+    /** Живой пинг активного (мс; -1 ✗; null неизвестно) + время — монитор ставит каждый цикл. Смена сервера сбрасывает прочие поля. */
+    fun setPing(pingMs: Int?, nowMs: Long, serverKey: String) {
+        val s = _state.value
+        _state.value = if (s.serverKey == serverKey || s.serverKey.isEmpty()) s.copy(pingMs = pingMs, pingAtMs = nowMs, serverKey = serverKey)
+                       else Speed(pingMs = pingMs, pingAtMs = nowMs, serverKey = serverKey)
     }
 
     /** Живой трафик: обновляем только ТУННЕЛЬ для сервера [serverKey], прямую сохраняем от прошлой пробы. */

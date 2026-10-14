@@ -398,13 +398,28 @@ object NetworkMonitor {
             val curKey0 = ProxyState.state.value.serverKey
             val curSrv0 = curKey0?.let { k -> SubscriptionManager.allServers(app).firstOrNull { SubscriptionManager.serverKey(it) == k } }
             var aliveNow = false
+            // Пинг АКТИВНОГО — ЧЕРЕЗ ТУННЕЛЬ, КАЖДЫЙ цикл (TCP-коннект через активный SOCKS = RTT до бэкенда),
+            // НЕЗАВИСИМО от трафика. ТЗ Elyor «на плашке ✗ при живом»: (1) во время трафика монитор раньше пинг НЕ
+            // делал → висел старый «✗»; (2) cold-start temp-инстанс для xhttp/reality не успевал в таймаут → ложный
+            // ✗ на сервере, тянущем 20+ Мбит/с. Тёплый туннель отвечает честно. Temp-инстанс — фолбэк (только простой).
+            var activePm = -1
+            if (curSrv0 != null) {
+                val lat = ExternalIpChecker.latencyMs(timeoutMs = PING_LIVENESS_TIMEOUT_MS)
+                when {
+                    lat >= 0 -> { activePm = lat; SubscriptionManager.applyPingResults(app, mapOf(curKey0!! to lat)) }
+                    !userTrafficActive() -> {   // простой + SOCKS-проба не прошла → temp-инстанс (и как сигнал живости)
+                        activePm = ServerTester.ping(app, curSrv0, PING_LIVENESS_TIMEOUT_MS).toInt()
+                        SubscriptionManager.applyPingResults(app, mapOf(curKey0!! to activePm))
+                    }
+                    // иначе: трафик идёт, но SOCKS-проба не прошла (редко) → сохранённый пинг НЕ трогаем (связь есть)
+                }
+                // Живой пинг активного — в TunnelSpeed (плашка берёт отсюда, минуя затенение сессионным pingResults).
+                if (activePm >= 0) TunnelSpeed.setPing(activePm, now(), curKey0!!)
+            }
             if (userTrafficActive()) {
                 aliveNow = true                                   // реальный трафик — сильнейший факт живости
             } else if (curSrv0 != null) {
-                val pm = ServerTester.ping(app, curSrv0, PING_LIVENESS_TIMEOUT_MS).toInt()   // temp, надёжный сигнал
-                // ТЗ Elyor: СОХРАНЯЕМ пинг активного — иначе плашка показывала «✗» (старое значение из полного теста),
-                // хотя монитор его только что успешно пингует. Теперь на плашке РЕАЛЬНЫЙ свежий пинг активного.
-                SubscriptionManager.applyPingResults(app, mapOf(curKey0!! to pm))
+                val pm = activePm
                 if (pm >= 0) {
                     aliveNow = true                               // ПИНГ отвечает → живо (замер скорости — отдельно, ниже)
                     // Адаптивный интервал замера: пинг заметно скакнул (сменилось качество канала) → мерим ЧАЩЕ.

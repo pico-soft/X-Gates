@@ -1006,7 +1006,13 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
     fun reloadServers() { servers = SubscriptionManager.allServers(context); CrashContext.registrySize = servers.size }
     fun reloadSources() { sources = SubscriptionManager.sources(context) }
 
-    fun effPing(p: ServerProfile): Int? = pingResults[SubscriptionManager.serverKey(p)] ?: p.pingMs
+    fun effPing(p: ServerProfile): Int? {
+        val k = SubscriptionManager.serverKey(p)
+        // АКТИВНЫЙ сервер: ЖИВОЙ пинг из TunnelSpeed (монитор ставит каждый цикл через активный туннель) приоритетнее
+        // сессионного pingResults — тот мог нести старый ✗ из полного теста (cold-start temp-инстанс для xhttp не успел).
+        if (proxy.running && proxy.serverKey == k && tunnelSpeed.serverKey == k && tunnelSpeed.pingMs != null) return tunnelSpeed.pingMs
+        return pingResults[k] ?: p.pingMs
+    }
     fun effSpeed(p: ServerProfile): Double? = speedResults[SubscriptionManager.serverKey(p)] ?: p.speedMbps
     // Качество замера для показа: сессионное (speedResultsFull) → сохранённое (speedFull). null = легаси/неизвестно
     // (трактуем как полный — без «≈», жирным). false → минимальный замер («≈», обычный шрифт).
@@ -1604,7 +1610,8 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                     serverNumber = alive.indexOfFirst { proxy.running && proxy.serverKey == SubscriptionManager.serverKey(it) } + 1,
                     subtitle = activeServer?.let { protoNetSec(it) },
                     speedMbps = activeServer?.let { effSpeed(it) },
-                    pingMs = activeServer?.let { effPing(it) },
+                    pingMs = activeServer?.let { effPing(it) },   // effPing для активного берёт живой пинг из TunnelSpeed
+                    pingAge = if (tunnelSpeed.serverKey == proxy.serverKey && tunnelSpeed.pingAtMs > 0L) speedAgeTextMs(tunnelSpeed.pingAtMs) else "",
                     uploadMbps = activeUploadMbps,
                     // Живая скорость (гибрид) + время замера — активного сервера. Показываем ТОЛЬКО при подтверждённой
                     // свежей связи (ipVerified); при обрыве/устаревании говорит statusLine.
@@ -1910,6 +1917,7 @@ private fun StatusBox(
     subtitle: String?,
     speedMbps: Double?,
     pingMs: Int? = null,               // Пр.146: пинг активного — показываем в плашке (полезно и в восстановлении)
+    pingAge: String = "",              // ТЗ Elyor: давность живого пинга активного («N сек/мин назад»)
     uploadMbps: Double?,
     directDownMbps: Double?,
     tunnelDownMbps: Double?,
@@ -2026,7 +2034,7 @@ private fun StatusBox(
             // Мелко: протокол · network · security активного сервера (вместо портов). Пр.146: + ПИНГ активного
             // (полезно и в восстановлении, когда скорости ещё нет). «✗» — не отозвался на последний пинг.
             if (subtitle != null) {
-                val pingSuffix = pingMs?.let { pm -> if (pm < 0) " · пинг ✗" else " · пинг $pm мс" } ?: ""
+                val pingSuffix = pingMs?.let { pm -> if (pm < 0) " · пинг ✗" else " · пинг $pm мс" + (if (pingAge.isNotEmpty()) " ($pingAge)" else "") } ?: ""
                 Text(subtitle + pingSuffix, style = MaterialTheme.typography.bodySmall, color = fg)
             }
             val ipDisplay = if (ipText.isEmpty()) "…" else ipText

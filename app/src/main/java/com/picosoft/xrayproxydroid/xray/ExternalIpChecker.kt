@@ -66,6 +66,37 @@ object ExternalIpChecker {
     fun probePass(socksPort: Int = XrayConfig.SOCKS_PORT, timeoutMs: Int = 4000): Boolean =
         fetch(socksPort, timeoutMs, maxEndpoints = 1) != null
 
+    /**
+     * ЗАДЕРЖКА активного туннеля (мс) — свежий TCP-коннект ЧЕРЕЗ активный SOCKS к удалённому хосту: время
+     * установления = RTT туннеля до бэкенда. Для пинга АКТИВНОГО сервера надёжнее, чем cold-start temp-инстанс
+     * (ServerTester.ping): для xhttp/reality холодное рукопожатие не успевает в таймаут → ложный «✗» на живом
+     * сервере, а тёплый активный туннель отвечает честно. Свежий сокет (Пр.144) → честно падает, если туннель
+     * мёртв (не кэш). Возврат мс (≥0) или -1 (нет прохода). Блокирующий — звать на фоне.
+     */
+    fun latencyMs(socksPort: Int = XrayConfig.SOCKS_PORT, host: String = "www.gstatic.com", path: String = "/generate_204", timeoutMs: Int = 4000): Int {
+        val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", socksPort))
+        var raw: Socket? = null
+        return try {
+            raw = Socket(proxy)
+            // ВАЖНО: голый SOCKS-коннект НЕ годится для пинга — xray отвечает на SOCKS-CONNECT локально мгновенно
+            // (не ждёт коннекта до бэкенда) → ~1 мс (фейк). Меряем РЕАЛЬНЫЙ round-trip: HTTP-запрос (без TLS) и время
+            // до ПЕРВОГО БАЙТА ответа = полный проход туда-обратно через туннель до бэкенда. gstatic /generate_204 —
+            // крошечный ответ (204). Работает и для xhttp/reality (обычный трафик проходит), в отличие от cold-start пинга.
+            raw.connect(InetSocketAddress.createUnresolved(host, 80), timeoutMs)   // SOCKS сам резолвит (как трафик)
+            raw.soTimeout = timeoutMs
+            val req = "GET $path HTTP/1.1\r\nHost: $host\r\nUser-Agent: curl/8.0\r\nConnection: close\r\n\r\n"
+            val t0 = System.nanoTime()
+            raw.getOutputStream().apply { write(req.toByteArray(Charsets.US_ASCII)); flush() }
+            val first = raw.getInputStream().read()   // первый байт ответа = round-trip ЧЕРЕЗ туннель
+            if (first < 0) -1 else ((System.nanoTime() - t0) / 1_000_000).toInt().coerceAtLeast(1)
+        } catch (e: Exception) {
+            Log.i(TAG, "latencyMs FAIL ${e.javaClass.simpleName}: ${e.message}")
+            -1
+        } finally {
+            try { raw?.close() } catch (_: Exception) {}
+        }
+    }
+
     /** Единая точка запроса внешнего адреса. Блокирующий — запускать на фоновом потоке (как и раньше). */
     fun fetch(socksPort: Int = XrayConfig.SOCKS_PORT, timeoutMs: Int = TIMEOUT_MS, maxEndpoints: Int = Int.MAX_VALUE): String? {
         synchronized(lock) {
