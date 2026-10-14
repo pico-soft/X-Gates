@@ -449,10 +449,14 @@ object NetworkMonitor {
                         .onFailure { MonitorLog.event(app, "error", "Ошибка замера скорости", it.message ?: "") }
                         .getOrDefault(lastActiveProbeMs)
                 }
-                // Пр.146.Ф2: активный ОК → периодически пингуем ВСЕХ кандидатов (не только живых): убираем мёртвых
-                // И ловим воскресших (список «Живые» и честный, и полный, и быстрый подбор при обрыве берёт реально
-                // живого). Раз в PING_REFRESH_INTERVAL_MS, не во время активной загрузки. Только ПИНГ (килобайты).
-                if (now() - lastPingRefreshMs >= PING_REFRESH_INTERVAL_MS && !userTrafficActive()) {
+                // Пр.146.Ф2 + ТЗ Elyor 2026-10-14 (свежий пинг «Живых»): периодически пингуем ВСЕХ кандидатов —
+                // убираем мёртвых (не ответил на пинг → applyPingResults ставит -1 → freshPingFailed выкидывает из
+                // «Живых») И ловим воскресших. Раз в PING_REFRESH_INTERVAL_MS (15 мин — баланс батареи; на батарее+
+                // экран-выкл реже из-за троттлинга цикла). ВАЖНО: НЕ гейтим по userTrafficActive — пинг это КБ
+                // (gstatic 204) через temp-инстанс (отдельный порт), активному трафику/замеру НЕ мешает; прежний гейт
+                // и был причиной «пинг много часов назад» (при активной загрузке список не обновлялся). Скорость-
+                // замеры (optimizeToFastest/rebuildAndRateTop — там МБ) свои гейты трафика/батареи сохраняют.
+                if (now() - lastPingRefreshMs >= PING_REFRESH_INTERVAL_MS) {
                     lastPingRefreshMs = now()
                     runCatching { refreshAllPings(app, cur) }
                         .onFailure { MonitorLog.event(app, "error", "Ошибка пинга всех", it.message ?: "") }
