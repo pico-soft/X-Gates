@@ -691,30 +691,51 @@ object NetworkMonitor {
                     if (ok) { connected = c; connectedMbps = mbps; break }
                 }
                 if (connected != null) {
-                    // Ночь/батарея: подключились по пингу и IP подтверждён → сервер рабочий, этого достаточно.
-                    // Не домеряем остальных и не ранжируем по скорости (это оптимизация, а не связь).
+                    // Связь уже восстановлена (ранний коннект к быстрейшему-по-рейтингу + IP подтверждён).
+                    // Ночь/батарея: этого достаточно — не ранжируем по скорости (оптимизация, а не связь).
                     if (!doMeasure) return SwitchResult.SWITCHED
-                    // Домерить ОСТАЛЬНЫХ живых temp-инстансом (обновить список/«топ»), не трогая активного.
-                    // < порога → мерим ради РАНЖИРОВАНИЯ (до sufficientMbps); ≥ порога → просто обновляем список.
-                    val measCap = if (connectedMbps in 0.0..keepThreshold) s.sufficientMbps.coerceAtLeast(keepThreshold) else keepThreshold
-                    val measured = LinkedHashMap<String, Double>()
-                    measured[SubscriptionManager.serverKey(connected)] = connectedMbps
-                    for (c in order) {
-                        if (SubscriptionManager.serverKey(c) == SubscriptionManager.serverKey(connected)) continue
-                        if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey != ownedKey) return SwitchResult.SWITCHED
-                        val m = ServerSpeedTester.measureSufficiency(app, c, measCap)
-                        measured[SubscriptionManager.serverKey(c)] = m
-                        SubscriptionManager.applySpeedResults(app, mapOf(SubscriptionManager.serverKey(c) to m))
+                    // ТЗ Elyor (коннект сразу, замеры потом): ТЕПЕРЬ, когда связь есть, уточняем рейтинг тем же принципом,
+                    // что «Самый быстрый»/фон — МИНИМАЛЬНЫЙ замер кандидатов (≤ cap, «≈») → ПОЛНЫЙ жизнеспособных (bold,
+                    // «умно — только несвежие») → переключиться на быстрейшего, если заметно лучше подключённого.
+                    val connectedKey = SubscriptionManager.serverKey(connected)
+                    val chargingWifi = isCharging(app) && !EconomyNet.lastKnownMobile
+                    val cap = if (chargingWifi) Int.MAX_VALUE else if (s.trafficSaveMode) 3 else 10
+                    val minGate = 0.5
+                    val freshMs = s.topFreshSec.coerceAtLeast(3600) * 1000L
+                    fun freshFullGood(p: ServerProfile): Boolean {
+                        if (p.speedFull != true || (p.speedMbps ?: 0.0) < keepThreshold) return false
+                        val t = runCatching { speedTsFmt.parse(p.speedTestedTs)?.time }.getOrNull() ?: return false
+                        return now() - t <= freshMs
                     }
-                    if (connectedMbps >= keepThreshold) return SwitchResult.SWITCHED   // годен — держим
-                    // < порога → уйти на самый быстрый из живых
-                    val bestKey = measured.maxByOrNull { it.value }?.key
-                    if (bestKey != null && bestKey != ownedKey && (measured[bestKey] ?: 0.0) > connectedMbps) {
-                        val best = order.firstOrNull { SubscriptionManager.serverKey(it) == bestKey }
-                        if (best != null) {
-                            MonitorStatus.update(true, "медленный — ухожу на самый быстрый · ${ServerLabels.display(best)}", now(), 0)
-                            connectMeasureLive(app, best, ownedKey)
-                        }
+                    // Кандидаты на рейтинг: ответившие, кроме подключённого; топ cap по порядку (скорость↓/пинг↑).
+                    val cands = order.filter { SubscriptionManager.serverKey(it) != connectedKey }.take(if (cap == Int.MAX_VALUE) order.size else cap)
+                    // Этап мин: МИНИМАЛЬНЫЙ (~100 КБ) несвежих (стабильные свежие-полные не трогаем) → «≈».
+                    val minimalByKey = HashMap<String, Double>()
+                    val minTagged = LinkedHashMap<String, Pair<Double, Boolean>>()
+                    for (c in cands) {
+                        if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey != ownedKey) return SwitchResult.SWITCHED
+                        if (freshFullGood(c)) { minimalByKey[SubscriptionManager.serverKey(c)] = c.speedMbps ?: 0.0; continue }
+                        val m = ServerSpeedTester.measureSpeedMinimal(app, c)
+                        minimalByKey[SubscriptionManager.serverKey(c)] = m
+                        minTagged[SubscriptionManager.serverKey(c)] = m to false
+                    }
+                    if (minTagged.isNotEmpty()) SubscriptionManager.applySpeedResultsTagged(app, minTagged)
+                    // Этап полн: ПОЛНЫЙ жизнеспособных (≥minGate) по убыв. минимального, несвежих мерим, стабильных реюзим.
+                    val viable = cands.filter { (minimalByKey[SubscriptionManager.serverKey(it)] ?: -1.0) >= minGate }
+                        .sortedByDescending { minimalByKey[SubscriptionManager.serverKey(it)] ?: 0.0 }
+                    var bestFull = connectedMbps; var bestP: ServerProfile? = null
+                    for (c in viable) {
+                        if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey != ownedKey) return SwitchResult.SWITCHED
+                        val full = if (freshFullGood(c)) (c.speedMbps ?: 0.0)
+                                   else ServerSpeedTester.measureSpeed(app, c).also { SubscriptionManager.applySpeedResultsTagged(app, mapOf(SubscriptionManager.serverKey(c) to (it to true))) }
+                        if (full > bestFull) { bestFull = full; bestP = c }
+                    }
+                    // Переключаемся на быстрейшего по ПОЛНОМУ числу: подключённый «в норме» (≥порога) → нужен запас
+                    // ×keepBestMultiplier (не дёргаемся на шум/занижение активного замера); иначе апгрейд по марже.
+                    val need = if (connectedMbps >= keepThreshold) connectedMbps * s.keepBestMultiplier else connectedMbps * (1 + s.marginRatio)
+                    if (bestP != null && bestFull > need && !MonitorCoordinator.fullTestRunning && ProxyState.state.value.serverKey == ownedKey) {
+                        MonitorStatus.update(true, "нашёл быстрее — перехожу · ${ServerLabels.display(bestP!!)}", now(), 0)
+                        connectMeasureLive(app, bestP!!, ownedKey)
                     }
                     return SwitchResult.SWITCHED
                 }
