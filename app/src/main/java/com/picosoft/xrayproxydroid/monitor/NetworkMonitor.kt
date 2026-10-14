@@ -1277,37 +1277,64 @@ object NetworkMonitor {
         }
     }
 
+    private val speedTsFmt = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.US)
+
+    // Фоновый рейтинг топа — ТОТ ЖЕ ПРИНЦИП, что «Самый быстрый»/«Проверить» (ТЗ Elyor): пинг всех → МИНИМАЛЬНЫЙ
+    // замер (~100 КБ) ВСЕХ живых (в «Живых» это «≈») → ПОЛНЫЙ точный замер ТОПа прошедших minGate (0.5), лимит
+    // fullCap: на МОБИЛЬНОЙ/батарее 10 (обычный)/3 (экономия), на ШНУРЕ+Wi-Fi — без лимита. Активный НЕ трогаем
+    // (его скорость даёт live-сэмпл sampleTunnelSpeed). Весь рейтинг под heavyMeasureAllowed (батарея) у вызова.
     private suspend fun rebuildAndRateTop(app: Context, s: AppSettings) {
         if (MonitorCoordinator.fullTestRunning) return
         MonitorCoordinator.monitorSearchRunning = true
         try {
-            runCatching { refreshAllPings(app, s) }   // пинг всех: ловим воскресших/новичков, чистим мёртвых
+            runCatching { refreshAllPings(app, s) }   // пинг всех: прунинг мёртвых + воскресшие
             val bl = BlocklistStore.current()
             fun key(p: com.picosoft.xrayproxydroid.xray.link.ServerProfile) = SubscriptionManager.serverKey(p)
-            val keepThreshold = s.degradationMinMbps.coerceAtLeast(0.1)   // ≥ этого = «живой по скорости», стабилен
-            val target = s.fastTopTarget.coerceAtLeast(1)
-            val measureAll = isCharging(app) && !EconomyNet.lastKnownMobile   // зарядка+Wi-Fi → мерим ВСЕХ живых
+            val curKey = ProxyState.state.value.serverKey
+            val minGate = 0.5
+            val chargingWifi = isCharging(app) && !EconomyNet.lastKnownMobile
+            val fullCap = if (chargingWifi) Int.MAX_VALUE else if (s.trafficSaveMode) 3 else 10
+            val keepThreshold = s.degradationMinMbps.coerceAtLeast(0.1)
+            val freshMs = s.topFreshSec.coerceAtLeast(3600) * 1000L
+            // СТАБИЛЬНЫЙ = свежий ПОЛНЫЙ замер ≥ порога (ТЗ Elyor «умно, только несвежие»): такие НЕ трогаем вовсе —
+            // ни минимальным (иначе их число сползло бы на «≈»), ни полным. Бережёт трафик (~1ГБ/мес).
+            fun freshFullGood(p: com.picosoft.xrayproxydroid.xray.link.ServerProfile): Boolean {
+                if (p.speedFull != true || (p.speedMbps ?: 0.0) < keepThreshold) return false
+                val t = runCatching { speedTsFmt.parse(p.speedTestedTs)?.time }.getOrNull() ?: return false
+                return now() - t <= freshMs
+            }
             val aliveByPing = SubscriptionManager.allServers(app)
+                .filter { key(it) != curKey }   // активный мерит live-сэмпл — не перемеряем temp-инстансом
                 .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl) && !ServerFilter.isPaused(it, bl) }
                 .filter { (it.pingMs ?: -1) >= 0 }
                 .distinctBy { key(it) }
                 .sortedBy { it.pingMs ?: Int.MAX_VALUE }
-            // Уже измеренные годные (≥ порога) и живые по пингу → СТАБИЛЬНЫ, НЕ перемеряем (ТЗ: отдал пинг = скорость та же).
-            val goodMeasured = aliveByPing.count { (it.speedMbps ?: 0.0) >= keepThreshold }
-            // Кандидаты на замер: живые по пингу без годной скорости (не мерены / < порога), по возрастанию пинга.
-            val needMeasure = aliveByPing.filter { (it.speedMbps ?: 0.0) < keepThreshold }
-            val toMeasure = if (measureAll) needMeasure
-                            else needMeasure.take((target - goodMeasured).coerceAtLeast(0))   // добор до [target]
-            val results = HashMap<String, Double>()
-            var measured = 0
-            for (p in toMeasure) {
+            val stableGood = aliveByPing.count { freshFullGood(it) }       // уже годные и свежие — в зачёт лимита
+            val needMeasure = aliveByPing.filterNot { freshFullGood(it) } // только НЕСВЕЖИЕ меряем
+            // Этап А: МИНИМАЛЬНЫЙ замер (~100 КБ) НЕСВЕЖИХ — сигнал throughput; в «Живых» помечаем «≈» (full=false).
+            val minimalByKey = LinkedHashMap<String, Double>()
+            val minimalTagged = LinkedHashMap<String, Pair<Double, Boolean>>()
+            for (p in needMeasure) {
                 if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey == null) break
-                results[key(p)] = ServerSpeedTester.measureSpeed(app, p)   // полный замер
-                measured++
+                val m = ServerSpeedTester.measureSpeedMinimal(app, p)
+                minimalByKey[key(p)] = m
+                minimalTagged[key(p)] = m to false
             }
-            if (results.isNotEmpty()) SubscriptionManager.applySpeedResults(app, results)
-            MonitorLog.event(app, "monitor", "Фон: топ обновлён",
-                "режим ${if (measureAll) "все живые (шнур+Wi-Fi)" else "до $target"}: замерено $measured, годных живых $goodMeasured")
+            if (minimalTagged.isNotEmpty()) SubscriptionManager.applySpeedResultsTagged(app, minimalTagged)
+            // Этап Б: ПОЛНЫЙ точный замер — добор топа до лимита fullCap (учитывая уже стабильных); на шнуре+Wi-Fi все.
+            val quota = if (chargingWifi) Int.MAX_VALUE else (fullCap - stableGood).coerceAtLeast(0)
+            val reasonable = needMeasure
+                .filter { (minimalByKey[key(it)] ?: -1.0) >= minGate }
+                .sortedByDescending { minimalByKey[key(it)] ?: 0.0 }
+                .take(quota)
+            val fullTagged = LinkedHashMap<String, Pair<Double, Boolean>>()
+            for (p in reasonable) {
+                if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey == null) break
+                fullTagged[key(p)] = ServerSpeedTester.measureSpeed(app, p) to true   // полный/точный замер
+            }
+            if (fullTagged.isNotEmpty()) SubscriptionManager.applySpeedResultsTagged(app, fullTagged)
+            MonitorLog.event(app, "monitor", "Фон: топ обновлён (пинг→мин→полный, только несвежие)",
+                "стабильных $stableGood, минимальный ${minimalTagged.size}, полный ${fullTagged.size}, лимит ${if (chargingWifi) "∞" else fullCap}")
         } finally {
             MonitorCoordinator.monitorSearchRunning = false
         }
