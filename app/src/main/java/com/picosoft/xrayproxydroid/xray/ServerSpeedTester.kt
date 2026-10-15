@@ -131,8 +131,11 @@ object ServerSpeedTester {
      * Прогрев крошечный (мелочь не должна уходить целиком в прогрев). >0 валидно, -1 провал. Трафик → «Тест».
      */
     fun measureSpeedMinimal(context: Context, profile: ServerProfile): Double =
+        // БЫСТРЫЙ замер: только 1 пробник + короткий коннект-таймаут 3с → мёртвый сервер (tcping открыт, но прокси не
+        // пропускает) отсеивается за ~3с, а не ~20-30с (4 пробника × 8с). Иначе на пуле из 269 «достижимых» Этап 2 полз.
         measureSpeedDetailed(context, profile, warmupMs = 100, measureMs = 800,
-            warmupBudgetOverride = 16 * 1024L, measureBudgetOverride = 100 * 1024L).let { if (it.ok) it.mbps else -1.0 }
+            warmupBudgetOverride = 16 * 1024L, measureBudgetOverride = 100 * 1024L,
+            maxProbes = 1, connectTimeoutMs = 3_000).let { if (it.ok) it.mbps else -1.0 }
 
     /** Как [measureSpeed], но с исходом/причиной (для диалога «Перемерить»). */
     fun measureSpeedDetailed(
@@ -142,11 +145,13 @@ object ServerSpeedTester {
         measureMs: Int = SettingsStore.current().speedWindowMs,
         warmupBudgetOverride: Long? = null,   // Пр.133: урезанный бюджет для замера достаточности
         measureBudgetOverride: Long? = null,
+        maxProbes: Int = Int.MAX_VALUE,       // для БЫСТРОГО минимального — 1 пробник (не перебирать 4 на мёртвом)
+        connectTimeoutMs: Int = CONNECT_TIMEOUT_MS,   // для минимального — короткий (3с), чтобы мёртвые падали быстро
     ): Measurement {
         XrayController.ensureEnv(context)
         val verbose = SettingsStore.current().verboseLogs
         fun log(msg: String) { if (verbose) Log.i(TAG, msg) }
-        val probes = (listOf(SettingsStore.current().speedProbeUrl) + fallbackProbes).distinct()
+        val probes = (listOf(SettingsStore.current().speedProbeUrl) + fallbackProbes).distinct().take(maxProbes.coerceAtLeast(1))
 
         val name = profile.remarks.ifBlank { profile.address }
         val warmupBudget = warmupBudgetOverride ?: SettingsStore.current().speedWarmupBudgetBytes
@@ -178,7 +183,7 @@ object ServerSpeedTester {
                 var testBytes = 0L
                 for (probe in probes) {
                     val m = downloadMbps(probe, Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", port)),
-                        warmupMs, measureMs, warmupBudget, measureBudget, name, verbose)
+                        warmupMs, measureMs, warmupBudget, measureBudget, name, verbose, connectTimeoutMs)
                     testBytes += m.bytes                    // тестовый трафик: скачанное каждым пробником
                     if (m.ok) {
                         TrafficTracker.addTest(testBytes)
@@ -404,11 +409,12 @@ object ServerSpeedTester {
     private fun downloadMbps(
         probe: String, proxy: Proxy?, warmupMs: Int, measureMs: Int,
         warmupBudget: Long, measureBudget: Long, name: String, verbose: Boolean,
+        connectTimeoutMs: Int = CONNECT_TIMEOUT_MS,
     ): Measurement {
         fun log(msg: String) { if (verbose) Log.i(TAG, msg) }
         // proxy=null → ПРЯМОЕ соединение (замер прямого канала, без туннеля); иначе через SOCKS.
         val conn = ((if (proxy != null) URL(probe).openConnection(proxy) else URL(probe).openConnection()) as HttpURLConnection).apply {
-            connectTimeout = CONNECT_TIMEOUT_MS
+            connectTimeout = connectTimeoutMs
             readTimeout = warmupMs + measureMs + 2_000
             setRequestProperty("User-Agent", "v2rayNG/1.8.0")
         }

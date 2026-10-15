@@ -95,14 +95,18 @@ object FullTestRunner {
             // throughput ≥ minGate (0.5 Мбит/с) — те в ПОЛНЫЙ точный замер, но не больше fullCap (10 обычный / 3
             // экономия). minGate НИЖЕ финального «держим» (1 Мбит/с): минимальный замер по короткому окну занижает,
             // 0.5 отсекает мёртвых/призраков, но не рубит жизнеспособных. Экономия теперь = только меньший fullCap.
-            val candidates = aliveByPing
+            val candidates = aliveByPing   // отсортированы по ВОЗР. пинга (лучший пинг первым)
             val minGate = 0.5
-            // Лимит полных замеров: на МОБИЛЬНОЙ — 10 (обычный) / 3 (экономия). На ШНУРЕ+Wi-Fi (батарея/трафик не
-            // жмут) — БЕЗ лимита: полностью мерим всех прошедших minGate (ТЗ Elyor).
-            val fullCap = if (NetworkMonitor.chargingAndWifi(appCtx)) Int.MAX_VALUE else if (s.trafficSaveMode) 3 else 10
+            // ТЗ Elyor (2026-10-15): строим ТОП по скорости, не меряя все живые (на tcping-пуле их сотни, многие
+            // мёртвые по трафику). Минимальный замер идёт от ЛУЧШЕГО ПИНГА к худшему; СТОП, когда набрали targetTop
+            // годных (≥minGate) ИЛИ прошли maxScan (пул мёртвый — не пылесосим все 269), ИЛИ бюджет. Полный замер —
+            // только топ fullCap. Это чинит «Этап 2 ползёт 269» и расход 5 ГБ/сут. На шнуре лимит тот же (без ∞).
+            val targetTop = if (s.trafficSaveMode) 3 else 10
+            val fullCap = targetTop
+            val maxScan = (targetTop * 6).coerceIn(targetTop, candidates.size)   // потолок сканирования (мёртвый пул)
             val budgetMs = s.fullTestBudgetSec.coerceAtLeast(30) * 1000L
-            onPhase("Этап 2: быстрый замер всех живых (${candidates.size})…")
-            emitProgress(0, candidates.size)
+            onPhase("Этап 2: быстрый замер (топ-$targetTop по скорости)…")
+            emitProgress(0, maxScan)
 
             // Промпт 103. ПРЕДОХРАНИТЕЛЬ ЗАВЕРШЕНИЯ. Наблюдение из поля: «Этап 2» долго стоял, плашка зеленела
             // (монитор), а бар не двигался. Причина: приоритетный замер активного туннеля (ниже) идёт ДО перебора
@@ -198,23 +202,23 @@ object FullTestRunner {
                 }
                 for (p in candidates) {
                     if (cancelled.get()) break
-                    // Общий бюджет времени (Промпт 82): не мерим ВСЕХ бесконечно — стоп по лимиту.
+                    // Общий бюджет времени (Промпт 82): не мерим бесконечно — стоп по лимиту.
                     if ((System.nanoTime() - phaseStart) / 1_000_000 > budgetMs) {
-                        onPhase("Бюджет теста (${s.fullTestBudgetSec / 60} мин) исчерпан на $measured/${candidates.size} — стоп")
+                        onPhase("Бюджет теста (${s.fullTestBudgetSec / 60} мин) исчерпан на $measured — стоп")
                         break
                     }
-                    // Активный уже измерен ПОЛНЫМ выше — минимально не перемеряем (число не затирается на «≈»).
-                    if (activeServerKey != null && key(p) == activeServerKey) {
-                        measured++; emitProgress(measured, candidates.size); beat(); continue
-                    }
-                    // МИНИМАЛЬНЫЙ замер (~100 КБ) — дёшево узнать «есть ли throughput». ВСЕ живые (без стоп-на-N).
+                    // Набрали топ годных ИЛИ просканировали потолок (пул мёртвый) → хватит минимального.
+                    if (goodOnes.size >= targetTop) { onPhase("Набрано $targetTop годных — к точному замеру топа"); break }
+                    if (measured >= maxScan) { onPhase("Просканировано $measured, годных ${goodOnes.size} — к точному замеру топа"); break }
+                    // Активный уже измерен ПОЛНЫМ выше — минимально не перемеряем (число не затирается на «≈»); не в счёт.
+                    if (activeServerKey != null && key(p) == activeServerKey) continue
+                    // МИНИМАЛЬНЫЙ замер (~100 КБ, 1 пробник/3с — быстро падает на мёртвых). От лучшего пинга к худшему.
                     val mbps = ServerSpeedTester.measureSpeedMinimal(appCtx, p)
                     minimalByKey[key(p)] = mbps
                     if (cancelled.get()) break   // Промпт 103: сторож/отмена сработали во время замера — не действуем по нему
                     measured++
                     onSpeedResult(p, mbps, false)   // минимальный → «≈» (быстрый/приблизительный)
-                    // Порог minGate: есть throughput → кандидат на ТОЧНЫЙ замер (Этап 3) + ранний коннект к ПЕРВОМУ
-                    // живому для НЕПРЕРЫВНОСТИ (Пр.95). Реальное переключение на быстрейший — на Этапе 3 (по полному числу).
+                    // Порог minGate: есть throughput → в топ-кандидаты + ранний коннект к ПЕРВОМУ живому (непрерывность, Пр.95).
                     if (mbps >= minGate && !ServerFilter.isPaused(p, blocklist) && ServerFilter.protocolAllowed(p, s)) {
                         goodOnes.add(p)
                         if (mbps > bestSpeed) { bestSpeed = mbps; best = p; hbBest.set(p) }
@@ -226,8 +230,8 @@ object FullTestRunner {
                             connect(p)
                         }
                     }
-                    onPhase("Этап 2: быстрый замер $measured / ${candidates.size} · подключён: ${connected?.let(::label) ?: "—"}")
-                    emitProgress(measured, candidates.size)
+                    onPhase("Этап 2: быстрый замер $measured · годных ${goodOnes.size}/$targetTop · подключён: ${connected?.let(::label) ?: "—"}")
+                    emitProgress(measured, maxScan)
                     beat()   // Промпт 103: шаг прогресса — «пульс» для сторожа
                 }
                 // ── Этап 3: ТОЧНЫЙ замер топа. Минимальный замер не различает самого быстрого (все ≈). Полным замером

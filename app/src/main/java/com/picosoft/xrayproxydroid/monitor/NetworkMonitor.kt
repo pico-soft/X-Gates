@@ -147,9 +147,11 @@ object NetworkMonitor {
     // батарея не тратится), на батарее экономно (в основном по событию «отвалилось >50% топа»). ≥ порога не перемеряем. ──
     private const val TOP_PING_CHARGING_MS = 3 * 60_000L        // шнур: пинг топа раз в 3 мин
     private const val TOP_PING_BATTERY_SCREEN_MS = 10 * 60_000L // батарея+экран вкл: пинг топа раз в 10 мин (экран выкл — не пингуем отдельно)
-    private const val TOP_RATE_CHARGING_WIFI_MS = 10 * 60_000L  // шнур+Wi-Fi: полный замер топа раз в 10 мин
-    private const val TOP_RATE_CHARGING_MOBILE_MS = 20 * 60_000L// шнур+моб: раз в 20 мин
-    private const val TOP_RATE_BATTERY_WIFI_MS = 30 * 60_000L   // батарея+Wi-Fi: раз в 30 мин (батарея+моб — только по событию)
+    // ТЗ Elyor (2026-10-15, «не 5 ГБ/сут»): реже + ОГРАНИЧЕННЫЙ рейтинг (топ-N, не все). С «только несвежие» (6ч)
+    // большинство прогонов пустые; реальная работа — лишь когда топ протух. Интервалы увеличены.
+    private const val TOP_RATE_CHARGING_WIFI_MS = 30 * 60_000L  // шнур+Wi-Fi: рейтинг топа раз в 30 мин
+    private const val TOP_RATE_CHARGING_MOBILE_MS = 60 * 60_000L// шнур+моб: раз в 60 мин
+    private const val TOP_RATE_BATTERY_WIFI_MS = 60 * 60_000L   // батарея+Wi-Fi: раз в 60 мин (батарея+моб — только по событию)
 
     // Пр.143: поддержание списка «Живые». Пока активный ОК — периодически пингуем живых (свежий пинг ≥0) и
     // отсеиваем не отозвавшихся (pingMs=−1 → уходит из «Живых»), чтобы список был честным, а быстрый подбор при
@@ -1327,8 +1329,7 @@ object NetworkMonitor {
             fun key(p: com.picosoft.xrayproxydroid.xray.link.ServerProfile) = SubscriptionManager.serverKey(p)
             val curKey = ProxyState.state.value.serverKey
             val minGate = 0.5
-            val chargingWifi = isCharging(app) && !EconomyNet.lastKnownMobile
-            val fullCap = if (chargingWifi) Int.MAX_VALUE else if (s.trafficSaveMode) 3 else 10
+            val targetTop = if (s.trafficSaveMode) 3 else 10   // держим топ-N по скорости (НЕ меряем все, без ∞ на шнуре)
             val keepThreshold = s.degradationMinMbps.coerceAtLeast(0.1)
             val freshMs = s.topFreshSec.coerceAtLeast(3600) * 1000L
             // СТАБИЛЬНЫЙ = свежий ПОЛНЫЙ замер ≥ порога (ТЗ Elyor «умно, только несвежие»): такие НЕ трогаем вовсе —
@@ -1344,32 +1345,34 @@ object NetworkMonitor {
                 .filter { (it.pingMs ?: -1) >= 0 }
                 .distinctBy { key(it) }
                 .sortedBy { it.pingMs ?: Int.MAX_VALUE }
-            val stableGood = aliveByPing.count { freshFullGood(it) }       // уже годные и свежие — в зачёт лимита
-            val needMeasure = aliveByPing.filterNot { freshFullGood(it) } // только НЕСВЕЖИЕ меряем
-            // Этап А: МИНИМАЛЬНЫЙ замер (~100 КБ) НЕСВЕЖИХ — сигнал throughput; в «Живых» помечаем «≈» (full=false).
+            val stableGood = aliveByPing.count { freshFullGood(it) }       // уже годные и свежие — в зачёт топа
+            val needTop = (targetTop - stableGood).coerceAtLeast(0)        // сколько ещё добрать в топ-N
+            val needMeasure = aliveByPing.filterNot { freshFullGood(it) } // мерим только НЕСВЕЖИХ
+            val maxScan = (targetTop * 6).coerceIn(targetTop, needMeasure.size)   // потолок сканирования (мёртвый пул)
+            // Этап А: МИНИМАЛЬНЫЙ замер (~100 КБ, 1 пробник/3с) НЕСВЕЖИХ от ЛУЧШЕГО ПИНГА; СТОП при наборе needTop
+            // годных ИЛИ maxScan. На tcping-пуле из сотен это ключ к «не 5 ГБ/сут»: мерим горстку, а не всё.
             val minimalByKey = LinkedHashMap<String, Double>()
             val minimalTagged = LinkedHashMap<String, Pair<Double, Boolean>>()
-            for (p in needMeasure) {
+            val good = ArrayList<com.picosoft.xrayproxydroid.xray.link.ServerProfile>()
+            var scanned = 0
+            if (needTop > 0) for (p in needMeasure) {
                 if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey == null) break
+                if (good.size >= needTop || scanned >= maxScan) break
                 val m = ServerSpeedTester.measureSpeedMinimal(app, p)
-                minimalByKey[key(p)] = m
-                minimalTagged[key(p)] = m to false
+                minimalByKey[key(p)] = m; minimalTagged[key(p)] = m to false; scanned++
+                if (m >= minGate) good.add(p)
             }
             if (minimalTagged.isNotEmpty()) SubscriptionManager.applySpeedResultsTagged(app, minimalTagged)
-            // Этап Б: ПОЛНЫЙ точный замер — добор топа до лимита fullCap (учитывая уже стабильных); на шнуре+Wi-Fi все.
-            val quota = if (chargingWifi) Int.MAX_VALUE else (fullCap - stableGood).coerceAtLeast(0)
-            val reasonable = needMeasure
-                .filter { (minimalByKey[key(it)] ?: -1.0) >= minGate }
-                .sortedByDescending { minimalByKey[key(it)] ?: 0.0 }
-                .take(quota)
+            // Этап Б: ПОЛНЫЙ точный замер — топ needTop из годных (по минимальному).
+            val reasonable = good.sortedByDescending { minimalByKey[key(it)] ?: 0.0 }.take(needTop)
             val fullTagged = LinkedHashMap<String, Pair<Double, Boolean>>()
             for (p in reasonable) {
                 if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey == null) break
                 fullTagged[key(p)] = ServerSpeedTester.measureSpeed(app, p) to true   // полный/точный замер
             }
             if (fullTagged.isNotEmpty()) SubscriptionManager.applySpeedResultsTagged(app, fullTagged)
-            MonitorLog.event(app, "monitor", "Фон: топ обновлён (пинг→мин→полный, только несвежие)",
-                "стабильных $stableGood, минимальный ${minimalTagged.size}, полный ${fullTagged.size}, лимит ${if (chargingWifi) "∞" else fullCap}")
+            MonitorLog.event(app, "monitor", "Фон: топ обновлён (пинг→мин→полный, ограниченный)",
+                "стабильных $stableGood, топ $targetTop, минимальный $scanned, полный ${fullTagged.size}")
         } finally {
             MonitorCoordinator.monitorSearchRunning = false
         }
