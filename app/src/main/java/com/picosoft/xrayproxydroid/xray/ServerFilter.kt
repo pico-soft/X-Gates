@@ -51,4 +51,39 @@ object ServerFilter {
     /** Пригоден для автоподключения/апгрейда: не заблокирован + не на паузе + протокол разрешён + скорость ≥ порога. */
     fun isSelectable(p: ServerProfile, speedMbps: Double?, s: AppSettings, b: Blocklist): Boolean =
         !isBlocked(p, b) && !isPaused(p, b) && protocolAllowed(p, s) && speedMbps != null && speedMbps >= s.minUsableMbps
+
+    // ═══ ДВА ВИДИМЫХ СПИСКА (ТЗ Elyor 2026-10-15) ═══════════════════════════════════════════════════════════
+    // Формат метки времени замера (ServerProfile.speedTestedTs). Locale.US — формат фиксированный, не локалезависим.
+    private val speedTsParser = ThreadLocal.withInitial { java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.US) }
+
+    /** Момент последнего замера скорости в эпоха-мс из persisted-метки; null — не тестировался/метки нет. */
+    fun speedMeasuredAtMs(p: ServerProfile): Long? =
+        p.speedTestedTs?.takeIf { it.isNotBlank() }?.let { runCatching { speedTsParser.get()!!.parse(it)?.time }.getOrNull() }
+
+    /** Замер считается СВЕЖИМ (список «Живые»), если он сделан не старее окна [freshSec]. null-метка = не свежий. */
+    fun isSpeedFresh(atMs: Long?, nowMs: Long, freshSec: Int): Boolean =
+        atMs != null && atMs <= nowMs && nowMs - atMs <= freshSec.coerceAtLeast(60) * 1000L
+
+    /** Классификация сервера для видимых списков. */
+    enum class Tier { LIVE, PREVIOUS, NONE }
+
+    /**
+     * Куда сервер идёт на экране (ТЗ Elyor 2026-10-15 «после полного замера перестраивай видимый топ»):
+     *  LIVE     — «Живые серверы»: доступен (не блок/пауза/протокол ок) + ЖИВОЙ ПИНГ (≥0) + измеренная СКОРОСТЬ>0 +
+     *             замер СВЕЖИЙ (не старше окна свежести). Это «отозвался и померился».
+     *  PREVIOUS — «Ранее измеренные»: то же, но замер СТАРЫЙ (мерили раньше, пинг ещё жив, не переподтвердили).
+     *  NONE     — ни в одном списке (только во «Все»): нет живого пинга ЛИБО пинг есть, но скорость не измерена/0
+     *             («при последнем замере не показали пинг / показали пинг, но не отдали скорость» — Elyor).
+     * [speedFreshAtMs] — момент последнего замера в мс (сессионный или из persisted-метки); null → трактуем как старый.
+     * АКТИВНЫЙ подключённый сервер — исключение (его живость доказана туннелем), добавляется в «Живые» вызывающим.
+     */
+    fun tier(
+        p: ServerProfile, pingMs: Int?, speedMbps: Double?, speedFreshAtMs: Long?, nowMs: Long,
+        s: AppSettings, b: Blocklist,
+    ): Tier {
+        if (isBlocked(p, b) || isPaused(p, b) || !protocolAllowed(p, s)) return Tier.NONE
+        if (pingMs == null || pingMs < 0) return Tier.NONE                 // нет пинга → только «Все»
+        if ((speedMbps ?: 0.0) <= 0.0) return Tier.NONE                    // пинг-без-скорости → только «Все»
+        return if (isSpeedFresh(speedFreshAtMs, nowMs, s.liveFreshSec)) Tier.LIVE else Tier.PREVIOUS
+    }
 }

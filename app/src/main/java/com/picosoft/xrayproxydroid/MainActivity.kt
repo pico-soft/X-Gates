@@ -935,6 +935,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
     var renameProfile by remember { mutableStateOf<ServerProfile?>(null) }   // диалог переименования сервера
     // Раскрытие «Все серверы» — на уровне экрана (стабильно, переживает переключение вкладок).
     var allServersExpanded by rememberSaveable { mutableStateOf(false) }
+    var prevMeasuredExpanded by rememberSaveable { mutableStateOf(true) }   // «Ранее измеренные» — развёрнут по умолчанию
 
     var pingResults by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
     // Когда пришёл СЕССИОННЫЙ пинг (из «Самый быстрый»): значение в pingResults метки времени не несёт, а
@@ -945,6 +946,9 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
     // Качество сессионного замера: ключ→full (true полный/точный, false минимальный/быстрый «≈»). Параллельно
     // speedResults — чтобы в «Живых» различать быстро- и полностью-померянных ещё до персиста (live-обновления теста).
     var speedResultsFull by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
+    // ТЗ Elyor (2026-10-15): момент СЕССИОННОГО замера скорости (мс) — чтобы деление «Живые»/«Ранее измеренные»
+    // по свежести работало СРАЗУ (до персиста speedTestedTs), пока идёт тест/проверка. Аналог pingResultsAt.
+    var speedResultsAt by remember { mutableStateOf<Map<String, Long>>(emptyMap()) }
 
     var fullTesting by remember { mutableStateOf(false) }  // меняется только на старт/стоп (не на тик)
     var fullHandle by remember { mutableStateOf<FullTestRunner.Handle?>(null) }
@@ -1017,6 +1021,10 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
     // Качество замера для показа: сессионное (speedResultsFull) → сохранённое (speedFull). null = легаси/неизвестно
     // (трактуем как полный — без «≈», жирным). false → минимальный замер («≈», обычный шрифт).
     fun effSpeedFull(p: ServerProfile): Boolean? = speedResultsFull[SubscriptionManager.serverKey(p)] ?: p.speedFull
+    // Момент последнего замера скорости (мс): сессионный (speedResultsAt, live-обновления теста/проверки) →
+    // persisted-метка (speedTestedTs). Нужен для деления «Живые» (свежий замер) vs «Ранее измеренные» (старый).
+    fun effSpeedAt(p: ServerProfile): Long? =
+        speedResultsAt[SubscriptionManager.serverKey(p)] ?: ServerFilter.speedMeasuredAtMs(p)
     // Давность пинга ВСЕГДА в паре со значением: сессионный пинг (из pingResults) → его время из pingResultsAt;
     // иначе сохранённый lastTestedTs; а если пинг есть, но метки нет (легаси-данные) — честно «давно» (уточнится
     // при следующем пере-пинге монитора). Так строка НИКОГДА не показывает пинг без времени (ТЗ Elyor).
@@ -1081,6 +1089,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
             SubscriptionManager.applySpeedResults(context, mapOf(key to m.mbps))   // -1 при провале
             activity.runOnUiThread {
                 speedResults = speedResults + (key to m.mbps)
+                speedResultsAt = speedResultsAt + (key to System.currentTimeMillis())
                 remeasureStatus = if (m.ok) "результат: ${m.mbps} Мбит/с"
                                   else "НЕ ИЗМЕРЕНО — ${m.reason}"
                 remeasuring = false
@@ -1151,7 +1160,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
         MonitorCoordinator.wake()                   // прервать возможный перебор/паузу монитора
         CrashContext.set("полный тест: старт")
         TestProgress.startIndeterminate("запуск…")   // до первого done/total — indeterminate
-        pingResults = emptyMap(); pingResultsAt = emptyMap(); speedResults = emptyMap(); speedResultsFull = emptyMap()
+        pingResults = emptyMap(); pingResultsAt = emptyMap(); speedResults = emptyMap(); speedResultsFull = emptyMap(); speedResultsAt = emptyMap()
 
         fullHandle = FullTestRunner.run(
             context = context,
@@ -1165,7 +1174,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
             },
             onSpeedResult = { p, mbps, full ->
                 val k = SubscriptionManager.serverKey(p)
-                activity.runOnUiThread { speedResults = speedResults + (k to mbps); speedResultsFull = speedResultsFull + (k to full) }
+                activity.runOnUiThread { speedResults = speedResults + (k to mbps); speedResultsFull = speedResultsFull + (k to full); speedResultsAt = speedResultsAt + (k to System.currentTimeMillis()) }
             },
             connect = { p -> activity.runOnUiThread { startServer(p) } },
             onDone = { r ->
@@ -1289,6 +1298,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                     ui {
                         speedResults = speedResults + (curKey to down)
                         speedResultsFull = speedResultsFull + (curKey to true)
+                        speedResultsAt = speedResultsAt + (curKey to System.currentTimeMillis())
                         activeUploadMbps = if (up > 0) up else null
                         checkStatus = "Соединение в норме: ↓${fmt(down)} / ↑${fmt(up)} Мбит/с (пинг ${pingMs} мс)"
                     }
@@ -1359,9 +1369,9 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
         .filter { (effPing(it) ?: -1) >= 0 }
     val hiddenLiveProtocols = hiddenLiveByProto.map { it.protocol }.distinct()
 
-    // Сортировка (ТЗ Elyor 2026-10-14): ТОП по РЕАЛЬНОЙ замеренной СКОРОСТИ — быстрые сверху. Все видимые уже
-    // живы по пингу (ServerFilter.isVisible требует pingMs≥0, «призраков без пинга» больше нет). Измеренные (speed>0)
+    // Сортировка (ТЗ Elyor 2026-10-14): ТОП по РЕАЛЬНОЙ замеренной СКОРОСТИ — быстрые сверху. Измеренные (speed>0)
     // идут ВЫШЕ непомеренных (только пинг); среди измеренных — по скорости убыв.; непомеренные — по пингу возр.
+    // Этот порядок наследуют оба списка («Живые» и «Ранее измеренные» — фильтры по [tierOf] из уже отсортированного shown).
     val shown = allowedServers.sortedWith(Comparator { a, b ->
         val sa = effSpeed(a) ?: 0.0; val sb = effSpeed(b) ?: 0.0
         val hasA = sa > 0.0; val hasB = sb > 0.0
@@ -1484,13 +1494,24 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
         onDispose { runCatching { cm?.unregisterNetworkCallback(cb) } }
     }
 
-    // Основной вид = ЖИВЫЕ — через единый предикат [ServerFilter.isVisible] (стоп-лист+протокол+пинг+мин.скорость).
-    // «Живые» = реально доступные сейчас (пинг жив). ИСКЛЮЧЕНИЕ: активный подключённый сервер ВСЕГДА в «Живых»
-    // (его живость доказана самим туннелем, даже если temp-пинг подписки массово падает) — иначе рабочий сервер
-    // выпадал бы из списка при недоступной подписке. Мёртвые/непингующиеся серверы НЕ держим по старым скоростям.
+    // ДВА ВИДИМЫХ СПИСКА (ТЗ Elyor 2026-10-15) через классификатор [ServerFilter.tier] по СВЕЖЕСТИ замера:
+    //  • «Живые серверы» (список 1)      = tier LIVE: живой пинг + измеренная скорость>0 + замер СВЕЖИЙ («отозвался
+    //                                       и померился»). ИСКЛЮЧЕНИЕ: активный подключённый сервер ВСЕГДА тут (его
+    //                                       живость доказана туннелем, даже если temp-пинг подписки массово падает).
+    //  • «Ранее измеренные» (список 2)   = tier PREVIOUS: пинг жив + скорость>0, но замер СТАРЫЙ (мерили раньше).
+    //  • нет пинга / пинг-без-скорости   = tier NONE → только во «Все серверы».
+    // nowMs фиксируем на проход рекомпозиции (стабильная граница свежести); обновляется при reloadServers/изменении state.
+    val nowMs = System.currentTimeMillis()
+    fun tierOf(p: ServerProfile): ServerFilter.Tier =
+        ServerFilter.tier(p, effPing(p), effSpeed(p), effSpeedAt(p), nowMs, settings, blocklist)
     val alive = shown.filter { p ->
-        ServerFilter.isVisible(p, effPing(p), effSpeed(p), settings, blocklist) ||
+        tierOf(p) == ServerFilter.Tier.LIVE ||
             (proxy.running && proxy.serverKey == SubscriptionManager.serverKey(p))
+    }
+    // Список 2: ранее измеренные (замер устарел), кроме тех, что уже попали в «Живые» (в т.ч. активный).
+    val prevMeasured = shown.filter { p ->
+        tierOf(p) == ServerFilter.Tier.PREVIOUS &&
+            !(proxy.running && proxy.serverKey == SubscriptionManager.serverKey(p))
     }
 
     // ПРИБОРЫ по стоп-листу (Промпт 73.C): на КАЖДЫЙ пересчёт фильтра — подробный дамп (гейт «Подробные логи»,
@@ -1508,6 +1529,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
     // слабый тон → прилипший заголовок не просвечивает строками, и оттенки корректны в тёмной теме.
     val surface = MaterialTheme.colorScheme.surface
     val liveBg = lerp(surface, MaterialTheme.colorScheme.tertiaryContainer, 0.18f)   // светло-зелёный тон
+    val prevBg = lerp(surface, MaterialTheme.colorScheme.primaryContainer, 0.12f)    // «Ранее измеренные» — бледно-синий
     val allBg = lerp(surface, MaterialTheme.colorScheme.secondaryContainer, 0.18f)   // серо-голубой тон
     val divCol = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.10f)             // волосок-разделитель
 
@@ -1741,6 +1763,34 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
         }
         item { SectionBottomCap(liveBg) }
         item { Spacer(Modifier.height(12.dp)) }
+
+        // ═══ РАНЕЕ ИЗМЕРЕННЫЕ (список 2, ТЗ Elyor 2026-10-15) — пинг жив, но замер скорости устарел ═══
+        // Фон приоритетно перемеряет их и возвращает ожившие в «Живые». Свёртка — отдельным состоянием.
+        if (prevMeasured.isNotEmpty()) {
+            stickyHeader(key = "h-prev") {
+                SectionHeader("Ранее измеренные (${prevMeasured.size})", prevBg, roundedBottom = !prevMeasuredExpanded,
+                    arrow = if (prevMeasuredExpanded) "▾" else "▸", onClick = { prevMeasuredExpanded = !prevMeasuredExpanded })
+            }
+            if (prevMeasuredExpanded) {
+                item { Box(Modifier.fillMaxWidth().background(prevBg).bottomHairline(divCol)) { ServerTableHeader() } }
+                itemsIndexed(prevMeasured, key = { _, it -> "prev-" + SubscriptionManager.serverKey(it) }) { index, p ->
+                    val rowMod = if (index < prevMeasured.lastIndex) Modifier.bottomHairline(divCol) else Modifier
+                    Box(Modifier.fillMaxWidth().background(prevBg).then(rowMod)) {
+                        ServerRow(
+                            profile = p, name = displayName(p, blocklist), isActive = false,
+                            speedMbps = effSpeed(p), pingMs = effPing(p), pingAge = effPingAge(p), speedFull = effSpeedFull(p), caption = discriminators[SubscriptionManager.serverKey(p)] ?: "",
+                            onConnect = { connectServer(p, "ручной выбор") },
+                            onDetails = { detailProfile = p; remeasureStatus = "" },
+                            showUseToggle = true,
+                            paused = ServerFilter.isPaused(p, blocklist),
+                            onToggleUse = { toggleUse(p) },
+                        )
+                    }
+                }
+                item { SectionBottomCap(prevBg) }
+            }
+            item { Spacer(Modifier.height(12.dp)) }
+        }
 
         // ═══ СВОРАЧИВАЕМЫЕ СЕКЦИИ (порядок как эталон) ═══
         // Все серверы (вкл. мёртвые ✗ и не тестированные —) — свёрнут, не мозолит глаза. Серо-голубой.
@@ -3094,6 +3144,15 @@ private fun OptimizeChecksBlock(settings: AppSettings, onChange: (AppSettings) -
     IntSettingRow("Сколько быстрых набирать («Самый быстрый»)", "", settings.fastTopTarget, dd.fastTopTarget, 1, 50) { v ->
         onChange(settings.copy(fastTopTarget = v))
     }
+    // ТЗ Elyor (2026-10-15): окно свежести для деления «Живые» (замер свежий) vs «Ранее измеренные» (замер старый).
+    // Всегда видимо (влияет на оба списка). Дефолт 60 мин.
+    IntSettingRow("Свежесть «Живых» (список 1)", "мин", settings.liveFreshSec / 60, dd.liveFreshSec / 60, 5, 1440) { v ->
+        onChange(settings.copy(liveFreshSec = v * 60))
+    }
+    Text(
+        "Сервер с живым пингом и измеренной скоростью держится в «Живых», пока замер не старше этого окна; старее — уходит в «Ранее измеренные» (фон перемеряет их и возвращает ожившие в «Живые»).",
+        style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+    )
     if (optSec > 0) {
         IntSettingRow("Размер топа (быстрых серверов)", "", topBatch, if (save) dd.topBatchSave else dd.topBatchNormal, 1, 50) { v ->
             onChange(if (save) settings.copy(topBatchSave = v) else settings.copy(topBatchNormal = v))
