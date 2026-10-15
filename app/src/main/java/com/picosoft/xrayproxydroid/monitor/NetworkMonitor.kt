@@ -402,19 +402,12 @@ object NetworkMonitor {
             // НЕЗАВИСИМО от трафика. ТЗ Elyor «на плашке ✗ при живом»: (1) во время трафика монитор раньше пинг НЕ
             // делал → висел старый «✗»; (2) cold-start temp-инстанс для xhttp/reality не успевал в таймаут → ложный
             // ✗ на сервере, тянущем 20+ Мбит/с. Тёплый туннель отвечает честно. Temp-инстанс — фолбэк (только простой).
+            // Пинг активного — tcping его host:port (ServerTester.ping, быстро, реально; latencyMs давал абсурд 5888мс).
             var activePm = -1
             if (curSrv0 != null) {
-                val lat = ExternalIpChecker.latencyMs(timeoutMs = PING_LIVENESS_TIMEOUT_MS)
-                when {
-                    lat >= 0 -> { activePm = lat; SubscriptionManager.applyPingResults(app, mapOf(curKey0!! to lat)) }
-                    !userTrafficActive() -> {   // простой + SOCKS-проба не прошла → temp-инстанс (и как сигнал живости)
-                        activePm = ServerTester.ping(app, curSrv0, PING_LIVENESS_TIMEOUT_MS).toInt()
-                        SubscriptionManager.applyPingResults(app, mapOf(curKey0!! to activePm))
-                    }
-                    // иначе: трафик идёт, но SOCKS-проба не прошла (редко) → сохранённый пинг НЕ трогаем (связь есть)
-                }
-                // Живой пинг активного — в TunnelSpeed (плашка берёт отсюда, минуя затенение сессионным pingResults).
-                if (activePm >= 0) TunnelSpeed.setPing(activePm, now(), curKey0!!)
+                activePm = ServerTester.ping(app, curSrv0, PING_LIVENESS_TIMEOUT_MS).toInt()
+                SubscriptionManager.applyPingResults(app, mapOf(curKey0!! to activePm))   // плашка/список — реальный пинг
+                if (activePm >= 0) TunnelSpeed.setPing(activePm, now(), curKey0!!)         // живой источник для плашки
             }
             if (userTrafficActive()) {
                 aliveNow = true                                   // реальный трафик — сильнейший факт живости

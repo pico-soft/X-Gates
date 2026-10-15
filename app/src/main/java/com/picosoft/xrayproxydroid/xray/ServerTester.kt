@@ -45,28 +45,24 @@ object ServerTester {
      * [timeoutMs] — мягкий верхний предел (из настроек); брошенный JNI-замер сам погасит temp-инстанс.
      */
     fun ping(context: Context, profile: ServerProfile, timeoutMs: Int = SettingsStore.current().pingTimeoutMs): Long {
-        // submit() ВНУТРИ try: на насыщенном/исчерпанном пуле он бросает RejectedExecutionException (Exception)
-        // или OutOfMemoryError (Error) — ловим ОБА через Throwable и считаем сервер мёртвым, а НЕ роняем задачу
-        // пинга (иначе прогресс батча залипал — см. testAll).
-        //
-        // ⚠️ ГРАБЛЯ (полевой баг Fold SM-F936N, 0.43, «пинг 25/36» намертво): и XrayConfigBuilder.build(), и native
-        // measureOutboundDelay идут ЦЕЛИКОМ внутри Callable → под мягким таймаутом future.get(timeoutMs). Раньше
-        // build() стоял ДО future (вне таймаута): если на каком-то профиле билдер/натив держал поток дольше 5с,
-        // воркер пула testAll не освобождался → awaitTermination(MAX_VALUE) ждал его вечно → батч виснул. Теперь
-        // ЕДИНСТВЕННАЯ точка ожидания воркера — future.get(timeoutMs), гарантированно ≤ timeoutMs.
+        // ТЗ Elyor (2026-10-15): tcping — TCP-коннект до host:port сервера (как «real/tcp ping» в v2rayN на ноутбуке).
+        // Пингует ВСЕ URL быстро, показывает ДОСТИЖИМЫЕ серверы, НЕ виснет и НЕ переполняет пул (чистый таймаут
+        // коннекта) — в отличие от прежнего gstatic-204 через ХОЛОДНЫЙ temp-инстанс (ложно падал на xhttp/reality/
+        // медленных и залипал на мёртвом пуле, «пинг 3→300»). Реальную работу туннеля далее доказывает замер скорости.
+        // Возврат: мс (≥0) или -1 (недостижим/таймаут/ошибка). Без jniPool/natve — обычный сокет, прерывается таймаутом.
+        val host = profile.address
+        val port = profile.port
+        if (host.isBlank() || port <= 0) return -1L
+        var sock: java.net.Socket? = null
         return try {
-            val future = jniPool.submit(Callable {
-                val cfg = XrayConfigBuilder.build(profile)   // неподдерж. транспорт → бросит → ExecutionException → -1
-                XrayController.measureOutboundDelay(context, cfg, GSTATIC_204)
-            })
-            try {
-                future.get(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
-            } catch (e: TimeoutException) {
-                future.cancel(true)   // прерываем ОЖИДАНИЕ; нативный вызов сам погаснет по своему таймауту
-                -1L
-            }
+            sock = java.net.Socket()
+            val t0 = System.nanoTime()
+            sock.connect(java.net.InetSocketAddress(host, port), timeoutMs.coerceIn(1000, 6000))
+            ((System.nanoTime() - t0) / 1_000_000).coerceAtLeast(1L)
         } catch (t: Throwable) {
             -1L
+        } finally {
+            try { sock?.close() } catch (_: Exception) {}
         }
     }
 
