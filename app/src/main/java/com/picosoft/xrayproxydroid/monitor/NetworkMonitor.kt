@@ -676,9 +676,19 @@ object NetworkMonitor {
                 .filter { SubscriptionManager.serverKey(it) != ProxyState.state.value.serverKey }
                 .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl) && !ServerFilter.isPaused(it, bl) }
 
-            // ── Фаза 1: пинг НЕДАВНИХ живых (по убыв. известной скорости; свежий провал → уходит из «Живых») ──
-            val recent = orderFastCandidates(allowed().filter { isLikelyAlive(it) },
-                isUnstable = { isUnstableKey(SubscriptionManager.serverKey(it)) })
+            // ── Фаза 1: пинг НЕДАВНИХ живых. ТЗ Elyor (2026-10-15): «при быстром восстановлении сначала идём по
+            // списку 1 (Живые — свежий замер), потом по списку 2 (Ранее измеренные — замер устарел)». Пингуем
+            // именно в этом порядке; вероятно-живые без измеренной скорости (tier NONE) — хвостом, как запас
+            // (связь любой ценой, Пр.95; пинг дёшев). Не ответившие на пинг уходят из «Живых» (прунинг ниже).
+            val nowRec = now()
+            fun tierOf(p: ServerProfile) =
+                ServerFilter.tier(p, p.pingMs, p.speedMbps, ServerFilter.speedMeasuredAtMs(p), nowRec, s, bl)
+            val poolAlive = allowed().filter { isLikelyAlive(it) }
+            val unstable: (ServerProfile) -> Boolean = { isUnstableKey(SubscriptionManager.serverKey(it)) }
+            val list1 = orderFastCandidates(poolAlive.filter { tierOf(it) == ServerFilter.Tier.LIVE }, unstable)
+            val list2 = orderFastCandidates(poolAlive.filter { tierOf(it) == ServerFilter.Tier.PREVIOUS }, unstable)
+            val restLikely = orderFastCandidates(poolAlive.filter { tierOf(it) == ServerFilter.Tier.NONE }, unstable)
+            val recent = (list1 + list2 + restLikely).distinctBy { SubscriptionManager.serverKey(it) }
             val pingUpd = HashMap<String, Int>()
             val responders = ArrayList<ServerProfile>()
             for ((i, c) in recent.withIndex()) {
@@ -1316,41 +1326,47 @@ object NetworkMonitor {
 
     private val speedTsFmt = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.US)
 
-    // Фоновый рейтинг топа — ТОТ ЖЕ ПРИНЦИП, что «Самый быстрый»/«Проверить» (ТЗ Elyor): пинг всех → МИНИМАЛЬНЫЙ
-    // замер (~100 КБ) ВСЕХ живых (в «Живых» это «≈») → ПОЛНЫЙ точный замер ТОПа прошедших minGate (0.5), лимит
-    // fullCap: на МОБИЛЬНОЙ/батарее 10 (обычный)/3 (экономия), на ШНУРЕ+Wi-Fi — без лимита. Активный НЕ трогаем
-    // (его скорость даёт live-сэмпл sampleTunnelSpeed). Весь рейтинг под heavyMeasureAllowed (батарея) у вызова.
+    // Фоновый рейтинг топа (ТЗ Elyor 2026-10-15: «в фоне приоритетно перебрать список 2 и перенести живые в список 1,
+    // далее из оставшихся живых по пингу после фетча доформировывать топ списка 1»). Порядок: пинг всех → МИНИМАЛЬНЫЙ
+    // замер (~100 КБ) сперва СПИСКА 2 (ранее измеренные: пинг жив, замер устарел) — ожившие (speed>0, свежая метка)
+    // становятся списком 1; затем ДОБОР из оставшихся живых по пингу (без годной скорости) до targetTop. ПОЛНЫЙ точный
+    // замер — топу прошедших minGate (0.5). Уже свежие по [liveFreshSec] и годные (≥ порога) — список 1, НЕ перемеряем
+    // (бережём трафик). Активный НЕ трогаем (его скорость даёт live-сэмпл). Рейтинг под heavyMeasureAllowed (батарея).
     private suspend fun rebuildAndRateTop(app: Context, s: AppSettings) {
         if (MonitorCoordinator.fullTestRunning) return
         MonitorCoordinator.monitorSearchRunning = true
         try {
-            runCatching { refreshAllPings(app, s) }   // пинг всех: прунинг мёртвых + воскресшие
+            runCatching { refreshAllPings(app, s) }   // пинг всех: прунинг мёртвых + воскресшие (фетч пинга перед добором)
             val bl = BlocklistStore.current()
             fun key(p: com.picosoft.xrayproxydroid.xray.link.ServerProfile) = SubscriptionManager.serverKey(p)
             val curKey = ProxyState.state.value.serverKey
             val minGate = 0.5
             val targetTop = if (s.trafficSaveMode) 3 else 10   // держим топ-N по скорости (НЕ меряем все, без ∞ на шнуре)
             val keepThreshold = s.degradationMinMbps.coerceAtLeast(0.1)
-            val freshMs = s.topFreshSec.coerceAtLeast(3600) * 1000L
-            // СТАБИЛЬНЫЙ = свежий ПОЛНЫЙ замер ≥ порога (ТЗ Elyor «умно, только несвежие»): такие НЕ трогаем вовсе —
-            // ни минимальным (иначе их число сползло бы на «≈»), ни полным. Бережёт трафик (~1ГБ/мес).
-            fun freshFullGood(p: com.picosoft.xrayproxydroid.xray.link.ServerProfile): Boolean {
-                if (p.speedFull != true || (p.speedMbps ?: 0.0) < keepThreshold) return false
-                val t = runCatching { speedTsFmt.parse(p.speedTestedTs)?.time }.getOrNull() ?: return false
-                return now() - t <= freshMs
-            }
+            // СПИСОК 1 «Живые» = измеренная скорость>0 И замер СВЕЖИЙ (не старше liveFreshSec). Такой сервер только что
+            // мерен — НЕ перемеряем в этом цикле. В зачёт топа идут лишь ГОДНЫЕ (≥ порога). liveFreshSec (а не topFreshSec)
+            // — чтобы список 2 (измеренные старше окна) активно перемерялся и промоутился обратно в список 1 (ТЗ).
+            fun isFreshLive(p: com.picosoft.xrayproxydroid.xray.link.ServerProfile): Boolean =
+                (p.speedMbps ?: 0.0) > 0.0 && ServerFilter.isSpeedFresh(ServerFilter.speedMeasuredAtMs(p), now(), s.liveFreshSec)
             val aliveByPing = SubscriptionManager.allServers(app)
                 .filter { key(it) != curKey }   // активный мерит live-сэмпл — не перемеряем temp-инстансом
                 .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl) && !ServerFilter.isPaused(it, bl) }
                 .filter { (it.pingMs ?: -1) >= 0 }
                 .distinctBy { key(it) }
                 .sortedBy { it.pingMs ?: Int.MAX_VALUE }
-            val stableGood = aliveByPing.count { freshFullGood(it) }       // уже годные и свежие — в зачёт топа
+            val stableGood = aliveByPing.count { isFreshLive(it) && (it.speedMbps ?: 0.0) >= keepThreshold }  // уже в топе
             val needTop = (targetTop - stableGood).coerceAtLeast(0)        // сколько ещё добрать в топ-N
-            val needMeasure = aliveByPing.filterNot { freshFullGood(it) } // мерим только НЕСВЕЖИХ
+            // ПРИОРИТЕТ — СПИСОК 2: ранее измеренные (speed>0), но НЕ свежие → перемерить, чтобы промоутить в список 1.
+            // Лучшие по прошлой скорости первыми. Затем ДОБОР — живые по пингу без годной скорости (unmeasured/провал),
+            // от лучшего пинга. Свежие-но-медленные (speed>0, fresh, <порога) пропускаем — только что мерены.
+            val list2 = aliveByPing.filter { (it.speedMbps ?: 0.0) > 0.0 && !isFreshLive(it) }
+                .sortedByDescending { it.speedMbps ?: 0.0 }
+            val fillPool = aliveByPing.filter { (it.speedMbps ?: 0.0) <= 0.0 && !isFreshLive(it) }
+                .sortedBy { it.pingMs ?: Int.MAX_VALUE }
+            val needMeasure = (list2 + fillPool).distinctBy { key(it) }   // список 2 — приоритет, затем добор
             val maxScan = (targetTop * 6).coerceIn(targetTop, needMeasure.size)   // потолок сканирования (мёртвый пул)
-            // Этап А: МИНИМАЛЬНЫЙ замер (~100 КБ, 1 пробник/3с) НЕСВЕЖИХ от ЛУЧШЕГО ПИНГА; СТОП при наборе needTop
-            // годных ИЛИ maxScan. На tcping-пуле из сотен это ключ к «не 5 ГБ/сут»: мерим горстку, а не всё.
+            // Этап А: МИНИМАЛЬНЫЙ замер (~100 КБ, 1 пробник/3с) от списка 2 к добору; СТОП при наборе needTop годных ИЛИ
+            // maxScan. На tcping-пуле из сотен это ключ к «не 5 ГБ/сут»: мерим горстку, а не всё.
             val minimalByKey = LinkedHashMap<String, Double>()
             val minimalTagged = LinkedHashMap<String, Pair<Double, Boolean>>()
             val good = ArrayList<com.picosoft.xrayproxydroid.xray.link.ServerProfile>()
@@ -1363,7 +1379,7 @@ object NetworkMonitor {
                 if (m >= minGate) good.add(p)
             }
             if (minimalTagged.isNotEmpty()) SubscriptionManager.applySpeedResultsTagged(app, minimalTagged)
-            // Этап Б: ПОЛНЫЙ точный замер — топ needTop из годных (по минимальному).
+            // Этап Б: ПОЛНЫЙ точный замер — топ needTop из годных (по минимальному). Ставит свежую метку → промоушен в список 1.
             val reasonable = good.sortedByDescending { minimalByKey[key(it)] ?: 0.0 }.take(needTop)
             val fullTagged = LinkedHashMap<String, Pair<Double, Boolean>>()
             for (p in reasonable) {
@@ -1371,8 +1387,8 @@ object NetworkMonitor {
                 fullTagged[key(p)] = ServerSpeedTester.measureSpeed(app, p) to true   // полный/точный замер
             }
             if (fullTagged.isNotEmpty()) SubscriptionManager.applySpeedResultsTagged(app, fullTagged)
-            MonitorLog.event(app, "monitor", "Фон: топ обновлён (пинг→мин→полный, ограниченный)",
-                "стабильных $stableGood, топ $targetTop, минимальный $scanned, полный ${fullTagged.size}")
+            MonitorLog.event(app, "monitor", "Фон: топ обновлён (список2→промоушен→добор)",
+                "в топе $stableGood, цель $targetTop, список2 ${list2.size}, минимальный $scanned, полный ${fullTagged.size}")
         } finally {
             MonitorCoordinator.monitorSearchRunning = false
         }
