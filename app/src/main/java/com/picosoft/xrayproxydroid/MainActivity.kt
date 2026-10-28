@@ -1544,6 +1544,24 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
         item {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.padding(bottom = 12.dp)) {
                 AppHeader()
+                // ТЗ Elyor «Только Wi-Fi»: туннель на паузе (мобильная сеть) — сказать прямо, что это НЕ сбой и
+                // связь сама поднимется на Wi-Fi. Показываем, пока сервис в состоянии паузы.
+                if (proxy.paused) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+                            .background(Color(0xFF263238)).padding(horizontal = 14.dp, vertical = 10.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        FlatIcon(UiIcon.GLOBE, size = 18.dp, color = Color(0xFF80DEEA))
+                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text("Пауза — жду Wi-Fi", style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold, color = Color(0xFF80DEEA))
+                            Text("Включён режим «Только Wi-Fi». На мобильной сети туннель остановлен — поднимется сам, как появится Wi-Fi.",
+                                style = MaterialTheme.typography.bodySmall, color = Color(0xFFB0BEC5))
+                        }
+                    }
+                }
                 // Полоса «было падение» (Промпт 93.B) — заметно, над списками; крестик снимает для этого отчёта.
                 if (showCrashBanner) {
                     CrashBanner(onDismiss = { CrashReporter.markLatestSeen(); showCrashBanner = false })
@@ -2206,6 +2224,19 @@ private fun TrafficBlock() {
                 SettingsStore.update(context, settings.copy(trafficSaveBlindProbe = it))
             }
         }
+
+        // ТЗ Elyor: «Только Wi-Fi» — НЕЗАВИСИМ от экономии выше (два отдельных тумблера).
+        Spacer(Modifier.height(6.dp))
+        SettingsGroupLabel("Только Wi-Fi")
+        BoolSettingRow("Работать только по Wi-Fi", settings.wifiOnlyEnabled, d.wifiOnlyEnabled) {
+            SettingsStore.update(context, SettingsStore.current().copy(wifiOnlyEnabled = it))
+            EconomyNet.applyNow(context)   // сразу пересчитать щадящий/полный по питанию; паузу/возобновление применит сервис
+        }
+        Text(
+            "На Wi-Fi: на зарядке — работа по полной (агрессивный замер/рейтинг), на батарее — щадящий режим (реже и меньше замеров). " +
+                "На мобильной сети туннель ставится на ПАУЗУ и сам поднимается, как только появится Wi-Fi. Работает независимо от «Режима экономии».",
+            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+        )
 
         // Пр.140: режим белых списков РФ.
         Spacer(Modifier.height(6.dp))
