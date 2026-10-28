@@ -12,6 +12,9 @@ data class ProxyStatus(
     val message: String = "idle",   // человекочитаемый статус (ошибка/этап); порты — отдельно
     val socksOk: Boolean = false,   // локальный SOCKS-сокет слушает
     val httpOk: Boolean = false,    // локальный HTTP-сокет слушает
+    // ТЗ Elyor «Только Wi-Fi»: туннель НАМЕРЕННО остановлен на мобильной сети и сам поднимется на Wi-Fi.
+    // Отличается от «остановлено» (пользователь нажал Стоп) — сервис ЖИВ и ждёт Wi-Fi. running=false при этом.
+    val paused: Boolean = false,
 )
 
 /**
@@ -30,7 +33,8 @@ object ProxyState {
         message: String,
         socksOk: Boolean = false,
         httpOk: Boolean = false,
+        paused: Boolean = false,
     ) {
-        _state.value = ProxyStatus(running, label, serverKey, message, socksOk, httpOk)
+        _state.value = ProxyStatus(running, label, serverKey, message, socksOk, httpOk, paused)
     }
 }

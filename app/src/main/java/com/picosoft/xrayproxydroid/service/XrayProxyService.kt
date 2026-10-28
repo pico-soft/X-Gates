@@ -71,6 +71,9 @@ class XrayProxyService : Service() {
     @Volatile private var coreActive = false
     @Volatile private var lastRelation = VpnRelation.NONE
     @Volatile private var bypassRetryAfterMs = 0L
+    // ТЗ Elyor «Только Wi-Fi»: туннель поставлен на паузу (ядро стоп), потому что сеть мобильная. Сервис ЖИВ и
+    // слушает сеть — на Wi-Fi сам поднимает последний сервер. Отличает «пауза» от пользовательского Стопа.
+    @Volatile private var wifiOnlyPaused = false
     // Сеть, к которой МЫ привязали процесс (null = не привязывали). Нужно, чтобы определять состояние
     // БЕЗ глобального снятия привязки (иначе параллельные запросы уйдут не тем маршрутом, Промпт 62.A).
     @Volatile private var ourBinding: Network? = null
@@ -96,6 +99,12 @@ class XrayProxyService : Service() {
         monitorScope.launch {
             SettingsStore.state.map { it.bypassSystemVpn }.distinctUntilChanged().collect { applyVpnBypass() }
         }
+        // ТЗ Elyor «Только Wi-Fi»: переключение тумблера применяем немедленно (не ждём смены сети) — если включили
+        // на мобильной, сразу пауза; выключили на паузе — сразу возобновление. Первая эмиссия (стартовое значение)
+        // тоже проходит и приводит состояние к текущей сети.
+        monitorScope.launch {
+            SettingsStore.state.map { it.wifiOnlyEnabled }.distinctUntilChanged().collect { applyWifiOnly() }
+        }
         // Промпт 93.I: пока прокси активен — раз в сутки проверять новую версию ЧЕРЕЗ уже работающий туннель
         // (несколько КБ). НЕ будим телефон (обычный delay в живом сервисе), НЕ при загрузке, тихо при неудаче.
         monitorScope.launch {
@@ -115,11 +124,20 @@ class XrayProxyService : Service() {
 
     private fun registerScreenReceiver() {
         val r = object : android.content.BroadcastReceiver() {
-            override fun onReceive(c: Context?, i: Intent?) { MonitorCoordinator.wake() }   // немедленная проверка связи
+            override fun onReceive(c: Context?, i: Intent?) {
+                // ТЗ Elyor «Только Wi-Fi»: шнур воткнули/вынули → пересчитать щадящий/полный по питанию (EconomyNet —
+                // единственный писатель trafficSaveMode; recompute идемпотентен). Сетевое событие тут не приходит.
+                if (i?.action == Intent.ACTION_POWER_CONNECTED || i?.action == Intent.ACTION_POWER_DISCONNECTED) {
+                    com.picosoft.xrayproxydroid.monitor.EconomyNet.applyNow(applicationContext)
+                }
+                MonitorCoordinator.wake()   // немедленная проверка связи
+            }
         }
         val f = android.content.IntentFilter().apply {
             addAction(Intent.ACTION_SCREEN_ON)
             addAction(Intent.ACTION_USER_PRESENT)
+            addAction(Intent.ACTION_POWER_CONNECTED)
+            addAction(Intent.ACTION_POWER_DISCONNECTED)
         }
         runCatching { registerReceiver(r, f); screenReceiver = r }
     }
@@ -153,6 +171,8 @@ class XrayProxyService : Service() {
                 bypassRetryAfterMs = 0L; scheduleVpnBypass()
                 // Пр.129: авто-переключение экономии по типу сети — по СОБЫТИЮ (default network отдаёт свои капы здесь).
                 com.picosoft.xrayproxydroid.monitor.EconomyNet.onDefaultNetwork(applicationContext, caps)
+                // ТЗ Elyor «Только Wi-Fi»: смена сети → мобильная→пауза, Wi-Fi→возобновление (EconomyNet уже обновил lastKnownMobile).
+                applyWifiOnly(com.picosoft.xrayproxydroid.monitor.EconomyNet.lastKnownMobile)
                 // Пр.140: смена сети → свежая оценка белых списков (снять ручной «держать обычный»); сама оценка — в мониторе.
                 com.picosoft.xrayproxydroid.monitor.WhiteListDetector.onNetworkChange(applicationContext)
             }
@@ -275,6 +295,14 @@ class XrayProxyService : Service() {
 
         // В foreground нужно уйти в течение ~5с после старта — иначе ANR.
         startForeground(NotificationHelper.NOTIFICATION_ID, NotificationHelper.buildNotification(this, label))
+
+        // ТЗ Elyor «Только Wi-Fi»: запуск на МОБИЛЬНОЙ сети → ядро не поднимаем, сразу пауза. Запоминаем выбранный
+        // сервер (на Wi-Fi возобновление поднимет именно его из LastServerStore). Сервис остаётся foreground и слушает сеть.
+        if (SettingsStore.current().wifiOnlyEnabled && com.picosoft.xrayproxydroid.monitor.EconomyNet.currentMobile(applicationContext)) {
+            serverKey?.let { LastServerStore.save(applicationContext, it) }
+            enterWifiOnlyPause(label, serverKey, "запуск на мобильной сети")
+            return
+        }
         ProxyState.update(running = false, label = label, serverKey = serverKey, message = "запуск…")
 
         coreActive = true
@@ -295,6 +323,12 @@ class XrayProxyService : Service() {
         ProxyState.update(running = false, label = null, serverKey = null, message = if (boot) "автозапуск после включения…" else "восстановление после сбоя…")
         coreActive = true
         bypassRetryAfterMs = 0L
+        // ТЗ Elyor «Только Wi-Fi»: возврат сервиса (START_STICKY/автозагрузка) на МОБИЛЬНОЙ сети → не поднимаем ядро,
+        // сразу пауза. Когда появится Wi-Fi — сетевой колбэк возобновит (поднимет последний сервер из LastServerStore).
+        if (SettingsStore.current().wifiOnlyEnabled && com.picosoft.xrayproxydroid.monitor.EconomyNet.currentMobile(applicationContext)) {
+            enterWifiOnlyPause(null, null, if (boot) "автозапуск на мобильной сети" else "восстановление на мобильной сети")
+            return
+        }
         val downtimeMs = LastServerStore.lastAlive(applicationContext).let { if (it > 0L) System.currentTimeMillis() - it else -1L }
         Thread {
             try {
@@ -393,6 +427,7 @@ class XrayProxyService : Service() {
 
     private fun handleStop() {
         stopMonitor()
+        wifiOnlyPaused = false   // пользователь нажал Стоп — выходим из «Только Wi-Fi» паузы (сервис завершается полностью)
         com.picosoft.xrayproxydroid.monitor.TunnelHealth.reset()   // Промпт 95: прокси остановлен — статус не зелёный
         NotificationHelper.cancelNoServers(applicationContext)
         coreActive = false
@@ -408,6 +443,87 @@ class XrayProxyService : Service() {
             ProxyState.update(running = false, label = null, serverKey = null, message = "остановлено")
             stopSelfAndForeground()
         }.start()
+    }
+
+    // ---- ТЗ Elyor: режим «Только Wi-Fi» (пауза на мобильной, авто-подъём на Wi-Fi) ----
+
+    /**
+     * Привести состояние к текущей сети при включённом «Только Wi-Fi». Мобильная → ПАУЗА (ядро стоп, сервис жив);
+     * Wi-Fi/Ethernet ИЛИ фича выключена (а мы были на паузе) → ВОЗОБНОВЛЕНИЕ. Идемпотентно — можно звать сколько угодно
+     * (сетевое событие / смена тумблера / старт). [isMobile] по умолчанию — свежее чтение активной сети.
+     */
+    private fun applyWifiOnly(isMobile: Boolean = com.picosoft.xrayproxydroid.monitor.EconomyNet.currentMobile(applicationContext)) {
+        val enabled = SettingsStore.current().wifiOnlyEnabled
+        when {
+            enabled && isMobile -> if (!wifiOnlyPaused) {
+                val st = ProxyState.state.value
+                enterWifiOnlyPause(st.label, st.serverKey, "сеть стала мобильной")
+            }
+            wifiOnlyPaused -> resumeFromWifiOnly()   // Wi-Fi вернулся ИЛИ «Только Wi-Fi» выключили
+        }
+    }
+
+    /**
+     * Войти в паузу «Только Wi-Fi»: остановить ядро (если поднято), СНЯТЬ привязку к сети, остаться foreground и ждать
+     * Wi-Fi. НЕ stopSelf — сетевой колбэк жив и возобновит на Wi-Fi. Зовётся из handleStart/handleRestartAfterKill
+     * (ядро ещё не поднято — стоп безвреден) и из applyWifiOnly (смена сети на мобильную).
+     */
+    private fun enterWifiOnlyPause(label: String?, serverKey: String?, reasonDetail: String) {
+        wifiOnlyPaused = true
+        coreActive = false
+        MonitorLog.event(applicationContext, "net", "Только Wi-Fi: пауза — жду Wi-Fi", reasonDetail)
+        runCatching { getSystemService(ConnectivityManager::class.java)?.bindProcessToNetwork(null) }
+        ourBinding = null
+        com.picosoft.xrayproxydroid.monitor.TunnelHealth.reset()
+        runCatching {
+            androidx.core.app.NotificationManagerCompat.from(this)
+                .notify(NotificationHelper.NOTIFICATION_ID, NotificationHelper.buildNotification(this, "Пауза — жду Wi-Fi"))
+        }
+        ProxyState.update(running = false, label = label, serverKey = serverKey, message = "Пауза — жду Wi-Fi (мобильная сеть)", paused = true)
+        Thread {
+            polling = false
+            runCatching { XrayController.queryTunnelDelta()?.let { TrafficTracker.addTunnel(it.first, it.second) } }
+            runCatching { XrayController.stop() }
+            TrafficTracker.onServiceStop()
+        }.start()
+    }
+
+    /** Wi-Fi вернулся (или «Только Wi-Fi» выключили) — поднять ПОСЛЕДНИЙ рабочий сервер. Монитор поднимется реактивно. */
+    private fun resumeFromWifiOnly() {
+        if (!wifiOnlyPaused) return
+        wifiOnlyPaused = false
+        coreActive = true
+        MonitorLog.event(applicationContext, "net", "Только Wi-Fi: возобновление", "сеть не мобильная — поднимаю последний сервер")
+        ProxyState.update(running = false, label = null, serverKey = null, message = "возобновление (Wi-Fi)…", paused = false)
+        Thread { resumeLastServerBlocking() }.start()
+    }
+
+    /** Блокирующий подъём последнего сервера при возобновлении (как handleRestartAfterKill, но без оценки простоя). */
+    private fun resumeLastServerBlocking() {
+        try {
+            val lastKey = LastServerStore.load(applicationContext)
+            var profile = lastKey?.let { k -> SubscriptionManager.allServers(applicationContext).firstOrNull { SubscriptionManager.serverKey(it) == k } }
+            if (profile != null) {
+                val bl = BlocklistStore.current()
+                if (ServerFilter.isBlocked(profile!!, bl) || ServerFilter.isPaused(profile!!, bl))
+                    profile = SubscriptionManager.bestSavedSelectable(applicationContext)
+            }
+            val config = profile?.let { runCatching { XrayConfigBuilder.build(it) }.getOrNull() }
+            if (profile == null || config == null) {
+                MonitorLog.event(applicationContext, "monitor", "Только Wi-Fi: поднимать нечем", "нет сохранённого сервера / конфиг не собрался")
+                ProxyState.update(running = false, label = null, serverKey = null, message = "нет сервера для подъёма", paused = false)
+                return
+            }
+            val label = ServerLabels.full(profile)
+            val serverKey = SubscriptionManager.serverKey(profile)
+            runCatching {
+                androidx.core.app.NotificationManagerCompat.from(this)
+                    .notify(NotificationHelper.NOTIFICATION_ID, NotificationHelper.buildNotification(this, label))
+            }
+            runCoreStart(config, label, serverKey)
+        } catch (e: Exception) {
+            Log.w("XrayProxyService", "возобновление wifi-only упало (проглочено): ${e.message}", e)
+        }
     }
 
     /** Опрос трафика туннеля раз в ~2.5с, только пока сервис активен (батарея важнее секундной точности). */
