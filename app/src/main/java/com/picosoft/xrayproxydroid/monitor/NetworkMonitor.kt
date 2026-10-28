@@ -1205,6 +1205,9 @@ object NetworkMonitor {
      *  На мобильной или на батарее — лимит действует. Тот же критерий, что measureAll в rebuildAndRateTop. */
     fun chargingAndWifi(app: Context): Boolean = isCharging(app) && !EconomyNet.lastKnownMobile
 
+    /** Публичный доступ к «питание подключено (шнур)?» — для EconomyNet (щадящий «Только Wi-Fi» действует лишь на батарее). */
+    fun poweredByCharger(app: Context): Boolean = isCharging(app)
+
     /**
      * Разрешены ли БАЙТ-ТЯЖЁЛЫЕ замеры скорости прямо сейчас (measureSpeed/measureSufficiency/фон-рейтинг/апгрейд)?
      * ⚠️ ГРАБЛЯ (замер фактом adb, оба телефона на 0.52, 2026-09-27): ночью на батарее при выключенном экране эти

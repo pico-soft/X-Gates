@@ -21,6 +21,13 @@ object EconomyNet {
     /** Последний известный тип сети: true — мобильная, false — Wi-Fi/Ethernet/неизвестно. Для фонового рейтинга (шнур/сеть). */
     val lastKnownMobile: Boolean get() = lastMobile ?: false
 
+    /** Текущий тип сети по АКТИВНОЙ сети (свежее чтение). Для «Только Wi-Fi» (пауза на мобильной) — без ожидания события. */
+    fun currentMobile(app: Context): Boolean {
+        val cm = app.applicationContext.getSystemService(ConnectivityManager::class.java)
+        val caps = runCatching { cm?.getNetworkCapabilities(cm.activeNetwork) }.getOrNull()
+        return mobileFromCaps(caps)
+    }
+
     private fun mobileFromCaps(caps: NetworkCapabilities?): Boolean {
         if (caps == null) return false
         // Wi-Fi/Ethernet — «немобильная» (даже если вдруг есть и cellular). Мобильная = только сотовая.
@@ -60,10 +67,14 @@ object EconomyNet {
      */
     private fun recompute(app: Context, isMobile: Boolean) {
         val s = SettingsStore.current()
-        val want = s.economyEffective(isMobile)
+        // ТЗ Elyor: «Только Wi-Fi» на БАТАРЕЕ (Wi-Fi/Ethernet) требует ЩАДЯЩИЙ режим. На мобильной туннель всё равно
+        // на паузе (trafficSaveMode там неважен). ИЛИ с экономией → единственный писатель trafficSaveMode остаётся здесь.
+        val wifiOnlyGentle = s.wifiOnlyEnabled && !isMobile && !NetworkMonitor.poweredByCharger(app)
+        val want = s.economyEffective(isMobile) || wifiOnlyGentle
         if (s.trafficSaveMode == want) return
         SettingsStore.update(app, s.copy(trafficSaveMode = want))
         val why = when {
+            wifiOnlyGentle && !s.economyEffective(isMobile) -> "Только Wi-Fi: Wi-Fi на батарее (щадящий)"
             !s.economyEnabled -> "режим экономии выключен"
             !s.trafficSaveAutoByNetwork -> "экономия всегда (подпункт «только моб.» выкл)"
             isMobile -> "мобильная сеть"
