@@ -40,6 +40,13 @@ android {
         }
     }
 
+    // Локальные unit-тесты: android.util.Log и прочие android-заглушки по умолчанию БРОСАЮТ
+    // «Method ... not mocked» → код, зовущий Log.i (напр. ExternalIpChecker в SingleFlightTest),
+    // падал в рабочих потоках. returnDefaultValues=true → заглушки возвращают 0/false/null, не бросают.
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
+
     signingConfigs {
         create("release") {
             if (hasReleaseKey) {

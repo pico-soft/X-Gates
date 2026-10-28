@@ -5,6 +5,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
  * Промпт 101.A — ЧИСЛАМИ подтверждаем «один запрос внешнего адреса за раз».
@@ -27,15 +28,25 @@ class SingleFlightTest {
             val start = CountDownLatch(1)
             val done = CountDownLatch(n)
             val results = java.util.Collections.synchronizedList(mutableListOf<String?>())
+            // Ошибки рабочих потоков СОБИРАЕМ: иначе бросок внутри Thread{} убивал бы поток ДО countDown() →
+            // done.await() висел бы вечно (а убитый по таймауту прогон оставляет битый Kryo-файл результатов →
+            // EOFException на следующем запуске). countDown в finally + bounded await → дедлок = падение, не зависание.
+            val errors = java.util.Collections.synchronizedList(mutableListOf<Throwable>())
             repeat(n) {
                 Thread {
-                    start.await()
-                    results.add(ExternalIpChecker.fetch(socksPort = 10815))
-                    done.countDown()
+                    try {
+                        start.await()
+                        results.add(ExternalIpChecker.fetch(socksPort = 10815))
+                    } catch (t: Throwable) {
+                        errors.add(t)
+                    } finally {
+                        done.countDown()
+                    }
                 }.start()
             }
             start.countDown()          // все стартуют одновременно
-            done.await()
+            assertTrue("потоки не завершились за 10с (дедлок single-flight?)", done.await(10, TimeUnit.SECONDS))
+            assertTrue("исключения в рабочих потоках: $errors", errors.isEmpty())
 
             // Один запрос за раз: параллельность реальной работы не превысила 1.
             assertEquals("максимум одновременных запросов", 1, ExternalIpChecker.maxConcurrentSeen)
