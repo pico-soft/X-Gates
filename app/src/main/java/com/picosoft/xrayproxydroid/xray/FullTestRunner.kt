@@ -101,11 +101,19 @@ object FullTestRunner {
             // мёртвые по трафику). Минимальный замер идёт от ЛУЧШЕГО ПИНГА к худшему; СТОП, когда набрали targetTop
             // годных (≥minGate) ИЛИ прошли maxScan (пул мёртвый — не пылесосим все 269), ИЛИ бюджет. Полный замер —
             // только топ fullCap. Это чинит «Этап 2 ползёт 269» и расход 5 ГБ/сут. На шнуре лимит тот же (без ∞).
-            val targetTop = if (s.trafficSaveMode) 3 else 10
-            val fullCap = targetTop
-            val maxScan = (targetTop * 6).coerceIn(targetTop, candidates.size)   // потолок сканирования (мёртвый пул)
+            // ТОЧНЫЙ замер (Этап 3) ДОРОГОЙ (~5 МБ/сервер) → только топ fullCap. А минимальный замер (Этап 2) ДЁШЕВ
+            // (~100 КБ) → можно сканировать МНОГО. ТЗ Elyor: ручной «Самый быстрый» должен находить ВСЕ живые серверы
+            // (как v2rayN на ноуте, где их 19+), а не только топ-10. Поэтому: стоп-цель по числу НАЙДЕННЫХ живых поднята
+            // (30, не 10), и сканируем ВСЕХ кандидатов — реальный ограничитель это бюджет времени (fullTestBudgetSec) +
+            // сторож застоя. (ФОН rebuildAndRateTop — отдельный код, свои лимиты трафика не трогаем.)
+            val fullCap = if (s.trafficSaveMode) 3 else 10              // сколько ТОЧНО мерить (топ для подключения)
+            val scanGoodTarget = if (s.trafficSaveMode) 3 else 30      // стоп-цель по числу найденных живых (минимальный замер дёшев)
+            // Потолок сканирования: БОЛЬШОЙ (было 60 → мало живых при пуле 400+), но ограничен, чтобы ручной скан не
+            // крутился весь 10-мин бюджет. Живые «фронт-загружены» по пингу (большинство в первых ~100-150), поэтому
+            // 180 ловит почти все при разумном ожидании (~5-6 мин). Экономия — скромнее. (ФОН — отдельный код.)
+            val maxScan = (if (s.trafficSaveMode) 30 else 180).coerceAtMost(candidates.size)
             val budgetMs = s.fullTestBudgetSec.coerceAtLeast(30) * 1000L
-            onPhase("Этап 2: быстрый замер (топ-$targetTop по скорости)…")
+            onPhase("Этап 2: быстрый замер (ищу живые)…")
             emitProgress(0, maxScan)
 
             // Промпт 103. ПРЕДОХРАНИТЕЛЬ ЗАВЕРШЕНИЯ. Наблюдение из поля: «Этап 2» долго стоял, плашка зеленела
@@ -208,7 +216,7 @@ object FullTestRunner {
                         break
                     }
                     // Набрали топ годных ИЛИ просканировали потолок (пул мёртвый) → хватит минимального.
-                    if (goodOnes.size >= targetTop) { onPhase("Набрано $targetTop годных — к точному замеру топа"); break }
+                    if (goodOnes.size >= scanGoodTarget) { onPhase("Набрано $scanGoodTarget живых — к точному замеру топа"); break }
                     if (measured >= maxScan) { onPhase("Просканировано $measured, годных ${goodOnes.size} — к точному замеру топа"); break }
                     // Активный уже измерен ПОЛНЫМ выше — минимально не перемеряем (число не затирается на «≈»); не в счёт.
                     if (activeServerKey != null && key(p) == activeServerKey) continue
@@ -230,7 +238,7 @@ object FullTestRunner {
                             connect(p)
                         }
                     }
-                    onPhase("Этап 2: быстрый замер $measured · годных ${goodOnes.size}/$targetTop · пробник ${ServerSpeedTester.activeProbeHost.ifBlank { "…" }} · подключён: ${connected?.let(::label) ?: "—"}")
+                    onPhase("Этап 2: замер $measured/${candidates.size} · живых ${goodOnes.size} · пробник ${ServerSpeedTester.activeProbeHost.ifBlank { "…" }} · подключён: ${connected?.let(::label) ?: "—"}")
                     emitProgress(measured, maxScan)
                     beat()   // Промпт 103: шаг прогресса — «пульс» для сторожа
                 }
