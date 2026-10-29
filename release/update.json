@@ -1,29 +1,29 @@
 {
   "_comment": "ОБРАЗЕЦ манифеста обновления (Промпт 70). В КАЖДЫЙ релиз кладётся вложением с именем update.json. Публичный API GitHub versionCode не отдаёт — обновлялка сравнивает версии ТОЛЬКО по versionCode отсюда (строго БОЛЬШЕ установленного). Перед публикацией: (1) versionCode/versionName должны совпасть с app/build.gradle.kts; (2) packageName = имя пакета приложения — обновлялка проверяет, что релиз НАШ, до скачивания APK (Промпт 121.C); (3) в каждый sha256 подставить РЕАЛЬНУЮ SHA-256 собранного APK (shasum -a 256 <файл>); (4) имена в fileName — КОНТРАКТ с обновлялкой (…-arm64-v8a.apk и т.д.), совпадают с именами вложений релиза. Схему имён вложений НЕ меняем при ребренде/переименовании репозитория (Промпт 106.E/121.E). Релиз публиковать ПОЛНЫМ (не draft, не prerelease) — иначе releases/latest его не отдаёт. КАВЫЧКИ в notes — ТОЛЬКО ёлочки « », НЕ ASCII, иначе ломается JSON (грабля 0.58). ВСЕГДА jq empty update.json перед заливкой.",
-  "versionCode": 59,
-  "versionName": "0.62 beta",
+  "versionCode": 60,
+  "versionName": "0.63 beta",
   "packageName": "com.picosoft.xrayproxydroid",
-  "notes": "Исправлен лишний расход батареи. • После каждого переключения сервера в фоне оставался лишний опрос счётчика трафика (раз в 2,5 с) — за сутки их набирались десятки. Теперь опрос всегда один. • Убрана кнопка «Очистить старые скачанные APK»: старые файлы обновлений удаляются автоматически при запуске. • Плюс всё из 0.61.",
+  "notes": "Обновление внутри приложения стало надёжнее. • Кнопка «Скачать и установить» больше не молчит: если с момента проверки вышла версия новее, приложение само перепроверяет и скачивает самую свежую (раньше скачивание могло тихо оборваться с ошибкой 404). • Результат скачивания показывается сразу под кнопкой. • Плюс всё из 0.62.",
   "artifacts": [
     {
       "abi": "arm64-v8a",
-      "fileName": "XrayProxyDroid-0.62-arm64-v8a.apk",
-      "sha256": "ff791c97e761e7dffbed913ba96327d1403d403d770915bcc6ee2cee3563ef66"
+      "fileName": "XrayProxyDroid-0.63-arm64-v8a.apk",
+      "sha256": "bb433a6d944b3b71eec42986deb67e2e8b450f5c5609556dd8dc564b33554151"
     },
     {
       "abi": "armeabi-v7a",
-      "fileName": "XrayProxyDroid-0.62-armeabi-v7a.apk",
-      "sha256": "8940b9d0b377b1f3ada24cb1def12712bb3b354b11cc9dd8e1757bf64caa9f2f"
+      "fileName": "XrayProxyDroid-0.63-armeabi-v7a.apk",
+      "sha256": "cf523dc4c1d76f6600e5163aead714793e8d176e71647e384e1be562a7b8b6b0"
     },
     {
       "abi": "x86_64",
-      "fileName": "XrayProxyDroid-0.62-x86_64.apk",
-      "sha256": "a26ca1ecdd5b0f13c7549865f63d2f904767f49dc0c8d4073c2c892b4effc24e"
+      "fileName": "XrayProxyDroid-0.63-x86_64.apk",
+      "sha256": "a65bf98ca566098e2a3ddc939ce373698b602aebc1affba7dac7e751f947ec66"
     },
     {
       "abi": "universal",
-      "fileName": "XrayProxyDroid-0.62-universal.apk",
-      "sha256": "d5cd9b2e1fe9d512dff615d415ce5c54521cf426785da3fc600dfa7982e11a51"
+      "fileName": "XrayProxyDroid-0.63-universal.apk",
+      "sha256": "0135299a82fec0ffa3e81927483a5b940897932b390eaf4018ca949f65a08fe9"
     }
   ]
 }
