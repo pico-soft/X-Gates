@@ -76,12 +76,7 @@ object ServerSpeedTester {
         val now = System.currentTimeMillis()
         chosenProbe?.let { if (now - chosenProbeAtMs < PROBE_PICK_TTL_MS) return it }
         val verbose = SettingsStore.current().verboseLogs
-        val saved = SettingsStore.current().speedProbeUrl
-        val candidates = buildList {
-            if (saved.isNotBlank() && !saved.contains("tele2")) add(saved)   // кастомный юзера, но НЕ мёртвый tele2
-            addAll(fallbackProbes)
-        }.distinct()
-        for (cand in candidates) {
+        for (cand in tunnelProbes()) {
             val got = runCatching { downloadSome(cand, null, PROBE_DIRECT_TARGET_BYTES, PROBE_DIRECT_TIMEOUT_MS) }.getOrDefault(0L)
             if (got >= PROBE_ALIVE_MIN_BYTES) {
                 chosenProbe = cand; chosenProbeAtMs = now; activeProbeHost = hostOf(cand)
@@ -96,6 +91,20 @@ object ServerSpeedTester {
     }
 
     private fun hostOf(url: String): String = runCatching { URL(url).host }.getOrDefault(url)
+
+    /**
+     * Пробники для замера ЧЕРЕЗ туннель, по приоритету: кастомный speedProbeUrl юзера (но НЕ мёртвый tele2-дефолт),
+     * затем глобальные [fallbackProbes]. Раньше проверка АКТИВНОГО туннеля/живости брала listOf(speedProbeUrl) — у всех
+     * со старым дефолтом первым шёл tele2, через туннель мёртвый: каждая проверка теряла ~4.5с на его таймауте
+     * (поле, Huawei 2026-10-30: монитор перебирал серверы медленнее). Фикс f8ba302 закрыл только полный тест.
+     */
+    private fun tunnelProbes(): List<String> {
+        val saved = SettingsStore.current().speedProbeUrl
+        return buildList {
+            if (saved.isNotBlank() && !saved.contains("tele2")) add(saved)
+            addAll(fallbackProbes)
+        }.distinct()
+    }
 
     // Приёмники ОТДАЧИ (POST). Промпт 104.B (проверено ФАКТОМ, POST 2МБ): cloudflare __up отвечает 200 за ~1.2с
     // (принимает тело и сразу отвечает) → БЫСТРЫЙ, ставим первым. tele2/upload.php отвечает 200 напрямую, но
@@ -270,7 +279,7 @@ object ServerSpeedTester {
         val verbose = SettingsStore.current().verboseLogs
         fun log(msg: String) { if (verbose) Log.i(TAG, msg) }
         val name = profile.remarks.ifBlank { profile.address }
-        val probes = (listOf(SettingsStore.current().speedProbeUrl) + fallbackProbes).distinct()
+        val probes = tunnelProbes()
         concurrentMeasures.incrementAndGet()
         try {
             val port = freePort() ?: return false
@@ -624,7 +633,7 @@ object ServerSpeedTester {
         XrayController.ensureEnv(context)
         val s = SettingsStore.current()
         val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", XrayConfig.SOCKS_PORT))
-        val probes = (listOf(s.speedProbeUrl) + fallbackProbes).distinct()
+        val probes = tunnelProbes()
         val cap = s.activeMeasureBudgetBytes.coerceAtLeast(STAGED_BUDGETS.first())
         val stages = STAGED_BUDGETS.filter { it <= cap }.ifEmpty { listOf(STAGED_BUDGETS.first()) }
         var testBytes = 0L
@@ -655,7 +664,7 @@ object ServerSpeedTester {
         XrayController.ensureEnv(context)
         val s = SettingsStore.current()
         val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", XrayConfig.SOCKS_PORT))
-        val probes = (listOf(s.speedProbeUrl) + fallbackProbes).distinct()
+        val probes = tunnelProbes()
         var testBytes = 0L
         for (probe in probes) {
             if (measureAborted) break
@@ -672,7 +681,7 @@ object ServerSpeedTester {
     fun measureActiveDownloadMbps(context: Context): Double {
         XrayController.ensureEnv(context)
         val s = SettingsStore.current()
-        val probes = (listOf(s.speedProbeUrl) + fallbackProbes).distinct()
+        val probes = tunnelProbes()
         var testBytes = 0L
         for (probe in probes) {
             if (measureAborted) break   // Промпт 101.B: отмена — не перебираем оставшиеся пробники
