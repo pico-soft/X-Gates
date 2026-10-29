@@ -20,8 +20,9 @@ import java.net.Proxy
  *
  * Порядок: API releases/latest (через каскад) → вложение update.json (через каскад) → сравнить versionCode.
  * ЗАПАСНОЙ путь (76.E): если API недоступен ИЛИ вложение не скачалось — тянем update.json НАПРЯМУЮ по
- * предсказуемому адресу `releases/latest/download/update.json` (без API), APK-адреса строим как
- * `releases/latest/download/<файл>`. Порядок: сначала API (точнее), при неудаче — запасной.
+ * предсказуемому адресу `releases/latest/download/update.json` (без API), APK-адреса строим по тегу из его
+ * редиректа `releases/download/<тег>/<файл>` (запасные — `releases/latest/download/<файл>`). Порядок: сначала
+ * API (точнее), при неудаче — запасной.
  *
  * ПРИБОРЫ (76.B): каждый запрос логируется (тег UpdateChecker, гейт «Подробные логи») — итоговый host,
  * ступень каскада, HTTP-код, размер, класс исключения, цепочка редиректов; ошибка в UI типизирована
@@ -42,7 +43,15 @@ object UpdateChecker {
         val slug: String get() = "$owner/$repo"
         val apiLatest: String get() = "https://api.github.com/repos/$owner/$repo/releases/latest"
         val latestDownload: String get() = "https://github.com/$owner/$repo/releases/latest/download"
+        fun tagDownload(tag: String): String = "https://github.com/$owner/$repo/releases/download/$tag"
     }
+
+    /**
+     * Тег релиза, на который РЕАЛЬНО указал `releases/latest/download/…`: GitHub редиректит его на
+     * `releases/download/<тег>/…` — берём тег из цепочки редиректов. null — цепочки нет (напр. temp-инстанс).
+     */
+    internal fun tagFromRedirects(chain: List<String>): String? =
+        chain.firstNotNullOfOrNull { Regex("""/releases/download/([^/?#]+)/""").find(it)?.groupValues?.get(1) }
 
     /**
      * СПИСОК АДРЕСОВ (Промпт 121.B): сначала НОВЫЙ (репозиторий переименован в X-Gates), при неудаче —
@@ -167,8 +176,12 @@ object UpdateChecker {
             if (fb.ok) {
                 val manifest = runCatching { json.decodeFromString<UpdateManifest>(fb.result!!.body) }.getOrNull()
                     ?: return UpdateCheckResult.Error(UpdateErrorKind.MANIFEST_PARSE, "запасной скачан, но JSON не разобран")
+                // APK-адрес — ПО ТЕГУ релиза, а не «latest/download/<файл>»: тот ломается, как только выходит релиз
+                // новее — имя файла в манифесте старое, а latest уже ведёт на новый релиз → 404 (поле, Fold 0.58:
+                // сведения о 0.59 с утра, к вечеру вышли 0.60–0.62 → «Скачать и установить» молча падал на 404).
+                val tag = tagFromRedirects(fb.result?.redirectChain.orEmpty())
                 return compareByManifest(manifest, release = null, repo, via = "через запасной адрес · ${repo.slug}${tempNote(fb)}",
-                    assetUrl = { fn -> "${repo.latestDownload}/$fn" })
+                    assetUrl = { fn -> if (tag != null) "${repo.tagDownload(tag)}/$fn" else "${repo.latestDownload}/$fn" })
             }
 
             // ── всё не вышло → типизированная ошибка (77.C / 80.C) ──

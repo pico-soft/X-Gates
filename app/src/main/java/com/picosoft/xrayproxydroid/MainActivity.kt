@@ -3587,6 +3587,8 @@ private fun fmtUptime(ms: Long): String {
 }
 
 private val UPDATE_DATE_FMT get() = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.US)
+// «Скачать и установить» по проверке старше этого — сперва перепроверяем (сведения могли устареть).
+private const val UPDATE_RECHECK_MS = 10 * 60_000L
 
 /** Метрическая (мобильная) сеть — на ней спрашиваем согласие перед скачиванием ~50 МБ APK. */
 private fun isMeteredNetwork(context: Context): Boolean =
@@ -4357,6 +4359,28 @@ private fun UpdateCheckSection() {
         }.start()
     }
 
+    // Сведения о версии могли устареть: проверка была часы назад, а с тех пор вышли релизы новее (поле, Fold 0.58:
+    // утром нашлась 0.59, к вечеру вышла 0.62, старые адреса вели в 404). Поэтому перед скачиванием по давней
+    // проверке — перепроверяем и качаем СВЕЖУЮ версию. Перепроверка не удалась — качаем по прежним сведениям.
+    fun recheckThenDownload(stale: UpdateCheckResult.Available) {
+        if (checking || downloading) return
+        checking = true; message = null; readyFile = null
+        Thread {
+            val report = runCatching { UpdateChecker.check(context, manual = true) }.getOrNull()
+            // Неудачную перепроверку НЕ применяем — иначе кнопка «теряет» уже найденное обновление.
+            if (report != null && (report.result is UpdateCheckResult.Available || report.result is UpdateCheckResult.UpToDate))
+                UpdateStore.apply(context, report, System.currentTimeMillis())
+            activity.runOnUiThread {
+                checking = false
+                when (val fresh = report?.result) {
+                    is UpdateCheckResult.Available -> startDownload(fresh)
+                    is UpdateCheckResult.UpToDate -> message = "Уже установлена последняя версия."
+                    else -> startDownload(stale)
+                }
+            }
+        }.start()
+    }
+
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SettingsGroupLabel("Обновление")
         if (record.checkedAtMs > 0) {
@@ -4397,7 +4421,9 @@ private fun UpdateCheckSection() {
                 when {
                     checking || downloading -> {}
                     readyFile != null -> install(readyFile!!)
-                    avail != null -> startDownload(avail)
+                    avail != null ->
+                        if (System.currentTimeMillis() - record.checkedAtMs > UPDATE_RECHECK_MS) recheckThenDownload(avail)
+                        else startDownload(avail)
                     else -> startCheck()
                 }
             },
@@ -4411,6 +4437,12 @@ private fun UpdateCheckSection() {
                 avail != null -> ButtonLabel(UiIcon.PLAY, "Скачать и установить")
                 else -> ButtonLabel(UiIcon.REFRESH, "Проверить обновление")
             }
+        }
+
+        // Итог нажатия — СРАЗУ под кнопкой. Раньше был в самом низу блока, под длинным описанием версии, и уходил
+        // за край экрана: ошибка скачивания (поле, Fold: HTTP 404) выглядела как «кнопка не работает».
+        message?.let {
+            Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
         }
 
         // Кнопки «Очистить старые скачанные APK» (0.55, createDeleteRequest) больше нет — лишняя (ТЗ Elyor 2026-10-29):
@@ -4480,10 +4512,6 @@ private fun UpdateCheckSection() {
                 "Есть версия новее (метка ${u.tag}), но в релизе нет update.json — надёжно проверить и установить нельзя. Обновите вручную со страницы релизов.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error,
             )
-        }
-
-        message?.let {
-            Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
         }
     }
 }
