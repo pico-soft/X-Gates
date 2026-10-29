@@ -38,6 +38,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Тонкий foreground-сервис (как v2rayNG CoreProxyOnlyService, но без VPN):
@@ -47,7 +48,10 @@ import java.net.Socket
  */
 class XrayProxyService : Service() {
 
-    @Volatile private var polling = false
+    // Поколение опроса трафика: поток опроса живёт, пока текущее поколение — ЕГО. Старт берёт новое, стоп — инкремент.
+    // Был голый флаг polling — он тёк: старый поток спит POLL_MS, а рестарт ядра при переключении сервера успевал
+    // снова поднять флаг → старый просыпался и продолжал. +1 вечный поток на каждое переключение (15 потоков за 4.5ч).
+    private val pollGeneration = AtomicLong(0)
 
     // Корутина автомониторинга. Живёт ТОЛЬКО когда монитор включён И туннель активен (реактивно).
     // Обработчик глушит НЕОБРАБОТАННЫЕ исключения фоновых корутин (монитор/обход/каскад) — фон не должен
@@ -379,7 +383,7 @@ class XrayProxyService : Service() {
                 ProxyState.update(running = false, label = label, serverKey = serverKey, message = "проверка маршрута (системный VPN)…")
             }
             applyVpnBypass()
-            polling = false   // остановить опрос прежнего туннеля при переключении сервера
+            stopTrafficPolling()   // остановить опрос прежнего туннеля при переключении сервера
             if (XrayController.isRunning) {
                 XrayController.queryTunnelDelta()?.let { TrafficTracker.addTunnel(it.first, it.second) }  // финал старого туннеля
                 XrayController.stop()   // авто-переключение сервера
@@ -436,7 +440,7 @@ class XrayProxyService : Service() {
         ourBinding = null
         SystemVpnState.reset()
         Thread {
-            polling = false
+            stopTrafficPolling()
             XrayController.queryTunnelDelta()?.let { TrafficTracker.addTunnel(it.first, it.second) }  // финальный замер туннеля
             XrayController.stop()
             TrafficTracker.onServiceStop()
@@ -481,7 +485,7 @@ class XrayProxyService : Service() {
         }
         ProxyState.update(running = false, label = label, serverKey = serverKey, message = "Пауза — жду Wi-Fi (мобильная сеть)", paused = true)
         Thread {
-            polling = false
+            stopTrafficPolling()
             runCatching { XrayController.queryTunnelDelta()?.let { TrafficTracker.addTunnel(it.first, it.second) } }
             runCatching { XrayController.stop() }
             TrafficTracker.onServiceStop()
@@ -530,13 +534,13 @@ class XrayProxyService : Service() {
     private fun startTrafficPolling() {
         TrafficTracker.attachContext(applicationContext)
         TrafficTracker.onServiceStart()
-        polling = true
+        val gen = pollGeneration.incrementAndGet()   // заодно гасит прежний поток, если стоп его не погасил
         LastServerStore.heartbeat(applicationContext)   // Промпт 115: отметить живость сразу при старте туннеля
         Thread {
             var lastHeartbeatMs = System.currentTimeMillis()
-            while (polling && XrayController.isRunning) {
+            while (pollGeneration.get() == gen && XrayController.isRunning) {
                 try { Thread.sleep(POLL_MS) } catch (e: InterruptedException) { break }
-                if (!polling) break
+                if (pollGeneration.get() != gen) break   // за время сна был стоп/рестарт — этот поток уже не наш
                 // Промпт 115: «пульс живости» раз в ~15с (не на каждый опрос — бережём запись prefs). На
                 // восстановлении после убийства простой ≈ now − последний пульс.
                 val nowMs = System.currentTimeMillis()
@@ -554,6 +558,11 @@ class XrayProxyService : Service() {
         }.start()
     }
 
+    /** Погасить поток опроса: его поколение устаревает, он выходит на ближайшем тике (≤ POLL_MS). */
+    private fun stopTrafficPolling() {
+        pollGeneration.incrementAndGet()
+    }
+
     private fun stopSelfAndForeground() {
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -561,7 +570,7 @@ class XrayProxyService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        polling = false
+        stopTrafficPolling()
         coreActive = false
         // ОБЯЗАТЕЛЬНО снять привязку процесса к сети — иначе приложение осталось бы прибито к сети и после стопа.
         runCatching { getSystemService(ConnectivityManager::class.java)?.bindProcessToNetwork(null) }
