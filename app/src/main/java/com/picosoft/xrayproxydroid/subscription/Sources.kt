@@ -79,6 +79,9 @@ data class SourcesFile(
     // (список уже «не пуст» из-за Yzewe) → на свежей установке оставался только Yzewe. Флаг гейтит разовый
     // back-add BLACK-дефолта (healMissingBlackDefault); после — не повторяем (уважаем удаление юзером).
     val blackDefaultHealed: Boolean = false,
+    // ВТОРОЙ BLACK-дефолт (igareck BLACK_SS+All, trojan-пул на 443) добавлен разово — свежим (в посеве) и
+    // существующим при обновлении (ensureBlackSs). Флаг не даёт ему вернуться после удаления пользователем.
+    val seededBlackSs: Boolean = false,
     val sources: List<SubSource> = emptyList(),
     val servers: List<ServerRecord> = emptyList(),
     // Промпт 85: СЫРОЙ ответ каждого источника (sourceId → тело). Позволяет ПЕРЕСОБРАТЬ реестр целиком из

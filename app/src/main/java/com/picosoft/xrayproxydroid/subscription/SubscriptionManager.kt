@@ -54,6 +54,12 @@ object SubscriptionManager {
     const val DEFAULT_SOURCE_URL = "https://raw.githack.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS_mobile.txt"
     const val DEFAULT_SOURCE_NAME = "Обход ограничений в РФ по-умолчанию"
 
+    /** ВТОРОЙ дефолт (igareck BLACK_SS+All): ДРУГОЙ пул — ~45 trojan-серверов, почти все на порту 443 (работают на
+     *  сетях, режущих нестандартные порты, напр. МегаФон). Добавлен, т.к. основной vless-пул часто деградирует
+     *  (мало живых); второй независимый пул удваивает кандидатов. Сеется ВКЛ, с тем же каскадом зеркал (igareck). */
+    const val BLACK_SS_URL = "https://raw.githack.com/igareck/vpn-configs-for-russia/main/BLACK_SS+All_RUS.txt"
+    const val BLACK_SS_NAME = "Обход в РФ — доп. пул (Trojan)"
+
     /** Дефолтная подписка «Yzewe» — ВКЛючена по умолчанию, добавляется всем (свежим и существующим при обновлении). */
     const val YZEWE_SOURCE_URL = "https://vpn.yzewe.ru/sub"
     const val YZEWE_SOURCE_NAME = "Yzewe"
@@ -118,8 +124,11 @@ object SubscriptionManager {
         // подтянет ближайший рефреш (автозапуск/«Самый быстрый»/авто раз в полчаса). На свежей — в trySeedDefaultSource.
         runCatching { ensureYzewe(context) }
         // Разовая починка бага посева (0.52–0.59): вернуть пропущенный igareck-дефолт (BLACK mobile) пострадавшим,
-        // у кого на свежей установке остался только Yzewe. Тело подтянет ближайший рефреш enabled-источников.
+        // у кого на свежей установке остался только Yzewe. ВАЖНО: ДО ensureBlackSs — иначе добавленный BLACK_SS
+        // ломает отпечаток «только Yzewe» и починка не сработает. Тело подтянет ближайший рефреш enabled-источников.
         runCatching { healMissingBlackDefault(context) }
+        // Второй BLACK-дефолт (trojan-пул на 443) существующим установкам — разово. Другой пул на случай деградации основного.
+        runCatching { ensureBlackSs(context) }
         // Промпт 85.E: самопроверка — неполные (осиротевшие) профили пересобрать из сырья + записать в журнал.
         runCatching { verifyAndHeal(context) }
         // Пр.136: восстановить статус посева для UI (переживает перезапуск) — чтобы карточка «не загрузилось»
@@ -171,11 +180,14 @@ object SubscriptionManager {
         }
         // Yzewe (ВКЛ) сеем ВМЕСТЕ с дефолтом — тело подтянет ближайший рефреш enabled-источников (автозапуск).
         val yzewe = SubSource(id = newId(), name = YZEWE_SOURCE_NAME, url = normalizeUrl(YZEWE_SOURCE_URL), enabled = true)
+        // Второй BLACK-дефолт (trojan-пул на 443, ВКЛ) — другой независимый пул на случай деградации основного.
+        val blackSs = SubSource(id = newId(), name = BLACK_SS_NAME, url = normalizeUrl(BLACK_SS_URL), enabled = true)
         SubscriptionStore.save(context, f2.copy(
             seededDefaultRuBypass = true,
             seededYzewe = true,
+            seededBlackSs = true,
             seedLastError = "",                                // успех — чистим прежнюю ошибку
-            sources = listOf(SubSource(id = id, name = DEFAULT_SOURCE_NAME, url = url, enabled = true), yzewe) + whiteSources,
+            sources = listOf(SubSource(id = id, name = DEFAULT_SOURCE_NAME, url = url, enabled = true), yzewe, blackSs) + whiteSources,
         ))
         importInto(context, id, cascade.result!!.body, "Дефолтная подписка (первый успешный фетч)")
         _seedStatus.value = SeedStatus(attempted = true, error = "")
@@ -223,6 +235,21 @@ object SubscriptionManager {
                       else file.sources + SubSource(id = newId(), name = YZEWE_SOURCE_NAME, url = url, enabled = true)
         SubscriptionStore.save(context, file.copy(seededYzewe = true, sources = sources))
         if (!already) Log.i(TAG, "добавлена дефолтная подписка Yzewe (ВКЛ)")
+    }
+
+    /** Второй BLACK-дефолт (igareck BLACK_SS+All, trojan-пул на 443): добавить РАЗОВО существующим установкам (флаг
+     *  seededBlackSs) — другой независимый пул на случай деградации основного. Как ensureYzewe: только для НЕпустого
+     *  списка (свежую сеет trySeedDefaultSource), уважает удаление юзером (флаг), дедуп по URL, тело подтянет рефреш. */
+    fun ensureBlackSs(context: Context) {
+        val file = SubscriptionStore.load(context)
+        if (file.seededBlackSs) return
+        if (file.sources.isEmpty()) return                     // свежая установка — засеет trySeedDefaultSource
+        val url = normalizeUrl(BLACK_SS_URL)
+        val already = file.sources.any { it.url == url }
+        val sources = if (already) file.sources
+                      else file.sources + SubSource(id = newId(), name = BLACK_SS_NAME, url = url, enabled = true)
+        SubscriptionStore.save(context, file.copy(seededBlackSs = true, sources = sources))
+        if (!already) Log.i(TAG, "добавлен второй BLACK-дефолт (trojan-пул на 443, ВКЛ)")
     }
 
     /**
@@ -509,16 +536,16 @@ object SubscriptionManager {
     /**
      * ЗЕРКАЛА одного и того же файла подписки igareck на разных CDN. ЗАЧЕМ: githack (на нём сидят зашитые дефолты)
      * нестабилен — даёт стойкие TLS-таймауты, и подписка «не обновляется», хотя файл жив на GitHub. Возвращаем тот
-     * же файл по нескольким CDN в порядке НАДЁЖНОСТИ (github raw → jsdelivr → githack → gitlab) — это один и тот же
+     * же файл по нескольким CDN в порядке НАДЁЖНОСТИ (github raw → jsdelivr → githack) — это один и тот же
      * контент, не разные подписки (дублей не создаёт: фетчим ТЕЛО, сам источник/URL в списке не меняем). Для НЕ-igareck
      * URL (Yzewe, пользовательские) возвращаем только сам URL — поведение ровно прежнее. */
     private fun mirrorUrls(url: String): List<String> {
         val rel = igareckRelPath(url) ?: return listOf(url)
+        // gitlab-зеркало убрано: его у автора НЕТ (HTTP 000, сверено 2026-10-29). Три рабочих CDN перекрывают отказы.
         return listOf(
             "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/$rel",
             "https://cdn.jsdelivr.net/gh/igareck/vpn-configs-for-russia@main/$rel",
             "https://raw.githack.com/igareck/vpn-configs-for-russia/main/$rel",
-            "https://gitlab.com/igareck/vpn-configs-for-russia/-/raw/main/$rel",
         ).distinct()
     }
 
