@@ -1,29 +1,29 @@
 {
   "_comment": "ОБРАЗЕЦ манифеста обновления (Промпт 70). В КАЖДЫЙ релиз кладётся вложением с именем update.json. Публичный API GitHub versionCode не отдаёт — обновлялка сравнивает версии ТОЛЬКО по versionCode отсюда (строго БОЛЬШЕ установленного). Перед публикацией: (1) versionCode/versionName должны совпасть с app/build.gradle.kts; (2) packageName = имя пакета приложения — обновлялка проверяет, что релиз НАШ, до скачивания APK (Промпт 121.C); (3) в каждый sha256 подставить РЕАЛЬНУЮ SHA-256 собранного APK (shasum -a 256 <файл>); (4) имена в fileName — КОНТРАКТ с обновлялкой (…-arm64-v8a.apk и т.д.), совпадают с именами вложений релиза. Схему имён вложений НЕ меняем при ребренде/переименовании репозитория (Промпт 106.E/121.E). Релиз публиковать ПОЛНЫМ (не draft, не prerelease) — иначе releases/latest его не отдаёт. КАВЫЧКИ в notes — ТОЛЬКО ёлочки « », НЕ ASCII, иначе ломается JSON (грабля 0.58). ВСЕГДА jq empty update.json перед заливкой.",
-  "versionCode": 50,
-  "versionName": "0.59 beta",
+  "versionCode": 51,
+  "versionName": "0.60 beta",
   "packageName": "com.picosoft.xrayproxydroid",
-  "notes": "Режим «Только Wi-Fi». • На мобильной сети туннель встаёт на паузу и сам поднимается, как только появится Wi-Fi — экономит мобильный трафик. • На Wi-Fi работает как обычно: на зарядке по полной, на батарее экономнее. • Включается в Настройки → Экономия трафика, независимо от «Режима экономии». • Плюс всё из 0.58 (два списка серверов: «Живые» и «Ранее измеренные») и ранее.",
+  "notes": "Исправлен набор серверов на новой установке. • Раньше на свежеустановленном приложении могла появиться только одна подписка (Yzewe), а основной список серверов и белые списки не подхватывались. • Теперь при первом запуске добавляются все источники по умолчанию, а на уже затронутых установках основной список возвращается сам при обновлении. • Плюс всё из 0.59 (режим «Только Wi-Fi») и ранее.",
   "artifacts": [
     {
       "abi": "arm64-v8a",
-      "fileName": "XrayProxyDroid-0.59-arm64-v8a.apk",
-      "sha256": "5fc5d05bf8f1a3744cb64834ef8b731f13c736a54986b6ceb3bcb589888ecd68"
+      "fileName": "XrayProxyDroid-0.60-arm64-v8a.apk",
+      "sha256": "7f80cd45ed63d5cd083b913bfebe30688094d9c6ef41d5a7aa0749ac218821ff"
     },
     {
       "abi": "armeabi-v7a",
-      "fileName": "XrayProxyDroid-0.59-armeabi-v7a.apk",
-      "sha256": "465e442f6bec3a1c572bae191bfc3177c2d24fa76de44398f7d2db42f56462ef"
+      "fileName": "XrayProxyDroid-0.60-armeabi-v7a.apk",
+      "sha256": "6e9616f9f2b98d4675123aba0bceb0eafc4ebe6f65c0dd827dd3da9598e097eb"
     },
     {
       "abi": "x86_64",
-      "fileName": "XrayProxyDroid-0.59-x86_64.apk",
-      "sha256": "c0b4793d0accbcc3de1c82d19afb5741e250a52130309766c2d81dff75cdb42a"
+      "fileName": "XrayProxyDroid-0.60-x86_64.apk",
+      "sha256": "ac692160ebbd8a61397f5fe9521a693a0d15573eb0acf13ee83407d3b0239123"
     },
     {
       "abi": "universal",
-      "fileName": "XrayProxyDroid-0.59-universal.apk",
-      "sha256": "7f4e7074c4fb2863d6d922ece5f4afb55daa66f57d99a157d98d334841c1f856"
+      "fileName": "XrayProxyDroid-0.60-universal.apk",
+      "sha256": "e48437f09459286bc6633678ef29bdece4f8885d043b458961471ec10568ddfd"
     }
   ]
 }
