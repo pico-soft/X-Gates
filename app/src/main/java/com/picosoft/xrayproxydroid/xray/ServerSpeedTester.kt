@@ -41,16 +41,61 @@ object ServerSpeedTester {
     // Warmup/окно/пул/URL пробника — теперь в [SettingsStore], не константами здесь.
 
     /**
-     * ЗАПАСНЫЕ пробники ТУННЕЛЯ (через прокси) — если пользовательский URL не отдал mbps>0.
-     * Диагностика (лог http=): Cloudflare __down → 403; Hetzner https → SSL-fail; cachefly → 200.
-     * HTTP-мирроры первыми (без TLS-through-tunnel проблем). Первый пробник — из настроек.
+     * ТЗ Elyor: пробники замера — ГЛОБАЛЬНО достижимые (и из РФ НАПРЯМУЮ, и из-за рубежа через туннель). tele2
+     * УБРАН: он RU-only и через туннель отдаёт http=000/таймаут (сверено фактом 2026-10-29 через SOCKS рабочего
+     * сервера), из-за чего быстрый замер (1 пробник=tele2) падал у ВСЕХ → «годных 0», хотя серверы живы.
+     * Cloudflare anycast — первый (достижим отовсюду); `__down?bytes=N` отдаёт РОВНО N байт (не гигабайт — читаем
+     * только бюджет замера, N лишь «длиннее окна»). ovh/thinkbroadband — фоллбэки (EU/UK, тоже глобальные).
+     * Порядок = приоритет выбора: directlyReachableProbe берёт ПЕРВЫЙ, что зафетчился НАПРЯМУЮ (из РФ).
      */
     private val fallbackProbes = listOf(
-        "http://speedtest.tele2.net/1GB.zip",                 // 1 ГБ — заведомо больше окна даже на 170 Мбит (нет eof)
-        "http://ipv4.download.thinkbroadband.com/1GB.zip",    // 1 ГБ, открытый speedtest-миррор
-        "https://proof.ovh.net/files/1Gb.dat",                // OVH https, 1 ГБ
-        "http://speedtest.tele2.net/100MB.zip",               // 100 МБ — запас (eof теперь валиден, мерим по факт. окну)
+        "https://speed.cloudflare.com/__down?bytes=20000000",  // Cloudflare anycast — N байт по запросу (не гигабайт)
+        "https://proof.ovh.net/files/1Gb.dat",                 // OVH (EU) https — глобальный speedtest-миррор
+        "http://ipv4.download.thinkbroadband.com/1GB.zip",     // thinkbroadband (UK) — открытый speedtest-миррор
     )
+
+    // Выбранный пробник (кэш): через него МЕРИМ туннели, подтверждён ПРЯМЫМ фетчем из РФ. Пере-выбираем по TTL.
+    @Volatile private var chosenProbe: String? = null
+    @Volatile private var chosenProbeAtMs: Long = 0L
+    private const val PROBE_PICK_TTL_MS = 90_000L            // сеть могла смениться — пере-выбирать не чаще
+    private const val PROBE_DIRECT_TARGET_BYTES = 24 * 1024L
+    private const val PROBE_DIRECT_TIMEOUT_MS = 6_000
+
+    /** Для UI/лога: host пробника, через который сейчас меряем (виден в фазах теста). */
+    @Volatile var activeProbeHost: String = ""
+        private set
+
+    /**
+     * ТЗ Elyor: выбрать пробник для замера туннелей — тот, что ЗАФЕТЧИЛСЯ НАПРЯМУЮ (из РФ, без туннеля) из списка
+     * ГЛОБАЛЬНЫХ кандидатов (достижимых и из-за рубежа). Проверяем по очереди ПРЯМЫМ коннектом (proxy=null); первый
+     * отдавший байты — выбран. СНАЧАЛА фетчим напрямую, ПОТОМ им меряем туннели → провал замера = вина туннеля, а не
+     * мёртвого пробника. Кэш на [PROBE_PICK_TTL_MS]. Уважаем КАСТОМНЫЙ speedProbeUrl юзера (кроме мёртвого tele2-дефолта)
+     * — он идёт первым кандидатом. Ни один не отдал напрямую (нет интернета) → первый глобальный (не кэшируем).
+     */
+    fun directlyReachableProbe(context: Context): String {
+        val now = System.currentTimeMillis()
+        chosenProbe?.let { if (now - chosenProbeAtMs < PROBE_PICK_TTL_MS) return it }
+        val verbose = SettingsStore.current().verboseLogs
+        val saved = SettingsStore.current().speedProbeUrl
+        val candidates = buildList {
+            if (saved.isNotBlank() && !saved.contains("tele2")) add(saved)   // кастомный юзера, но НЕ мёртвый tele2
+            addAll(fallbackProbes)
+        }.distinct()
+        for (cand in candidates) {
+            val got = runCatching { downloadSome(cand, null, PROBE_DIRECT_TARGET_BYTES, PROBE_DIRECT_TIMEOUT_MS) }.getOrDefault(0L)
+            if (got >= PROBE_ALIVE_MIN_BYTES) {
+                chosenProbe = cand; chosenProbeAtMs = now; activeProbeHost = hostOf(cand)
+                if (verbose) Log.i(TAG, "пробник замера ВЫБРАН (зафетчился НАПРЯМУЮ из РФ): ${hostOf(cand)} ($got Б)")
+                return cand
+            }
+            if (verbose) Log.i(TAG, "пробник ${hostOf(cand)} НЕ фетчится напрямую — пробую следующий")
+        }
+        // ни один напрямую (нет интернета?) — первый глобальный, кэш НЕ ставим (пере-проверим скоро)
+        activeProbeHost = hostOf(fallbackProbes.first())
+        return fallbackProbes.first()
+    }
+
+    private fun hostOf(url: String): String = runCatching { URL(url).host }.getOrDefault(url)
 
     // Приёмники ОТДАЧИ (POST). Промпт 104.B (проверено ФАКТОМ, POST 2МБ): cloudflare __up отвечает 200 за ~1.2с
     // (принимает тело и сразу отвечает) → БЫСТРЫЙ, ставим первым. tele2/upload.php отвечает 200 напрямую, но
@@ -151,7 +196,10 @@ object ServerSpeedTester {
         XrayController.ensureEnv(context)
         val verbose = SettingsStore.current().verboseLogs
         fun log(msg: String) { if (verbose) Log.i(TAG, msg) }
-        val probes = (listOf(SettingsStore.current().speedProbeUrl) + fallbackProbes).distinct().take(maxProbes.coerceAtLeast(1))
+        // ТЗ Elyor: мерим туннель ТОЛЬКО пробником, подтверждённым ПРЯМЫМ фетчем из РФ (и глобально достижимым — значит
+        // и из-за рубежа через туннель). Так провал замера = вина ТУННЕЛЯ, а не мёртвого пробника (был баг: tele2 как
+        // единственный пробник быстрого замера мёртв через туннель → «годных 0» у живых серверов). maxProbes игнорируем.
+        val probes = listOf(directlyReachableProbe(context))
 
         val name = profile.remarks.ifBlank { profile.address }
         val warmupBudget = warmupBudgetOverride ?: SettingsStore.current().speedWarmupBudgetBytes
@@ -257,10 +305,10 @@ object ServerSpeedTester {
         }
     }
 
-    /** Скачать до [targetBytes] через socks-proxy с [timeoutMs]. Возвращает фактически принятые байты. */
-    private fun downloadSome(probe: String, proxy: Proxy, targetBytes: Long, timeoutMs: Int): Long {
+    /** Скачать до [targetBytes] через socks-proxy (или НАПРЯМУЮ при proxy=null) с [timeoutMs]. Возвращает принятые байты. */
+    private fun downloadSome(probe: String, proxy: Proxy?, targetBytes: Long, timeoutMs: Int): Long {
         return try {
-            val conn = (URL(probe).openConnection(proxy) as HttpURLConnection).apply {
+            val conn = ((if (proxy != null) URL(probe).openConnection(proxy) else URL(probe).openConnection()) as HttpURLConnection).apply {
                 connectTimeout = CONNECT_TIMEOUT_MS
                 readTimeout = timeoutMs
                 setRequestProperty("User-Agent", "v2rayNG/1.8.0")

@@ -230,7 +230,7 @@ object FullTestRunner {
                             connect(p)
                         }
                     }
-                    onPhase("Этап 2: быстрый замер $measured · годных ${goodOnes.size}/$targetTop · подключён: ${connected?.let(::label) ?: "—"}")
+                    onPhase("Этап 2: быстрый замер $measured · годных ${goodOnes.size}/$targetTop · пробник ${ServerSpeedTester.activeProbeHost.ifBlank { "…" }} · подключён: ${connected?.let(::label) ?: "—"}")
                     emitProgress(measured, maxScan)
                     beat()   // Промпт 103: шаг прогресса — «пульс» для сторожа
                 }
