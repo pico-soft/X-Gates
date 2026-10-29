@@ -74,6 +74,11 @@ data class SourcesFile(
     // Дефолтную подписку «Yzewe» (ВКЛ) добавляем разово каждому — на свежую установку и существующим при
     // обновлении. Флаг не даёт ей вернуться после удаления пользователем (как seededDefaultRuBypass выше).
     val seededYzewe: Boolean = false,
+    // Разовая починка бага посева (0.52–0.59): ensureYzewe добавлял Yzewe в ПУСТОЙ список РАНЬШЕ, чем
+    // trySeedDefaultSource успевал засеять дефолт → посев igareck-дефолта (BLACK mobile) + белых ПРОПУСКАЛСЯ
+    // (список уже «не пуст» из-за Yzewe) → на свежей установке оставался только Yzewe. Флаг гейтит разовый
+    // back-add BLACK-дефолта (healMissingBlackDefault); после — не повторяем (уважаем удаление юзером).
+    val blackDefaultHealed: Boolean = false,
     val sources: List<SubSource> = emptyList(),
     val servers: List<ServerRecord> = emptyList(),
     // Промпт 85: СЫРОЙ ответ каждого источника (sourceId → тело). Позволяет ПЕРЕСОБРАТЬ реестр целиком из

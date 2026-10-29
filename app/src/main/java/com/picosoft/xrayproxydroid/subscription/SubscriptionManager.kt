@@ -117,6 +117,9 @@ object SubscriptionManager {
         // Yzewe: добавить дефолтную подписку (ВКЛ) существующим установкам — разово (флаг seededYzewe). Тела
         // подтянет ближайший рефреш (автозапуск/«Самый быстрый»/авто раз в полчаса). На свежей — в trySeedDefaultSource.
         runCatching { ensureYzewe(context) }
+        // Разовая починка бага посева (0.52–0.59): вернуть пропущенный igareck-дефолт (BLACK mobile) пострадавшим,
+        // у кого на свежей установке остался только Yzewe. Тело подтянет ближайший рефреш enabled-источников.
+        runCatching { healMissingBlackDefault(context) }
         // Промпт 85.E: самопроверка — неполные (осиротевшие) профили пересобрать из сырья + записать в журнал.
         runCatching { verifyAndHeal(context) }
         // Пр.136: восстановить статус посева для UI (переживает перезапуск) — чтобы карточка «не загрузилось»
@@ -209,12 +212,44 @@ object SubscriptionManager {
     fun ensureYzewe(context: Context) {
         val file = SubscriptionStore.load(context)
         if (file.seededYzewe) return
+        // КРИТИЧНО (баг посева 0.52–0.59): на СВЕЖЕЙ установке (пустой список) НЕ добавляем Yzewe здесь —
+        // иначе trySeedDefaultSource увидит «список не пуст» и пропустит посев igareck-дефолта (BLACK) + белых,
+        // оставив ТОЛЬКО Yzewe. Свежую установку целиком сеет trySeedDefaultSource (там Yzewe идёт ВМЕСТЕ с BLACK).
+        // ensureYzewe — ТОЛЬКО back-add для СУЩЕСТВУЮЩИХ установок (как ensureWhiteListSources, тот же гейт).
+        if (file.sources.isEmpty()) return
         val url = normalizeUrl(YZEWE_SOURCE_URL)
         val already = file.sources.any { it.url == url }
         val sources = if (already) file.sources
                       else file.sources + SubSource(id = newId(), name = YZEWE_SOURCE_NAME, url = url, enabled = true)
         SubscriptionStore.save(context, file.copy(seededYzewe = true, sources = sources))
         if (!already) Log.i(TAG, "добавлена дефолтная подписка Yzewe (ВКЛ)")
+    }
+
+    /**
+     * РАЗОВАЯ ПОЧИНКА бага посева (0.52–0.59): из-за гонки ensureYzewe→trySeedDefaultSource на СВЕЖЕЙ установке
+     * оставался ТОЛЬКО Yzewe — igareck-дефолт (BLACK mobile) НЕ посеялся, хотя seededDefaultRuBypass=true. Чиним
+     * у ПОСТРАДАВШИХ: если установка явно авто-засеяна (seededYzewe && seededDefaultRuBypass), список НЕ пуст, но
+     * BLACK-дефолта в нём НЕТ — back-add BLACK (ВКЛ); тело подтянет ближайший рефреш. Флаг [blackDefaultHealed] →
+     * ровно один раз (уважаем последующее удаление юзером). На чистых/правильно-засеянных установках — no-op.
+     */
+    fun healMissingBlackDefault(context: Context) {
+        val file = SubscriptionStore.load(context)
+        if (file.blackDefaultHealed) return
+        val blackUrl = normalizeUrl(DEFAULT_SOURCE_URL)
+        val hasBlack = file.sources.any { it.url == blackUrl }
+        // ТОЧНЫЙ отпечаток бага: авто-засеяно (seededYzewe && seededDefaultRuBypass), BLACK-дефолта нет, и
+        // ЕДИНСТВЕННАЯ «настоящая» (не-белая) подписка — это ровно Yzewe. Так не трогаем того, кто ДОБАВИЛ свои
+        // подписки и удалил дефолт НАМЕРЕННО (у него среди не-белых будет не только Yzewe) — уважаем его выбор.
+        val nonWhite = file.sources.filter { !it.whiteList }
+        val onlyYzewe = nonWhite.size == 1 && nonWhite[0].url == normalizeUrl(YZEWE_SOURCE_URL)
+        val affected = file.seededYzewe && file.seededDefaultRuBypass && !hasBlack && onlyYzewe
+        if (!affected) {
+            SubscriptionStore.save(context, file.copy(blackDefaultHealed = true))
+            return
+        }
+        val black = SubSource(id = newId(), name = DEFAULT_SOURCE_NAME, url = blackUrl, enabled = true)
+        SubscriptionStore.save(context, file.copy(blackDefaultHealed = true, sources = file.sources + black))
+        Log.i(TAG, "починка: back-add igareck-дефолта (BLACK mobile) — был пропущен из-за гонки посева Yzewe")
     }
 
     /** Пр.140: id источников белого списка. */
