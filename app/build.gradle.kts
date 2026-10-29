@@ -13,8 +13,14 @@ val localProps = Properties().apply {
     if (f.exists()) f.inputStream().use { load(it) }
 }
 fun releaseProp(name: String): String? = localProps.getProperty(name) ?: System.getenv(name)
-val releaseStorePath: String? = releaseProp("RELEASE_STORE_FILE")
-val hasReleaseKey: Boolean = releaseStorePath != null && file(releaseStorePath).exists()
+// Путь в local.properties абсолютный и машинный (Mac: /Users/zodchy/…), а сам файл синхронизируется между Mac и
+// Ubuntu-сервером — общий для обеих машин. Поэтому, если прописанного пути на ЭТОЙ машине нет, берём ключ из
+// _Secrets/ корня проекта (папка синхронизируется вместе с проектом, в git не попадает).
+val releaseStoreFile: File? = listOfNotNull(
+    releaseProp("RELEASE_STORE_FILE")?.let { file(it) },
+    rootProject.file("_Secrets/xrayproxydroid.jks"),
+).firstOrNull { it.exists() }
+val hasReleaseKey: Boolean = releaseStoreFile != null
 
 android {
     namespace = "com.picosoft.xrayproxydroid"
@@ -50,7 +56,7 @@ android {
     signingConfigs {
         create("release") {
             if (hasReleaseKey) {
-                storeFile = file(releaseStorePath!!)
+                storeFile = releaseStoreFile
                 storePassword = releaseProp("RELEASE_STORE_PASSWORD")
                 keyAlias = releaseProp("RELEASE_KEY_ALIAS")
                 keyPassword = releaseProp("RELEASE_KEY_PASSWORD")
