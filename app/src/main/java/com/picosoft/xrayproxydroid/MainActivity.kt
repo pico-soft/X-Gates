@@ -1495,23 +1495,24 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
 
     // ДВА ВИДИМЫХ СПИСКА (ТЗ Elyor 2026-10-15) через классификатор [ServerFilter.tier] по СВЕЖЕСТИ замера:
     //  • «Живые серверы» (список 1)      = tier LIVE: живой пинг + измеренная скорость>0 + замер СВЕЖИЙ («отозвался
-    //                                       и померился»). ИСКЛЮЧЕНИЕ: активный подключённый сервер ВСЕГДА тут (его
-    //                                       живость доказана туннелем, даже если temp-пинг подписки массово падает).
+    //                                       и померился»). ИСКЛЮЧЕНИЕ: активный подключённый сервер тут, КОГДА связь
+    //                                       через него подтверждена фактом (даже если temp-пинг подписки падает).
     //  • «Ранее измеренные» (список 2)   = tier PREVIOUS: пинг жив + скорость>0, но замер СТАРЫЙ (мерили раньше).
     //  • нет пинга / пинг-без-скорости   = tier NONE → только во «Все серверы».
     // nowMs фиксируем на проход рекомпозиции (стабильная граница свежести); обновляется при reloadServers/изменении state.
     val nowMs = System.currentTimeMillis()
     fun tierOf(p: ServerProfile): ServerFilter.Tier =
         ServerFilter.tier(p, effPing(p), effSpeed(p), effSpeedAt(p), nowMs, settings, blocklist)
-    val alive = shown.filter { p ->
-        tierOf(p) == ServerFilter.Tier.LIVE ||
-            (proxy.running && proxy.serverKey == SubscriptionManager.serverKey(p))
-    }
-    // Список 2: ранее измеренные (замер устарел), кроме тех, что уже попали в «Живые» (в т.ч. активный).
-    val prevMeasured = shown.filter { p ->
-        tierOf(p) == ServerFilter.Tier.PREVIOUS &&
-            !(proxy.running && proxy.serverKey == SubscriptionManager.serverKey(p))
-    }
+    // Активный — в «Живых», только когда связь через НЕГО подтверждена фактом (внешний IP через его туннель) и сейчас
+    // не идёт восстановление. Раньше был там ВСЕГДА — и во время перебора в «Живых» висел непроверенный, часто мёртвый
+    // сервер со старым замером (поле, Huawei 2026-10-30: «Другое 73», 0.3 Мбит/с 25 дн назад — «нашёлся один, и тот
+    // дохлый»). Плановая перепроверка (VERIFYING) рабочего сервера его из списка не выкидывает.
+    val activeProven = proxy.running && health.lastOkMs > 0 && health.serverKey == proxy.serverKey &&
+        health.phase != TunnelHealth.Phase.RECOVERING && health.phase != TunnelHealth.Phase.NO_SERVERS
+    fun isProvenActive(p: ServerProfile) = activeProven && proxy.serverKey == SubscriptionManager.serverKey(p)
+    val alive = shown.filter { p -> tierOf(p) == ServerFilter.Tier.LIVE || isProvenActive(p) }
+    // Список 2: ранее измеренные (замер устарел), кроме тех, что уже попали в «Живые» (в т.ч. подтверждённый активный).
+    val prevMeasured = shown.filter { p -> tierOf(p) == ServerFilter.Tier.PREVIOUS && !isProvenActive(p) }
 
     // ПРИБОРЫ по стоп-листу (Промпт 73.C): на КАЖДЫЙ пересчёт фильтра — подробный дамп (гейт «Подробные логи»,
     // тег Blocklist). Ключи эффекта = все входы фильтра, чтобы лог был на каждое реальное изменение.
