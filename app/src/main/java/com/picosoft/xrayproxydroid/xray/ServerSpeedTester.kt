@@ -368,6 +368,10 @@ object ServerSpeedTester {
                 if (res.bodyBytes > 0) TrafficTracker.addTest(res.bodyBytes.toLong())
                 log("«$name» fetchViaTempInstance http=${res.httpCode} bytes=${res.bodyBytes}")
                 return res
+            } catch (e: Exception) {
+                // Находка порта Windows №4: исключение startLoop (битый конфиг сервера — ядро не стартует) раньше летело
+                // наружу и обрывало ВЕСЬ каскад загрузки. Теперь это провал ОДНОГО кандидата: null → каскад берёт следующего.
+                log("«$name» fetchViaTempInstance ядро не стартовало: ${e.message}"); return null
             } finally {
                 try { core.stopLoop() } catch (e: Exception) { /* ignore */ }
             }
