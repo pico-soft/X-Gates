@@ -91,6 +91,7 @@ object JsonConfigParser {
 
         var path: String? = null; var hostHeader: String? = null; var serviceName: String? = null
         var headerType: String? = null; var mode: String? = null; var seed: String? = null
+        var xhttpExtra: String? = null
         when (network) {
             "ws" -> st.optJSONObject("wsSettings")?.let { w ->
                 path = w.optString("path").ifBlank { null }
@@ -102,6 +103,8 @@ object JsonConfigParser {
             "xhttp", "splithttp" -> (st.optJSONObject("xhttpSettings") ?: st.optJSONObject("splithttpSettings"))?.let { x ->
                 path = x.optString("path").ifBlank { null }; hostHeader = x.optString("host").ifBlank { null }
                 mode = x.optString("mode").ifBlank { null }
+                // Как в ядре: при extra остальные поля xhttpSettings (кроме host/path/mode) не действуют.
+                xhttpExtra = XhttpExtra.sanitize((x.optJSONObject("extra") ?: x).toString())
             }
             "grpc" -> st.optJSONObject("grpcSettings")?.let { g -> serviceName = g.optString("serviceName").ifBlank { null } }
             "kcp", "mkcp" -> st.optJSONObject("kcpSettings")?.let { k ->
@@ -139,6 +142,7 @@ object JsonConfigParser {
             serviceName = serviceName,
             headerType = headerType,
             mode = mode,
+            xhttpExtra = xhttpExtra,
             seed = seed,
             publicKey = publicKey,
             shortId = shortId,

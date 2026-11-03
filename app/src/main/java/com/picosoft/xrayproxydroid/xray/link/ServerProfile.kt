@@ -81,6 +81,7 @@ data class ServerProfile(
     val serviceName: String? = null,   // grpc
     val headerType: String? = null,    // tcp http-header; mkcp тип обфускации заголовка (none/srtp/utp/…)
     val mode: String? = null,          // xhttp mode (auto/packet-up/stream-up/stream-one); пусто → ядро auto
+    @EncodeDefault(EncodeDefault.Mode.NEVER) val xhttpExtra: String? = null,   // xhttpSettings.extra, см. XhttpExtra
     val seed: String? = null,          // mkcp seed (обфускация)
 
     // --- reality ---

@@ -37,6 +37,7 @@ object VlessParser : LinkParser {
             serviceName = q["serviceName"],
             headerType = q["headerType"],
             mode = q["mode"],
+            xhttpExtra = XhttpExtra.sanitize(q["extra"]),
             seed = q["seed"],
             publicKey = q["pbk"],
             shortId = q["sid"],

@@ -2,6 +2,7 @@ package com.picosoft.xrayproxydroid.xray
 
 import com.picosoft.xrayproxydroid.xray.link.Protocol
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
+import com.picosoft.xrayproxydroid.xray.link.XhttpExtra
 import com.picosoft.xrayproxydroid.xray.link.normalizePinnedCerts
 import com.picosoft.xrayproxydroid.xray.link.normalizeStreamSecurity
 
@@ -188,6 +189,8 @@ object XrayConfigBuilder {
             """"host": ${j(host)}""",
         )
         if (!p.mode.isNullOrBlank()) fields += """"mode": ${j(p.mode)}"""
+        // Профиль лежит на диске, поэтому фильтр проходит и здесь, а не только при разборе ссылки.
+        XhttpExtra.forConfig(p.xhttpExtra, p.mode)?.let { fields += """"extra": $it""" }
         return "{ ${fields.joinToString(", ")} }"
     }
 
