@@ -1371,7 +1371,9 @@ object NetworkMonitor {
             // мало при пуле 400+: 10 живых с худшим пингом за его пределами → фон НИКОГДА не набирал цель и КАЖДЫЙ цикл
             // сканировал зря 60). 180 даёт набрать 10 → пул «здоров» → следующие циклы почти без замеров (стоп при needTop
             // годных рано). Т.е. 180 ДОЛГОСРОЧНО дешевле: сходится к 10 живых, а не крутит 60 вхолостую. Экономия — 30.
-            val maxScan = (if (s.trafficSaveMode) 30 else 180).coerceIn(targetTop, needMeasure.size)
+            // Нижняя граница — не больше размера пула: на малом пуле (needMeasure < targetTop) coerceIn(targetTop, size)
+            // бросал «empty range» → фон-рейтинг ничего не мерил (находка порта Windows №3).
+            val maxScan = (if (s.trafficSaveMode) 30 else 180).coerceIn(minOf(targetTop, needMeasure.size), needMeasure.size)
             // Этап А: МИНИМАЛЬНЫЙ замер (~100 КБ, 1 пробник/3с) от списка 2 к добору; СТОП при наборе needTop годных ИЛИ
             // maxScan. На tcping-пуле из сотен это ключ к «не 5 ГБ/сут»: мерим горстку, а не всё.
             val minimalByKey = LinkedHashMap<String, Double>()
