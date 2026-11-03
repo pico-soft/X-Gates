@@ -116,11 +116,14 @@ object NetworkMonitor {
     // ── ЗАРЯДКА: проверка чаще (решение Elyor 2026-10-31, как в Windows-версии) ──
     // Редкая проверка (раз в connectionCheckIntervalSec + grace 90 с ≈ 2–2,5 мин до переключения) — ради БАТАРЕИ. На
     // зарядке батарея не тратится: проверяем раз в 10 с, обрыв объявляем после 30 с тишины (перепроверка 10 с) →
-    // переключение ≈ 35 с. Цена проверки без трафика — пинг через temp-инстанс и ~3 КБ; с трафиком пользователя пинга
-    // нет. Экономия трафика / мобильная сеть — как на батарее (там важнее трафик).
+    // переключение ≈ 35 с. Цена проверки — TCP-коннект (tcping): трафика туннеля не тратит. Экономия трафика / мобильная
+    // сеть — как на батарее (там важнее трафик).
     internal const val AC_CHECK_MS = 10_000L
     internal const val AC_LIVENESS_GRACE_MS = 30_000L
     internal const val AC_GRACE_RECHECK_MS = 10_000L
+    // Запись пинга — это весь sources.json целиком: при цикле 10 с сотни КБ шесть раз в минуту всю ночь. Плашка берёт пинг
+    // из TunnelSpeed, реестру хватает раза в минуту (как на батарее); смену живой/мёртвый пишем сразу.
+    internal const val AC_PING_SAVE_MS = 60_000L
 
     /** Частые проверки: зарядка (см. [isCharging] — и при 100%), не экономия трафика и не мобильная сеть. */
     fun fastChecksOnCharger(app: Context, s: AppSettings): Boolean = fastChecks(isCharging(app), s, EconomyNet.lastKnownMobile)
@@ -135,6 +138,10 @@ object NetworkMonitor {
 
     internal fun graceMs(fast: Boolean): Long = if (fast) minOf(LIVENESS_GRACE_MS, AC_LIVENESS_GRACE_MS) else LIVENESS_GRACE_MS
     internal fun graceRecheckMs(fast: Boolean): Long = if (fast) minOf(GRACE_RECHECK_MS, AC_GRACE_RECHECK_MS) else GRACE_RECHECK_MS
+
+    /** Писать ли пинг активного в реестр: на батарее — каждый цикл, на зарядке — см. [AC_PING_SAVE_MS]. */
+    internal fun activePingSaveDue(fast: Boolean, pingMs: Int, lastSavedPingMs: Int, sinceSaveMs: Long): Boolean =
+        !fast || (pingMs >= 0) != (lastSavedPingMs >= 0) || sinceSaveMs >= AC_PING_SAVE_MS
     private const val IP_REFRESH_MS = 150_000L          // внешний IP тянем реже — ТОЛЬКО для показа на плашке
 
     // ── АДАПТИВНЫЙ ЗАМЕР ЖИВОСТИ (снижение трафика/батареи; ТЗ Elyor поверх Пр.150) ──
@@ -256,6 +263,8 @@ object NetworkMonitor {
         var graceRecheck = false           // Пр.150: в grace-окне перепроверяем чаще (короче интервал следующего цикла)
         var lastLivenessMeasureMs = 0L     // адаптивный замер: когда последний раз мерили СКОРОСТЬ активного (0 = ещё ни разу → мерим на первом цикле)
         var lastActivePingMs = -1          // адаптивный замер: пинг активного в прошлый раз (для детекта «скачка»)
+        var lastPingSavedMs = 0L           // зарядка: когда пинг активного последний раз писали в реестр
+        var lastPingSaved = -1             // зарядка: какой пинг тогда записали
         var lastFullCycleMs = 0L           // дебаунс паразитных пробуждений: когда последний раз делали ДОРОГУЮ работу цикла (пинг/IP/замер)
         var lastTopPingMs = 0L             // фоновый рейтинг: когда последний раз пинговали ТОП (держим его живость)
         var lastTopRateMs = 0L             // фоновый рейтинг: когда последний раз делали ПОЛНЫЙ замер топа (перестройка)
@@ -431,7 +440,10 @@ object NetworkMonitor {
             var activePm = -1
             if (curSrv0 != null) {
                 activePm = ServerTester.ping(app, curSrv0, PING_LIVENESS_TIMEOUT_MS).toInt()
-                SubscriptionManager.applyPingResults(app, mapOf(curKey0!! to activePm))   // плашка/список — реальный пинг
+                if (activePingSaveDue(fastChecksOnCharger(app, cur), activePm, lastPingSaved, now() - lastPingSavedMs)) {
+                    SubscriptionManager.applyPingResults(app, mapOf(curKey0!! to activePm))   // плашка/список — реальный пинг
+                    lastPingSaved = activePm; lastPingSavedMs = now()
+                }
                 if (activePm >= 0) TunnelSpeed.setPing(activePm, now(), curKey0!!)         // живой источник для плашки
             }
             if (userTrafficActive()) {

@@ -38,4 +38,14 @@ class ChargerChecksTest {
         assertFalse("экономия трафика", NetworkMonitor.fastChecks(charging = true, s = s.copy(trafficSaveMode = true), mobile = false))
         assertFalse("мобильная сеть", NetworkMonitor.fastChecks(charging = true, s = s, mobile = true))
     }
+
+    @Test fun active_ping_is_saved_every_cycle_on_battery_but_once_a_minute_on_charger() {
+        // Реестр пишется целиком: на зарядке цикл раз в 10 с, а файл не должен переписываться шесть раз в минуту.
+        assertTrue(NetworkMonitor.activePingSaveDue(fast = false, pingMs = 40, lastSavedPingMs = 40, sinceSaveMs = 10_000))
+        assertFalse(NetworkMonitor.activePingSaveDue(fast = true, pingMs = 45, lastSavedPingMs = 40, sinceSaveMs = 10_000))
+        assertTrue(NetworkMonitor.activePingSaveDue(fast = true, pingMs = 45, lastSavedPingMs = 40, sinceSaveMs = 60_000))
+        // Сервер умер или ожил — список должен узнать сразу.
+        assertTrue(NetworkMonitor.activePingSaveDue(fast = true, pingMs = -1, lastSavedPingMs = 40, sinceSaveMs = 10_000))
+        assertTrue(NetworkMonitor.activePingSaveDue(fast = true, pingMs = 40, lastSavedPingMs = -1, sinceSaveMs = 10_000))
+    }
 }
