@@ -848,7 +848,7 @@ private fun protoNetSec(p: ServerProfile): String =
 /**
  * Подпись-дискриминатор для ОДИНАКОВЫХ имён (иначе строки визуально неотличимы, выбрать нельзя).
  * Возвращает serverKey → «протокол · network · security». Только для имён, встречающихся >1 раза.
- * Если и эта подпись совпала внутри группы — добавляем последние 4 символа serverKey (гарантия уникальности).
+ * Если и эта подпись совпала внутри группы — добавляем адрес:порт (совпал и он — «#» + 4 hex хэша ключа).
  * Уникальные имена в map не попадают.
  */
 private fun buildDiscriminators(servers: List<ServerProfile>, bl: Blocklist): Map<String, String> {
@@ -860,11 +860,22 @@ private fun buildDiscriminators(servers: List<ServerProfile>, bl: Blocklist): Ma
         val ambiguous = group.map(::protoNetSec).toSet().size < group.size
         for (p in group) {
             val key = SubscriptionManager.serverKey(p)
-            result[key] = if (ambiguous) "${protoNetSec(p)} · ${key.takeLast(4)}" else protoNetSec(p)
+            if (!ambiguous) { result[key] = protoNetSec(p); continue }
+            // Находка порта Windows №9: раньше «гарантией» были 4 последних символа ключа, а ключ кончается пустыми
+            // полями («…|tcp||||||») → у одноимённых подпись «… · ||||», строки неотличимы. Теперь — адрес:порт;
+            // совпал и он — «#» + 4 hex хэша ключа.
+            val sameAddr = group.count { protoNetSec(it) == protoNetSec(p) && hostPort(it) == hostPort(p) } > 1
+            result[key] = "${protoNetSec(p)} · ${hostPort(p)}" + if (sameAddr) " · #${keyTag(key)}" else ""
         }
     }
     return result
 }
+
+/** адрес:порт для подписи (IPv6 — в скобках, как в ссылках). */
+private fun hostPort(p: ServerProfile): String = (if (':' in p.address) "[${p.address}]" else p.address) + ":" + p.port
+
+/** 4 hex от String.hashCode ключа — стабильно между запусками (и одинаково с Windows-версией). */
+private fun keyTag(key: String): String = "%08x".format(key.hashCode()).takeLast(4)
 
 // Промпт 123.E: давность пинга/замера в списке (в МИНУТАХ/часах — как удобнее) — «24 Мбит/с минутной давности»
 // ≠ «двухдневной». Показываем ДВЕ отдельные метки: слева «пинг NNN мс · N мин» (когда пинговали), справа
