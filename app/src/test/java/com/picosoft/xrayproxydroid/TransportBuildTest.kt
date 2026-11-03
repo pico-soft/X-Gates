@@ -121,6 +121,17 @@ class TransportBuildTest {
         assertTrue("json balanced", balanced(cfg))
     }
 
+    @Test fun splithttp_normalizes_to_xhttp() {
+        // Находка порта Windows №1: splithttp (старое имя xhttp) падал «unsupported transport» (и из ссылки, и из JSON).
+        val p = vless("vless://11111111-1111-1111-1111-111111111111@h.example.com:443?type=splithttp&path=%2Fsp&host=cdn.example.com&security=tls&sni=cdn.example.com#n")
+        assertEquals("splithttp", p.network)   // сырьё в профиле НЕ трогаем (serverKey стабилен)
+        val cfg = XrayConfigBuilder.build(p)
+        assertTrue(cfg.contains("\"network\": \"xhttp\""))
+        assertTrue(cfg.contains("\"xhttpSettings\""))
+        assertTrue(cfg.contains("\"path\": \"/sp\""))
+        assertTrue("json balanced", balanced(cfg))
+    }
+
     @Test fun still_supports_ws_grpc() {
         val ws = XrayConfigBuilder.build(vless("vless://11111111-1111-1111-1111-111111111111@h:443?type=ws&path=%2Fw&host=x.com&security=tls&sni=x.com#n"))
         assertTrue(ws.contains("\"wsSettings\""))
