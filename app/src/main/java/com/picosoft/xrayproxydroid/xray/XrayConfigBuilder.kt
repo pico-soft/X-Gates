@@ -2,6 +2,7 @@ package com.picosoft.xrayproxydroid.xray
 
 import com.picosoft.xrayproxydroid.xray.link.Protocol
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
+import com.picosoft.xrayproxydroid.xray.link.normalizePinnedCerts
 import com.picosoft.xrayproxydroid.xray.link.normalizeStreamSecurity
 
 /**
@@ -206,8 +207,10 @@ object XrayConfigBuilder {
     }
 
     private fun tlsBlock(p: ServerProfile): String {
+        // allowInsecure не пишем: ядро v26 отвергает конфиг с true («removed and migrated to pinnedPeerCertSha256»), полевой
+        // случай Elyor 2026-11-01: «Не запущен». Такой сервер запускается и проверяет сертификат как обычно; пропустить
+        // проверку больше нельзя, самоподписанному нужен pcs (его даёт ссылка).
         val fields = mutableListOf(
-            """"allowInsecure": ${p.allowInsecure}""",
             """"serverName": ${j(p.sni ?: p.address)}""",
         )
         if (!p.fingerprint.isNullOrBlank()) fields += """"fingerprint": ${j(p.fingerprint)}"""
@@ -215,6 +218,8 @@ object XrayConfigBuilder {
             val alpnArr = p.alpn.split(",").joinToString(", ") { j(it.trim()) }
             fields += """"alpn": [$alpnArr]"""
         }
+        normalizePinnedCerts(p.pinnedPeerCertSha256)?.let { fields += """"pinnedPeerCertSha256": ${j(it)}""" }
+        if (!p.verifyPeerCertByName.isNullOrBlank()) fields += """"verifyPeerCertByName": ${j(p.verifyPeerCertByName)}"""
         return "{ ${fields.joinToString(", ")} }"
     }
 

@@ -83,6 +83,8 @@ object JsonConfigParser {
         val fingerprint = sec?.optString("fingerprint")?.ifBlank { null }
         val alpn = tls?.optJSONArray("alpn")?.let { a -> (0 until a.length()).joinToString(",") { a.optString(it) } }?.ifBlank { null }
         val allowInsecure = tls?.optBoolean("allowInsecure", false) ?: false
+        val pinnedPeerCertSha256 = tls?.optString("pinnedPeerCertSha256")?.ifBlank { null }
+        val verifyPeerCertByName = tls?.optString("verifyPeerCertByName")?.ifBlank { null }
         val publicKey = reality?.optString("publicKey")?.ifBlank { null }
         val shortId = reality?.optString("shortId")?.ifBlank { null }
         val spiderX = reality?.optString("spiderX")?.ifBlank { null }
@@ -129,6 +131,8 @@ object JsonConfigParser {
             fingerprint = fingerprint,
             alpn = alpn,
             allowInsecure = allowInsecure,
+            pinnedPeerCertSha256 = pinnedPeerCertSha256,
+            verifyPeerCertByName = verifyPeerCertByName,
             network = network,
             path = path,
             hostHeader = hostHeader,

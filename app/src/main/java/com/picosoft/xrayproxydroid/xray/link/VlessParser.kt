@@ -29,6 +29,8 @@ object VlessParser : LinkParser {
             fingerprint = q["fp"],
             alpn = q["alpn"],
             allowInsecure = q["allowInsecure"] == "1" || q["insecure"] == "1",
+            pinnedPeerCertSha256 = q["pcs"]?.ifBlank { null },
+            verifyPeerCertByName = q["vcn"]?.ifBlank { null },
             network = q["type"] ?: "tcp",
             path = q["path"],
             hostHeader = q["host"],

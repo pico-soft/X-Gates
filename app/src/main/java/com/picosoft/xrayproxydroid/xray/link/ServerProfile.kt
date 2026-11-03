@@ -1,5 +1,7 @@
 package com.picosoft.xrayproxydroid.xray.link
 
+import kotlinx.serialization.EncodeDefault
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.Serializable
 
 /** Протоколы, которые исполняет наш xray-core. Hysteria2/TUIC сюда НЕ входят (sing-box, будущий этап). */
@@ -21,10 +23,26 @@ fun normalizeStreamSecurity(raw: String): String = when (raw.trim().lowercase())
 }
 
 /**
+ * pcs для tlsSettings.pinnedPeerCertSha256: SHA-256 через запятую, можно в формате OpenSSL (AA:BB:…).
+ * Значение не той длины или не hex ядро отвергает вместе с конфигом, поэтому такие выбрасываем: без pin
+ * сертификат проверяется как обычно, а сервер не пропадает из-за опечатки в подписке. null — годных нет.
+ */
+fun normalizePinnedCerts(raw: String?): String? {
+    val pins = raw?.split(",").orEmpty().map { it.trim() }.filter(::isSha256Hex)
+    return if (pins.isNotEmpty()) pins.joinToString(",") else null
+}
+
+private fun isSha256Hex(pin: String): Boolean {
+    val hex = pin.replace(":", "")
+    return hex.length == 64 && hex.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
+}
+
+/**
  * Нормализованный сервер: результат разбора одной ссылки, вход для [XrayConfigBuilder].
  * Поля — общий знаменатель ss/vless/vmess/trojan; лишние для конкретного протокола остаются null.
  * @Serializable — сохраняется внутри подписки в subscriptions.json.
  */
+@OptIn(ExperimentalSerializationApi::class)
 @Serializable
 data class ServerProfile(
     val protocol: Protocol,
@@ -51,7 +69,10 @@ data class ServerProfile(
     val sni: String? = null,
     val fingerprint: String? = null,
     val alpn: String? = null,
-    val allowInsecure: Boolean = false,
+    val allowInsecure: Boolean = false,   // читаем, но в конфиг не пишем: ядро v26 отвергает его (см. XrayConfigBuilder.tlsBlock)
+    // pcs и vcn. Пустые не сериализуем (файл как у Windows-версии). В serverKey не входят: иначе сдвинутся стоп-лист и замеры.
+    @EncodeDefault(EncodeDefault.Mode.NEVER) val pinnedPeerCertSha256: String? = null,
+    @EncodeDefault(EncodeDefault.Mode.NEVER) val verifyPeerCertByName: String? = null,
 
     // --- транспорт ---
     val network: String = "tcp",       // tcp | raw(=tcp) | ws | grpc | xhttp | httpupgrade | kcp/mkcp
