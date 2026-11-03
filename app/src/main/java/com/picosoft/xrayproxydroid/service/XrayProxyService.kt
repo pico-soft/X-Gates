@@ -53,6 +53,22 @@ class XrayProxyService : Service() {
     // снова поднять флаг → старый просыпался и продолжал. +1 вечный поток на каждое переключение (15 потоков за 4.5ч).
     private val pollGeneration = AtomicLong(0)
 
+    // Находка порта Windows №5: операции с ядром (старт/стоп/пауза) шли параллельными потоками — два почти
+    // одновременных старта («первый рабочий» → «точный топ») могли оставить поднятым НЕ последний сервер (второй
+    // видел «уже запущено»), а опоздавший старт — поднять ядро ПОСЛЕ «Стоп». Теперь каждая операция берёт номер в
+    // момент ЗАПРОСА и выполняется под одной блокировкой, только если она всё ещё последняя.
+    private val coreOpLock = Any()
+    private val coreOpGen = AtomicLong(0)
+
+    private fun newCoreOp(): Long = coreOpGen.incrementAndGet()
+
+    private inline fun runCoreOp(gen: Long, what: String, op: () -> Unit) {
+        synchronized(coreOpLock) {
+            if (gen != coreOpGen.get()) { Log.i("XrayProxyService", "$what: есть более поздний запрос — пропуск"); return }
+            op()
+        }
+    }
+
     // Корутина автомониторинга. Живёт ТОЛЬКО когда монитор включён И туннель активен (реактивно).
     // Обработчик глушит НЕОБРАБОТАННЫЕ исключения фоновых корутин (монитор/обход/каскад) — фон не должен
     // ронять процесс (Промпт 66.B). SupervisorJob — падение одной не гасит остальные.
@@ -311,7 +327,8 @@ class XrayProxyService : Service() {
 
         coreActive = true
         bypassRetryAfterMs = 0L   // ручной (пере)запуск = действие пользователя → снять троттлинг отката
-        Thread { runCoreStart(config, label, serverKey) }.start()
+        val gen = newCoreOp()
+        Thread { runCoreStart(config, label, serverKey, gen) }.start()
     }
 
     /**
@@ -334,6 +351,7 @@ class XrayProxyService : Service() {
             return
         }
         val downtimeMs = LastServerStore.lastAlive(applicationContext).let { if (it > 0L) System.currentTimeMillis() - it else -1L }
+        val gen = newCoreOp()
         Thread {
             try {
                 val lastKey = LastServerStore.load(applicationContext)
@@ -364,7 +382,7 @@ class XrayProxyService : Service() {
                 MonitorLog.event(applicationContext, "monitor",
                     if (boot) "Автозапуск после включения телефона" else "Сервис был убит системой — восстанавливаюсь",
                     if (boot) "последний сервер: $label" else "$downtimeStr · сервер: $label")
-                runCoreStart(config, label, serverKey)
+                runCoreStart(config, label, serverKey, gen)
             } catch (e: Exception) {
                 Log.w("XrayProxyService", "восстановление после убийства упало (проглочено): ${e.message}", e)
                 runCatching { stopSelfAndForeground() }
@@ -373,7 +391,10 @@ class XrayProxyService : Service() {
     }
 
     /** Блокирующий подъём ядра (обход VPN → старт xray → пробы портов). Зовётся из ФОНОВОГО потока. */
-    private fun runCoreStart(config: String, label: String?, serverKey: String?) {
+    private fun runCoreStart(config: String, label: String?, serverKey: String?, gen: Long) =
+        runCoreOp(gen, "старт «$label»") { runCoreStartLocked(config, label, serverKey) }
+
+    private fun runCoreStartLocked(config: String, label: String?, serverKey: String?) {
           // Весь поток старта под перехватом: любая ошибка (в т.ч. сетевого API) → сообщение + стоп, НЕ падение.
           try {
             // Привязку МИМО чужого VPN ставим ДО старта ядра (его первый дозвон уже мимо VPN). На фоне,
@@ -439,13 +460,16 @@ class XrayProxyService : Service() {
         runCatching { getSystemService(ConnectivityManager::class.java)?.bindProcessToNetwork(null) }
         ourBinding = null
         SystemVpnState.reset()
+        val gen = newCoreOp()
         Thread {
-            stopTrafficPolling()
-            XrayController.queryTunnelDelta()?.let { TrafficTracker.addTunnel(it.first, it.second) }  // финальный замер туннеля
-            XrayController.stop()
-            TrafficTracker.onServiceStop()
-            ProxyState.update(running = false, label = null, serverKey = null, message = "остановлено")
-            stopSelfAndForeground()
+            runCoreOp(gen, "стоп") {
+                stopTrafficPolling()
+                XrayController.queryTunnelDelta()?.let { TrafficTracker.addTunnel(it.first, it.second) }  // финальный замер туннеля
+                XrayController.stop()
+                TrafficTracker.onServiceStop()
+                ProxyState.update(running = false, label = null, serverKey = null, message = "остановлено")
+                stopSelfAndForeground()
+            }
         }.start()
     }
 
@@ -484,11 +508,14 @@ class XrayProxyService : Service() {
                 .notify(NotificationHelper.NOTIFICATION_ID, NotificationHelper.buildNotification(this, "Пауза — жду Wi-Fi"))
         }
         ProxyState.update(running = false, label = label, serverKey = serverKey, message = "Пауза — жду Wi-Fi (мобильная сеть)", paused = true)
+        val gen = newCoreOp()
         Thread {
-            stopTrafficPolling()
-            runCatching { XrayController.queryTunnelDelta()?.let { TrafficTracker.addTunnel(it.first, it.second) } }
-            runCatching { XrayController.stop() }
-            TrafficTracker.onServiceStop()
+            runCoreOp(gen, "пауза Wi-Fi") {
+                stopTrafficPolling()
+                runCatching { XrayController.queryTunnelDelta()?.let { TrafficTracker.addTunnel(it.first, it.second) } }
+                runCatching { XrayController.stop() }
+                TrafficTracker.onServiceStop()
+            }
         }.start()
     }
 
@@ -499,11 +526,12 @@ class XrayProxyService : Service() {
         coreActive = true
         MonitorLog.event(applicationContext, "net", "Только Wi-Fi: возобновление", "сеть не мобильная — поднимаю последний сервер")
         ProxyState.update(running = false, label = null, serverKey = null, message = "возобновление (Wi-Fi)…", paused = false)
-        Thread { resumeLastServerBlocking() }.start()
+        val gen = newCoreOp()
+        Thread { resumeLastServerBlocking(gen) }.start()
     }
 
     /** Блокирующий подъём последнего сервера при возобновлении (как handleRestartAfterKill, но без оценки простоя). */
-    private fun resumeLastServerBlocking() {
+    private fun resumeLastServerBlocking(gen: Long) {
         try {
             val lastKey = LastServerStore.load(applicationContext)
             var profile = lastKey?.let { k -> SubscriptionManager.allServers(applicationContext).firstOrNull { SubscriptionManager.serverKey(it) == k } }
@@ -524,7 +552,7 @@ class XrayProxyService : Service() {
                 androidx.core.app.NotificationManagerCompat.from(this)
                     .notify(NotificationHelper.NOTIFICATION_ID, NotificationHelper.buildNotification(this, label))
             }
-            runCoreStart(config, label, serverKey)
+            runCoreStart(config, label, serverKey, gen)
         } catch (e: Exception) {
             Log.w("XrayProxyService", "возобновление wifi-only упало (проглочено): ${e.message}", e)
         }
@@ -570,6 +598,7 @@ class XrayProxyService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        newCoreOp()   // опоздавшие старты/стоп после уничтожения сервиса не выполняются (блокировку на main не ждём)
         stopTrafficPolling()
         coreActive = false
         // ОБЯЗАТЕЛЬНО снять привязку процесса к сети — иначе приложение осталось бы прибито к сети и после стопа.
