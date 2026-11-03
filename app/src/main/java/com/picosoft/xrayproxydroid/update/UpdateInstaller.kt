@@ -71,6 +71,7 @@ object UpdateInstaller {
         // скачивания или несовпадение суммы — пробуем следующий адрес; успех с верной суммой — выходим.
         val urls = available.downloadUrls.ifEmpty { listOf(available.downloadUrl) }
         var lastFail: DownloadOutcome.Fail? = null
+        var checksumFail: DownloadOutcome.Fail? = null
         var downloaded = false
         for (url in urls) {
             if (isCancelled()) { dest.delete(); return DownloadOutcome.Fail(UpdateErrorKind.CANCELLED) }
@@ -91,10 +92,11 @@ object UpdateInstaller {
             val actual = sha256Hex(dest)
             if (!actual.equals(available.artifact.sha256, ignoreCase = true)) {
                 dest.delete()
-                lastFail = DownloadOutcome.Fail(
+                checksumFail = DownloadOutcome.Fail(
                     UpdateErrorKind.CHECKSUM_MISMATCH,
                     "${hostOf(url)}: ожидали ${available.artifact.sha256.take(16)}…, получили ${actual.take(16)}…",
                 )
+                lastFail = checksumFail
                 continue
             }
             downloaded = true
@@ -104,6 +106,9 @@ object UpdateInstaller {
             // Пр.135: сам APK (~50 МБ) через одноразовый temp-инстанс НЕ тянем (дорого, и стриминг через него
             // не реализован). Если прямой путь заблокирован, а туннеля нет — честно направляем поднять прокси
             // (сведения об обновлении при этом уже могли прийти через temp-инстанс, а файл идёт стадией 2/SOCKS).
+            // Находка порта Windows №7: файл ДОШЁЛ, но сумма не совпала → путь не заблокирован, подсказка про прокси
+            // была бы ложной — называем несовпадение суммы.
+            checksumFail?.let { return it }
             if (!CascadeFetch.isOwnProxyUp())
                 return DownloadOutcome.Fail(UpdateErrorKind.DOWNLOAD_FAILED,
                     "Прямой доступ к GitHub заблокирован, а прокси не запущен. Запустите прокси на главном экране (▶) и повторите — файл скачается через туннель.")
