@@ -3053,9 +3053,11 @@ private fun MonitorSection(
             LaunchedEffect(Unit) { while (true) { uiNow = System.currentTimeMillis(); delay(1000) } }
             val t = if (heartbeat.lastCheckMs > 0) monitorTimeFmt.format(Date(heartbeat.lastCheckMs)) else "—"
             val ago = if (heartbeat.lastCheckMs > 0) "${((uiNow - heartbeat.lastCheckMs) / 1000).coerceAtLeast(0)} с назад" else "—"
-            val interval = settings.connectionCheckIntervalSec.coerceAtLeast(15)
+            val ctx = LocalContext.current
+            val interval = NetworkMonitor.healthyCheckMs(ctx, settings) / 1000   // на зарядке — чаще (решение Elyor)
+            val power = if (NetworkMonitor.fastChecksOnCharger(ctx, settings)) " (на зарядке)" else ""
             Text(
-                "● Проверка связи каждые $interval с · последняя: $t ($ago) · циклов: ${heartbeat.cycles} · ${heartbeat.state}",
+                "● Проверка связи каждые $interval с$power · последняя: $t ($ago) · циклов: ${heartbeat.cycles} · ${heartbeat.state}",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary,
             )
         }
@@ -3234,7 +3236,7 @@ private fun OptimizeChecksBlock(settings: AppSettings, onChange: (AppSettings) -
 
     // — Проверки живости (ОБЩИЕ для обоих режимов, Пр.127: на проверках не экономим никогда) —
     Spacer(Modifier.height(4.dp))
-    TickSlider("Проверка связи (оба режима)", CHK_LABELS, nearestIndex(CHK_SECS, settings.connectionCheckIntervalSec)) { i ->
+    TickSlider("Проверка связи на батарее (на зарядке по Wi-Fi — каждые 10 с)", CHK_LABELS, nearestIndex(CHK_SECS, settings.connectionCheckIntervalSec)) { i ->
         onChange(settings.copy(connectionCheckIntervalSec = CHK_SECS[i]))
     }
     val chkSec = CHK_SECS[nearestIndex(CHK_SECS, settings.connectionCheckIntervalSec)].coerceAtLeast(15)
