@@ -177,5 +177,8 @@ object Sanitizer {
         .replace(creds, "<логин>@")
         .replace(uuid, "<uuid>")
         .replace(ip, "<ip>")
-        .replace(token, "<токен>")
+        // Находка порта Windows №6: слово ТОЛЬКО из латинских букв — имя исключения/метода (IllegalArgumentException,
+        // rebuildAndRateTop), его не маскируем: иначе отчёт теряет главное — ЧТО упало. Ключи/base64/hex почти
+        // всегда содержат цифры или +/=_- (24 случайных символа base64 без них — ~0,7%).
+        .replace(token) { m -> if (m.value.all { it in 'A'..'Z' || it in 'a'..'z' }) m.value else "<токен>" }
 }

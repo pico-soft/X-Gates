@@ -1,6 +1,7 @@
 package com.picosoft.xrayproxydroid
 
 import com.picosoft.xrayproxydroid.crash.Sanitizer
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -44,5 +45,21 @@ class SanitizerTest {
         // Полезное (модель/версия Android) сохраняется — маска не съедает диагностику.
         assertTrue("модель устройства", clean.contains("SM-S908E"))
         assertTrue("версия Android", clean.contains("Android 14"))
+    }
+
+    @Test
+    fun `keeps exception and method names but masks keys`() {
+        // Находка порта Windows №6: имена исключений/методов ≥24 букв раньше превращались в «<токен>».
+        val raw = "java.lang.IllegalArgumentException: Cannot coerce value\n" +
+            "java.util.ConcurrentModificationException\n" +
+            "    at com.picosoft.xrayproxydroid.monitor.NetworkMonitor.rebuildAndRateTopWithFallback(NetworkMonitor.kt:1374)\n" +
+            "pbk=SxYzKz3vV9nGq0rUe8yH2bJk5mWp7tLc4aDfRhNs1Eo hex=0123456789abcdef0123456789abcdef"
+        val clean = Sanitizer.clean(raw)
+        assertTrue(clean.contains("IllegalArgumentException"))
+        assertTrue(clean.contains("ConcurrentModificationException"))
+        assertTrue(clean.contains("rebuildAndRateTopWithFallback"))
+        assertFalse("ключ reality (base64)", clean.contains("SxYzKz3vV9nGq0rUe8yH2bJk5mWp7tLc4aDfRhNs1Eo"))
+        assertFalse("hex", clean.contains("0123456789abcdef0123456789abcdef"))
+        assertEquals(2, clean.split("<токен>").size - 1)
     }
 }
