@@ -20,9 +20,12 @@ object VmessParser : LinkParser {
 
         // Детект query-формата (vmess-std) по наличию ? и & — откладываем, не крашим.
         if (body.contains('?') && body.contains('&')) return null
+        // Находка порта Windows №2: ~1.5% реальных ссылок — `vmess://<base64>=?хвост` (без &): хвост ломал Base64 и
+        // сервер отбрасывался. Base64-часть — до «?», хвост не нужен (имя — в "ps" JSON).
+        val b64 = body.substringBefore('?')
 
         val json = try {
-            val padded = body + "=".repeat((4 - body.length % 4) % 4) // паддинг до кратности 4
+            val padded = b64 + "=".repeat((4 - b64.length % 4) % 4) // паддинг до кратности 4
             String(Base64.decode(padded, Base64.DEFAULT), Charsets.UTF_8)
         } catch (e: Exception) {
             return null
