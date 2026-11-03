@@ -68,3 +68,8 @@ network.proxy.allow_hijacking_localhost = true
 - Ядро: **AndroidLibXrayLite** (обёртка xray-core), нативные `.so` по ABI.
 - Данные (подписки / настройки / стоп-лист / трафик) — в приватном хранилище приложения (JSON).
 - Релизные APK подписаны собственным ключом; сборка разбита по ABI + универсальная.
+
+## Лицензия
+
+[MIT](LICENSE). Сторонние компоненты — под своими лицензиями: `app/libs/libv2ray.aar` (AndroidLibXrayLite,
+обёртка Xray-core; Xray-core — MPL-2.0).
