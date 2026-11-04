@@ -180,7 +180,7 @@ object NetworkMonitor {
     // радио каждую минуту = батарея. Живость активного оставляем на ПИНГЕ (дёшев, КБ, надёжен через свежий сокет —
     // Пр.144). ЗАМЕР СКОРОСТИ — РЕДКО и АДАПТИВНО: пинг стабилен → раз в STABLE; пинг заметно скакнул (признак смены
     // качества канала) → раз в UNSTABLE (чаще). Реальный трафик пользователя по-прежнему даёт скорость бесплатно.
-    private const val LIVENESS_MEASURE_STABLE_MS = 30 * 60_000L   // пинг стабилен → замер раз в 30 мин
+    internal const val LIVENESS_MEASURE_STABLE_MS = 30 * 60_000L   // пинг стабилен → замер раз в 30 мин
     private const val LIVENESS_MEASURE_UNSTABLE_MS = 3 * 60_000L  // пинг скакнул → замер раз в 3 мин
     private const val PING_JITTER_ABS_MS = 80         // абсолютный порог «скачка» пинга, мс
     private const val PING_JITTER_FRAC_PCT = 60       // ИЛИ относительный: изменение > 60% прежнего
@@ -210,7 +210,7 @@ object NetworkMonitor {
     private const val TOP_PING_BATTERY_SCREEN_MS = 10 * 60_000L // батарея+экран вкл: пинг топа раз в 10 мин (экран выкл — не пингуем отдельно)
     // ТЗ Elyor (2026-10-15, «не 5 ГБ/сут»): реже + ОГРАНИЧЕННЫЙ рейтинг (топ-N, не все). С «только несвежие» (6ч)
     // большинство прогонов пустые; реальная работа — лишь когда топ протух. Интервалы увеличены.
-    private const val TOP_RATE_CHARGING_WIFI_MS = 30 * 60_000L  // шнур+Wi-Fi: рейтинг топа раз в 30 мин
+    internal const val TOP_RATE_CHARGING_WIFI_MS = 30 * 60_000L  // шнур+Wi-Fi: рейтинг топа раз в 30 мин
     private const val TOP_RATE_CHARGING_MOBILE_MS = 60 * 60_000L// шнур+моб: раз в 60 мин
     private const val TOP_RATE_BATTERY_WIFI_MS = 60 * 60_000L   // батарея+Wi-Fi: раз в 60 мин (батарея+моб — только по событию)
 
@@ -1477,7 +1477,7 @@ object NetworkMonitor {
             fun key(p: com.picosoft.xrayproxydroid.xray.link.ServerProfile) = SubscriptionManager.serverKey(p)
             val curKey = ProxyState.state.value.serverKey
             val minGate = 0.5
-            val targetTop = if (s.trafficSaveMode) 3 else 10   // держим топ-N по скорости (НЕ меряем все, без ∞ на шнуре)
+            val targetTop = rateTopTarget(s.trafficSaveMode)   // держим топ-N по скорости (НЕ меряем все, без ∞ на шнуре)
             val keepThreshold = s.degradationMinMbps.coerceAtLeast(0.1)
             // СПИСОК 1 «Живые» = измеренная скорость>0 И замер СВЕЖИЙ (не старше liveFreshSec). Такой сервер только что
             // мерен — НЕ перемеряем в этом цикле. В зачёт топа идут лишь ГОДНЫЕ (≥ порога). liveFreshSec (а не topFreshSec)
@@ -1508,7 +1508,7 @@ object NetworkMonitor {
             // годных рано). Т.е. 180 ДОЛГОСРОЧНО дешевле: сходится к 10 живых, а не крутит 60 вхолостую. Экономия — 30.
             // Нижняя граница — не больше размера пула: на малом пуле (needMeasure < targetTop) coerceIn(targetTop, size)
             // бросал «empty range» → фон-рейтинг ничего не мерил (находка порта Windows №3).
-            val maxScan = (if (s.trafficSaveMode) 30 else 180).coerceIn(minOf(targetTop, needMeasure.size), needMeasure.size)
+            val maxScan = rateMaxScan(s.trafficSaveMode).coerceIn(minOf(targetTop, needMeasure.size), needMeasure.size)
             // Этап А: МИНИМАЛЬНЫЙ замер (~100 КБ, 1 пробник/3с) от списка 2 к добору; СТОП при наборе needTop годных ИЛИ
             // maxScan. На tcping-пуле из сотен это ключ к «не 5 ГБ/сут»: мерим горстку, а не всё.
             val minimalByKey = LinkedHashMap<String, Double>()
@@ -1586,6 +1586,10 @@ object NetworkMonitor {
      * Правило Elyor: с живого туннеля уходим, только если уверены, что другой намного быстрее. [candMbps] — замер сейчас,
      * не число из памяти. Медленный туннель всё равно живой: «чуть быстрее» не повод его рвать.
      */
+    /** Рейтинг топа: сколько держать в топе и сколько живых по пингу перебрать минимальным замером. Общие с оценкой расхода в Настройках. */
+    internal fun rateTopTarget(trafficSave: Boolean) = if (trafficSave) 3 else 10
+    internal fun rateMaxScan(trafficSave: Boolean) = if (trafficSave) 30 else 180
+
     /** Правило Elyor 2026-11-02: чем медленнее активный, тем чаще ищем быстрее. */
     internal fun upgradeCheckMs(activeMbps: Double?): Long = when {
         activeMbps == null || activeMbps < 1.0 -> 60_000L

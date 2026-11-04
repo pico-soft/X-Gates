@@ -129,6 +129,7 @@ import com.picosoft.xrayproxydroid.monitor.LogEvent
 import com.picosoft.xrayproxydroid.monitor.MonitorCoordinator
 import com.picosoft.xrayproxydroid.monitor.MonitorHeartbeat
 import com.picosoft.xrayproxydroid.monitor.MonitorLog
+import com.picosoft.xrayproxydroid.monitor.TrafficEstimate
 import com.picosoft.xrayproxydroid.monitor.MonitorPrompt
 import com.picosoft.xrayproxydroid.monitor.MonitorStatus
 import com.picosoft.xrayproxydroid.monitor.NetworkMonitor
@@ -3170,17 +3171,6 @@ private fun nearestIndex(values: List<Int>, cur: Int): Int {
     return values.indices.minByOrNull { kotlin.math.abs(values[it] - cur) } ?: 0
 }
 
-/**
- * Пр.133.B: расход поддержания топа, МБ/мес. Фон мерит на ДОСТАТОЧНОСТЬ (стоп при подтверждении порога),
- * поэтому на замер уходит не весь бюджет, а ~короткий прогрев (0.5 МБ) + прокачка на подтверждение порога
- * (порог×~1.2с). Для 8 Мбит/с ≈ 0.5 + 1.2 = 1.7 МБ на замер — на порядок меньше полного (было ~8-13 МБ).
- */
-private fun optimizeMbPerMonth(optSec: Int, topBatch: Int, mix: Int, sufficientMbps: Double): Double {
-    if (optSec <= 0) return 0.0
-    val cyclesPerMonth = 2_592_000.0 / optSec
-    val perMeasureMb = 0.5 + (sufficientMbps / 8.0) * 1.2
-    return cyclesPerMonth * (topBatch + mix) * perMeasureMb
-}
 private fun fmtData(mb: Double): String =
     if (mb >= 1024.0) "≈ %.1f ГБ/мес".format(mb / 1024.0) else "≈ %.0f МБ/мес".format(mb)
 
@@ -3273,7 +3263,7 @@ private fun OptimizeChecksBlock(settings: AppSettings, onChange: (AppSettings) -
             style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
         )
         Text(
-            "Расход поддержания топа: ${fmtData(optimizeMbPerMonth(optSec, topBatch, settings.topMixUnmeasured, settings.sufficientMbps))} — ОЦЕНКА СВЕРХУ (замер на достаточность стоит доли полного; предохранители и свежий топ пропускают перемеры — реально меньше).",
+            "Поддержание топа: ${fmtData(TrafficEstimate.optimizeMbPerMonth(settings, TrafficEstimate.FAST_MBPS))} на быстром сервере (от 10 Мбит/с), ${fmtData(TrafficEstimate.optimizeMbPerMonth(settings, TrafficEstimate.SLOW_MBPS))} на очень медленном (ниже 1 Мбит/с): там на зарядке по Wi-Fi более быстрый ищем каждую минуту.",
             style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
         )
         BoolSettingRow("Перемер только по Wi-Fi", settings.monitorOptimizeWifiOnly, dd.monitorOptimizeWifiOnly) {
@@ -3286,7 +3276,7 @@ private fun OptimizeChecksBlock(settings: AppSettings, onChange: (AppSettings) -
             onChange(settings.copy(monitorOptimizeSkipAboveMbps = it))
         }
     } else {
-        Text("Перемер выключен — на замеры скорости в фоне трафик не тратится.", style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
+        Text("Перемер выключен: более быстрый сервер сам не ищем. Остаются редкие проверки текущего сервера и списка.", style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY)
     }
 
     // — Проверки живости (ОБЩИЕ для обоих режимов, Пр.127: на проверках не экономим никогда) —
@@ -3295,16 +3285,20 @@ private fun OptimizeChecksBlock(settings: AppSettings, onChange: (AppSettings) -
         onChange(settings.copy(connectionCheckIntervalSec = CHK_SECS[i]))
     }
     val chkSec = CHK_SECS[nearestIndex(CHK_SECS, settings.connectionCheckIntervalSec)].coerceAtLeast(15)
-    val chkMb = (2_592_000.0 / chkSec) * EST_CHECK_BYTES / 1_048_576.0
+    val chkMb = TrafficEstimate.checksMbPerMonth(chkSec, EST_CHECK_BYTES)
+    val chkAcMb = TrafficEstimate.checksMbPerMonth((NetworkMonitor.AC_CHECK_MS / 1000L).toInt(), EST_CHECK_BYTES)
     Text(
-        "Расход проверок: ${fmtData(chkMb)} — копейки. Реже проверка — ДОЛЬШЕ сидишь с мёртвым туннелем, если он упадёт; поэтому её не отключаем.",
+        "Расход проверок: ${fmtData(chkMb)} на батарее, ${fmtData(chkAcMb)} на зарядке по Wi-Fi — копейки. Реже проверка — ДОЛЬШЕ сидишь с мёртвым туннелем, если он упадёт; поэтому её не отключаем.",
         style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
     )
 
     // — ИТОГ (Пр.131.H): всего на замеры в месяц при настройках активного режима + контраст с проверками —
     Spacer(Modifier.height(4.dp))
+    val totalFast = fmtData(TrafficEstimate.backgroundMbPerMonth(settings, TrafficEstimate.FAST_MBPS))
+    val totalSlow = fmtData(TrafficEstimate.backgroundMbPerMonth(settings, TrafficEstimate.SLOW_MBPS))
+    val totalCost = if (totalFast == totalSlow) totalFast else "$totalFast на быстром сервере, $totalSlow на очень медленном"
     Text(
-        "ИТОГО на замеры в фоне ($modeName): ${if (optSec > 0) fmtData(optimizeMbPerMonth(optSec, topBatch, settings.topMixUnmeasured, settings.sufficientMbps)) else "≈ 0 (перемер выкл — только реактивно при потере связи)"}. Проверки связи: ${fmtData(chkMb)}. Контраст копеек и гигабайтов и объясняет, почему экономим на замерах, а на проверках — нет.",
+        "ИТОГО на замеры в фоне ($modeName): $totalCost. Это потолок: телефон круглые сутки на зарядке по Wi-Fi, экран включён, своего трафика нет. На батарее с выключенным экраном замеров нет. Сколько ушло на самом деле, видно в разделе «Трафик», строка «Тест». Проверки связи: ${fmtData(chkAcMb)} на зарядке по Wi-Fi.",
         style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.primary,
     )
 }

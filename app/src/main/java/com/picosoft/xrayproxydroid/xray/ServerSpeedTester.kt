@@ -172,12 +172,20 @@ object ServerSpeedTester {
      * трафика на порядок меньше полного. Возврат — как обычный замер (mbps); достаточность = mbps ≥ порога.
      * Бюджет замера = порог×~1.2с (сколько нужно прокачать, чтобы подтвердить скорость), прогрев — короткий.
      */
-    fun measureSufficiency(context: Context, profile: ServerProfile, thresholdMbps: Double): Double {
-        val measureBudget = (thresholdMbps / 8.0 * 1_000_000.0 * 1.2).toLong().coerceIn(256 * 1024L, 4 * 1024 * 1024L)
-        val warmupBudget = 512 * 1024L   // короткий прогрев — точность не нужна, нужен факт «тянет порог»
-        return measureSpeedDetailed(context, profile, warmupMs = 400, measureMs = 1200,
-            warmupBudgetOverride = warmupBudget, measureBudgetOverride = measureBudget).let { if (it.ok) it.mbps else -1.0 }
-    }
+    fun measureSufficiency(context: Context, profile: ServerProfile, thresholdMbps: Double): Double =
+        measureSpeedDetailed(context, profile, warmupMs = SUFFICIENCY_WARMUP_MS, measureMs = SUFFICIENCY_WINDOW_MS,
+            warmupBudgetOverride = SUFFICIENCY_WARMUP_BYTES, measureBudgetOverride = sufficiencyBudgetBytes(thresholdMbps))
+            .let { if (it.ok) it.mbps else -1.0 }
+
+    // Бюджеты замеров общие с оценкой расхода в Настройках: копия чисел в оценке и разошлась с кодом.
+    internal const val SUFFICIENCY_WARMUP_MS = 400
+    internal const val SUFFICIENCY_WINDOW_MS = 1200
+    internal const val SUFFICIENCY_WARMUP_BYTES = 512 * 1024L   // короткий прогрев — точность не нужна, нужен факт «тянет порог»
+    internal const val MINIMAL_WARMUP_BYTES = 16 * 1024L
+    internal const val MINIMAL_BUDGET_BYTES = 100 * 1024L
+
+    internal fun sufficiencyBudgetBytes(thresholdMbps: Double): Long =
+        (thresholdMbps / 8.0 * 1_000_000.0 * 1.2).toLong().coerceIn(256 * 1024L, 4 * 1024 * 1024L)
 
     /**
      * МИНИМАЛЬНЫЙ замер кандидата (temp-инстанс), ~100 КБ — как первая ступень активного staged. Цель: ДЁШЕВО
@@ -188,7 +196,7 @@ object ServerSpeedTester {
         // БЫСТРЫЙ замер: только 1 пробник + короткий коннект-таймаут 3с → мёртвый сервер (tcping открыт, но прокси не
         // пропускает) отсеивается за ~3с, а не ~20-30с (4 пробника × 8с). Иначе на пуле из 269 «достижимых» Этап 2 полз.
         measureSpeedDetailed(context, profile, warmupMs = 100, measureMs = 800,
-            warmupBudgetOverride = 16 * 1024L, measureBudgetOverride = 100 * 1024L,
+            warmupBudgetOverride = MINIMAL_WARMUP_BYTES, measureBudgetOverride = MINIMAL_BUDGET_BYTES,
             maxProbes = 1, connectTimeoutMs = 3_000).let { if (it.ok) it.mbps else -1.0 }
 
     /** Как [measureSpeed], но с исходом/причиной (для диалога «Перемерить»). */
