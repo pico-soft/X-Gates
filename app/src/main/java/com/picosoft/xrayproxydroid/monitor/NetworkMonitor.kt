@@ -282,6 +282,7 @@ object NetworkMonitor {
         var lastTunnelBytes = 0L
         var lastSpeedSampleMs = 0L      // живая скорость плашки: когда последний раз сэмплировали
         var lastActiveProbeMs = 0L      // когда последний раз делали АКТИВНУЮ пробу (в простое)
+        var sampledKey: String? = null  // чью скорость мерили: другой сервер не ждёт интервала
         var lastExactAlarm = false      // Промпт 118: последний тик поставлен ТОЧНЫМ будильником? (для лога/диагностики)
         var lastWhiteEvalMs = 0L        // Пр.140: когда последний раз оценивали режим белых списков
         var lastWhiteRefreshMs = 0L     // Пр.140: когда последний раз обновляли источники белого списка
@@ -532,6 +533,8 @@ object NetworkMonitor {
                 MonitorStatus.update(true, "ок", now(), cycles)
                 // ЖИВАЯ скорость плашки (гибрид): раз в цикл сэмплируем — реальный трафик даёт скорость
                 // бесплатно, иначе активная проба в простое. Держим ↓/↑ и время замера свежими.
+                // Сервер сменил сам монитор: цикл не перезапускался, и новый ждал бы интервала прежнего (до 5 мин без скорости на плашке).
+                if (curKey0 != sampledKey) { sampledKey = curKey0; lastSpeedSampleMs = 0L; lastActiveProbeMs = 0L }
                 if (cur.liveSpeedEnabled && now() - lastSpeedSampleMs >= SPEED_SAMPLE_MIN_GAP_MS) {
                     lastSpeedSampleMs = now()
                     lastActiveProbeMs = runCatching { sampleTunnelSpeed(app, cur, lastActiveProbeMs) }
@@ -1532,9 +1535,9 @@ object NetworkMonitor {
             // Пр.127.C: деградация по УЖЕ идущему трафику (бесплатно). Только при СУЩЕСТВЕННОМ трафике — иначе
             // низкая скорость = «мало качали», а не медленный туннель. Тишину (иначе — ниже порога байт) НЕ трактуем.
             if (dRx + dTx >= DEGRADATION_MIN_TRAFFIC_BYTES) maybeStepFromDegraded(app, cur, curKey, down)
-            return lastActiveProbeMs
-        }
-        TunnelSpeed.clearFlow(curKey)
+            // Замера этого сервера ещё нет: одна проба и при трафике, иначе при постоянной работе браузера «Туннель» пустой сколько угодно.
+            if (TunnelSpeed.measured(curKey)) return lastActiveProbeMs
+        } else TunnelSpeed.clearFlow(curKey)
 
         // (2) Простой: активная проба — только если пришло время И экран включён (иначе не тратим трафик).
         // Пр.125.E: в режиме экономии ПЛАНОВАЯ проба плашки в простое ОТКЛЮЧЕНА — замер активного туннеля только

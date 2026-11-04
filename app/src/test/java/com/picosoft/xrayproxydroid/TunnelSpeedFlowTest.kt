@@ -40,6 +40,14 @@ class TunnelSpeedFlowTest {
         assertEquals(0.7, s.flowDownMbps!!, 0.0)
     }
 
+    @Test fun first_measure_is_still_due_while_only_flow_is_known() {
+        TunnelSpeed.setFlow(0.7, 0.1, 2000L, "a")
+        assertEquals(false, TunnelSpeed.measured("a"))   // при постоянном трафике проба всё равно нужна, иначе «Туннель» пустой
+        TunnelSpeed.setProbe(null, 15.0, 5.0, 3000L, "a")
+        assertEquals(true, TunnelSpeed.measured("a"))
+        assertEquals(false, TunnelSpeed.measured("b"))
+    }
+
     @Test fun numbers_of_previous_server_do_not_leak_to_new_one() {
         TunnelSpeed.setProbe(30.0, 15.0, 5.0, 1000L, "a")
         TunnelSpeed.setFlow(40.0, 1.0, 2000L, "b")

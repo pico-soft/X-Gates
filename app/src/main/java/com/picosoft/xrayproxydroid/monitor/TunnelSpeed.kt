@@ -80,6 +80,9 @@ object TunnelSpeed {
         )
     }
 
+    /** Есть ли уже замер этого сервера. */
+    fun measured(serverKey: String): Boolean = _state.value.let { it.serverKey == serverKey && it.measuredAtMs > 0L }
+
     /** Тишина: «сейчас идёт» убираем, замер остаётся. */
     fun clearFlow(serverKey: String) {
         val s = _state.value
