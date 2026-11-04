@@ -2907,9 +2907,13 @@ private fun SettingsSection(
         }
 
         SettingsGroupLabel("Прочее")
-        BoolSettingRow("Автозапуск при старте", settings.autoStartOnLaunch, d.autoStartOnLaunch) {
+        BoolSettingRow("Подключаться при открытии приложения", settings.autoStartOnLaunch, d.autoStartOnLaunch) {
             onChange(settings.copy(autoStartOnLaunch = it))
         }
+        Text(
+            "При первом открытии после перезагрузки, обновления или выхода: сразу подключаемся к последнему серверу, обновляем подписки и проводим полный тест, чтобы найти самый быстрый (это заметный трафик). Подъём прокси после перезагрузки без открытия приложения — отдельный переключатель «Запускать при включении телефона» в «Работа в фоне».",
+            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+        )
         BoolSettingRow("Сообщать о новых версиях", settings.notifyNewVersions, d.notifyNewVersions) {
             onChange(settings.copy(notifyNewVersions = it))
         }
