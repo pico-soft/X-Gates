@@ -23,4 +23,10 @@ class LeaveLiveTunnelTest {
     @Test fun candidate_below_useful_speed_is_not_worth_leaving_for() {
         assertFalse(NetworkMonitor.worthLeaving(candMbps = 1.5, curMbps = 0.1, s))
     }
+
+    @Test fun browser_consumption_alone_passes_but_real_tunnel_speed_keeps_us() {
+        // Страница в браузере: за 6 с скачано 0,7 Мбит/с, а туннель тянет 15. Кандидат на 3 проходит только против потребления.
+        assertTrue(NetworkMonitor.worthLeaving(candMbps = 3.0, curMbps = 0.7, s))
+        assertFalse(NetworkMonitor.worthLeaving(candMbps = 3.0, curMbps = maxOf(15.0, 0.7), s))
+    }
 }

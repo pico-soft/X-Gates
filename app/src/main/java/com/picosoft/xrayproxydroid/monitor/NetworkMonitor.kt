@@ -1553,6 +1553,12 @@ object NetworkMonitor {
                 SubscriptionManager.applySpeedResults(app, mapOf(SubscriptionManager.serverKey(cand) to candMbps))
                 if (ProxyState.state.value.serverKey != curKey) return
                 if (worthLeaving(candMbps, passiveDown, cur)) {
+                    // Потребление — ещё не скорость: браузер читает страницу, а туннель тянет 15 Мбит/с. Правило Elyor — уходить, только
+                    // если уверены, поэтому перед уходом меряем сам туннель. Замер не состоялся — уверенности нет, остаёмся.
+                    val curProfile = SubscriptionManager.allServers(app).firstOrNull { SubscriptionManager.serverKey(it) == curKey }
+                    val curMbps = if (curProfile != null) ServerSpeedTester.measureSufficiency(app, curProfile, candMbps) else -1.0
+                    if (ProxyState.state.value.serverKey != curKey) return
+                    if (curMbps <= 0.0 || !worthLeaving(candMbps, maxOf(curMbps, passiveDown), cur)) continue
                     val cfg = runCatching { XrayConfigBuilder.build(cand) }.getOrNull() ?: continue
                     val from = ServerLabels.displayForKey(app, curKey)
                     XrayProxyService.start(app, cfg, ServerLabels.full(cand), SubscriptionManager.serverKey(cand))
