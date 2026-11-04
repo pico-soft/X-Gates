@@ -139,6 +139,23 @@ object NetworkMonitor {
     internal fun graceMs(fast: Boolean): Long = if (fast) minOf(LIVENESS_GRACE_MS, AC_LIVENESS_GRACE_MS) else LIVENESS_GRACE_MS
     internal fun graceRecheckMs(fast: Boolean): Long = if (fast) minOf(GRACE_RECHECK_MS, AC_GRACE_RECHECK_MS) else GRACE_RECHECK_MS
 
+    // Рейтинг и перемер идут внутри цикла, и пока они мерят, связь никто не проверяет: на мёртвом пуле это минуты, а на зарядке
+    // обещано переключение за ~35 с. В фон не выносим (решение Elyor 2026-11-02): фону нужна своя блокировка сна, а временные ядра
+    // живут в процессе приложения. Вместо этого между серверами спрашиваем активный: дважды не ответил — замеры бросаем, дальше решает цикл.
+    private const val YIELD_PING_TIMEOUT_MS = 3_000
+    @Volatile private var backgroundYielded = false
+
+    internal fun resetBackgroundYield() { backgroundYielded = false }
+
+    /** Прервать ли фоновые замеры: ручной тест, прокси остановлен или активный [active] молчит. */
+    internal fun backgroundMustYield(app: Context, active: com.picosoft.xrayproxydroid.xray.link.ServerProfile?): Boolean {
+        if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey == null || backgroundYielded) return true
+        if (active == null) return false
+        if (ServerTester.ping(app, active, YIELD_PING_TIMEOUT_MS) >= 0 || ServerTester.ping(app, active, YIELD_PING_TIMEOUT_MS) >= 0) return false
+        backgroundYielded = true
+        return true
+    }
+
     /** Писать ли пинг активного в реестр: на батарее — каждый цикл, на зарядке — см. [AC_PING_SAVE_MS]. */
     internal fun activePingSaveDue(fast: Boolean, pingMs: Int, lastSavedPingMs: Int, sinceSaveMs: Long): Boolean =
         !fast || (pingMs >= 0) != (lastSavedPingMs >= 0) || sinceSaveMs >= AC_PING_SAVE_MS
@@ -600,6 +617,10 @@ object NetworkMonitor {
                         runCatching { rebuildAndRateTop(app, cur) }
                             .onFailure { MonitorLog.event(app, "error", "Ошибка фон-рейтинга топа", it.message ?: "") }
                     }
+                }
+                if (backgroundYielded) {   // замеры заметили, что активный молчит: следующая проверка сразу, без обычного интервала
+                    resetBackgroundYield(); graceRecheck = true
+                    MonitorLog.event(app, "monitor", "Фон: активный не отвечает — замеры прерваны", "")
                 }
                 continue
             }
@@ -1200,7 +1221,8 @@ object NetworkMonitor {
             if (curMbps > 0) results[curKey] = curMbps
             var bestKey: String? = null; var bestMbps = 0.0
             for (c in toMeasure.values) {
-                if (MonitorCoordinator.fullTestRunning) return               // ручной тест — уступаем
+                // ручной тест или молчит активный — уступаем
+                if (backgroundMustYield(app, curProfile)) { SubscriptionManager.applySpeedResults(app, results); return }
                 if (ProxyState.state.value.serverKey != curKey) return       // пользователь сменил — уступаем
                 val k = key(c)
                 if (k == curKey) continue
@@ -1377,9 +1399,11 @@ object NetworkMonitor {
                 .distinctBy { SubscriptionManager.serverKey(it) }
                 .sortedBy { it.pingMs ?: Int.MAX_VALUE }
                 .take(MORNING_RATE_COUNT)
+            val curKey = ProxyState.state.value.serverKey
+            val active = SubscriptionManager.allServers(app).firstOrNull { SubscriptionManager.serverKey(it) == curKey }
             val results = HashMap<String, Double>()
             for (p in top) {
-                if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey == null) break
+                if (backgroundMustYield(app, active)) break
                 results[SubscriptionManager.serverKey(p)] = ServerSpeedTester.measureSufficiency(app, p, cap)
             }
             if (results.isNotEmpty()) SubscriptionManager.applySpeedResults(app, results)
@@ -1413,7 +1437,9 @@ object NetworkMonitor {
             // — чтобы список 2 (измеренные старше окна) активно перемерялся и промоутился обратно в список 1 (ТЗ).
             fun isFreshLive(p: com.picosoft.xrayproxydroid.xray.link.ServerProfile): Boolean =
                 (p.speedMbps ?: 0.0) > 0.0 && ServerFilter.isSpeedFresh(ServerFilter.speedMeasuredAtMs(p), now(), s.liveFreshSec)
-            val aliveByPing = SubscriptionManager.allServers(app)
+            val all = SubscriptionManager.allServers(app)
+            val active = all.firstOrNull { key(it) == curKey }
+            val aliveByPing = all
                 .filter { key(it) != curKey }   // активный мерит live-сэмпл — не перемеряем temp-инстансом
                 .filter { ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl) && !ServerFilter.isPaused(it, bl) }
                 .filter { (it.pingMs ?: -1) >= 0 }
@@ -1443,7 +1469,7 @@ object NetworkMonitor {
             val good = ArrayList<com.picosoft.xrayproxydroid.xray.link.ServerProfile>()
             var scanned = 0
             if (needTop > 0) for (p in needMeasure) {
-                if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey == null) break
+                if (backgroundMustYield(app, active)) break
                 if (good.size >= needTop || scanned >= maxScan) break
                 val m = ServerSpeedTester.measureSpeedMinimal(app, p)
                 minimalByKey[key(p)] = m; minimalTagged[key(p)] = m to false; scanned++
@@ -1454,7 +1480,7 @@ object NetworkMonitor {
             val reasonable = good.sortedByDescending { minimalByKey[key(it)] ?: 0.0 }.take(needTop)
             val fullTagged = LinkedHashMap<String, Pair<Double, Boolean>>()
             for (p in reasonable) {
-                if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey == null) break
+                if (backgroundMustYield(app, active)) break
                 fullTagged[key(p)] = ServerSpeedTester.measureSpeed(app, p) to true   // полный/точный замер
             }
             if (fullTagged.isNotEmpty()) SubscriptionManager.applySpeedResultsTagged(app, fullTagged)
