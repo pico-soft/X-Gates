@@ -29,6 +29,13 @@ import kotlin.math.roundToInt
  */
 object FullTestRunner {
 
+    /**
+     * Этап 3 сравнивает точное с точным. Быстрый замер в 100 КБ завышает: журнал Elyor 2026-11-02, Windows-версия, оценка ≈53,3,
+     * точные других её не превысили, и программа осталась на сервере, у которого проба вскоре не уложилась в 45 с.
+     */
+    internal fun exactConnectedSpeed(connectedKey: String?, measuredKey: String, full: Double, current: Double): Double =
+        if (connectedKey == measuredKey) maxOf(full, 0.0) else current
+
     // Промпт 103. ПРЕДОХРАНИТЕЛЬ «Этап 2» не должен виснуть.
     //  STALL — фаза не двигается (нет ни одного шага прогресса) дольше этого → честно завершаем.
     //  PRIORITY_CAP — приоритетный замер активного туннеля (прямой+↓+↑ с фолбэками) может тянуться ~2 мин
@@ -264,6 +271,7 @@ object FullTestRunner {
                         val full = ServerSpeedTester.measureSpeed(appCtx, p)   // ПОЛНЫЙ/точный замер
                         if (cancelled.get()) break
                         onSpeedResult(p, full, true)
+                        connectedSpeed = exactConnectedSpeed(connected?.let(::key), key(p), full, connectedSpeed)
                         if (full > bestFull) { bestFull = full; bestFullP = p }
                         if (full > bestSpeed) { bestSpeed = full; best = p; hbBest.set(p) }
                         beat()
@@ -278,6 +286,8 @@ object FullTestRunner {
                         MonitorLog.switch(appCtx, from, ServerLabels.display(pick), "полный тест: точный топ", "было ${fmt(connectedSpeed)} → стало ${fmt(bestFull)} Мбит/с")
                         connected = pick; connectedSpeed = bestFull; hbConnected.set(pick)
                         connect(pick)
+                    } else if (pick != null) {
+                        MonitorLog.event(appCtx, "monitor", "Полный тест: смены нет", "подключённый ${fmt(connectedSpeed)}, лучший ${fmt(bestFull)}, нужно больше ${fmt(need)}")
                     }
                 }
                 } catch (e: Throwable) {
