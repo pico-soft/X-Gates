@@ -71,7 +71,18 @@ object ServerTester {
     fun isUdp(profile: ServerProfile): Boolean = profile.network == "kcp" || profile.network == "mkcp"
 
     // Временные ядра живут в процессе приложения: подписка из многих UDP-серверов не должна поднять десятки сразу (Пр.88, OOM на мёртвом пуле).
-    private val udpPings = java.util.concurrent.Semaphore(3)
+    private const val UDP_PING_SLOTS = 3
+    private val udpPings = java.util.concurrent.Semaphore(UDP_PING_SLOTS)
+
+    /**
+     * Потолок времени на батч. UDP-пинги идут очередью из [UDP_PING_SLOTS] слотов: без их доли сторож бросил бы живые UDP-серверы
+     * недопингованными и они выглядели бы мёртвыми (находка Windows-КК, X-Gates-Win 5091242).
+     */
+    internal fun batchBudgetMs(total: Int, udp: Int, concurrency: Int, perServerMs: Long): Long {
+        val waves = ((total + concurrency - 1) / concurrency).coerceAtLeast(1)
+        val udpWaves = (udp + UDP_PING_SLOTS - 1) / UDP_PING_SLOTS
+        return 15_000L + (waves + udpWaves) * perServerMs
+    }
 
     /** UDP-сервер проверяем настоящей передачей данных через временное ядро; в отклик входит его подъём. */
     private fun udpPing(context: Context, profile: ServerProfile, timeoutMs: Int): Long {
@@ -118,7 +129,8 @@ object ServerTester {
         val lastProgressMs = AtomicLong(System.currentTimeMillis())
         val pool = Executors.newFixedThreadPool(conc)
 
-        for (p in servers) {
+        // UDP в конец: ожидая слот, он держал бы поток пула и задерживал обычные пинги за собой. Порядок остальных прежний.
+        for (p in servers.sortedBy { isUdp(it) }) {
             pool.execute {
                 if (cancelled.get() || finished.get()) return@execute
                 var ms = -1L
@@ -151,8 +163,7 @@ object ServerTester {
         // бюджету — недотестированные считаем мёртвыми, onFinish идёт с тем, что успели напинговать. Зомби-натив
         // сам гаснет по keepAlive jniPool. Теперь Этап 1 НЕ МОЖЕТ зависнуть ни на каком устройстве.
         val perServerMs = (SettingsStore.current().pingTimeoutMs + 2_000).toLong()
-        val waves = ((total + conc - 1) / conc).coerceAtLeast(1)
-        val hardBudgetMs = 15_000L + waves * perServerMs         // общий потолок на весь батч
+        val hardBudgetMs = batchBudgetMs(total, servers.count { isUdp(it) }, conc, perServerMs)   // общий потолок на весь батч
         val stallLimitMs = (perServerMs * 3).coerceAtLeast(20_000L)  // нет НИ ОДНОГО нового результата столько → бросаем
         Thread {
             val startMs = System.currentTimeMillis()
