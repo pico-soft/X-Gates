@@ -85,10 +85,24 @@ class TransportBuildTest {
         assertEquals("mySeed", p.seed)
         val cfg = XrayConfigBuilder.build(p)
         assertTrue("network mkcp", cfg.contains("\"network\": \"mkcp\""))
-        assertTrue("kcpSettings", cfg.contains("\"kcpSettings\""))
-        assertTrue("header type srtp", cfg.contains("\"type\": \"srtp\""))
-        assertTrue("seed", cfg.contains("\"seed\": \"mySeed\""))
+        // Ядро v26 отвергает header и seed в kcpSettings. Порядок масок важен: шифр, затем заголовок.
+        assertTrue(cfg, cfg.contains("""{ "udp": [{ "type": "mkcp-legacy", "settings": { "value": "mySeed" } }, { "type": "mkcp-legacy", "settings": { "header": "srtp" } }] }"""))
         assertTrue("json balanced", balanced(cfg))
+    }
+
+    @Test fun mkcp_without_header_and_seed_still_needs_legacy_mask() {
+        // Без маски конфиг загружается, но со старым сервером связи нет.
+        val cfg = XrayConfigBuilder.build(vless("vless://11111111-1111-1111-1111-111111111111@h.example.com:2408?type=kcp&security=none#n"))
+        assertTrue(cfg, cfg.contains("""{ "udp": [{ "type": "mkcp-legacy" }] }"""))
+        assertFalse(cfg.contains("\"header\": { \"type\""))
+    }
+
+    @Test fun mkcp_wechat_video_and_dns_and_unknown_headers() {
+        fun cfg(q: String) = XrayConfigBuilder.build(vless("vless://11111111-1111-1111-1111-111111111111@h.example.com:2408?type=kcp&security=none&$q#n"))
+        assertTrue(cfg("headerType=wechat-video").contains("\"header\": \"wechat\""))
+        assertTrue(cfg("headerType=dns&host=a.example.com").contains("""{ "header": "dns", "value": "a.example.com" }"""))
+        assertTrue(cfg("headerType=none").contains("""{ "udp": [{ "type": "mkcp-legacy" }] }"""))
+        assertTrue(cfg("headerType=junk").contains("""{ "udp": [{ "type": "mkcp-legacy" }] }"""))
     }
 
     // --- фикс: мусор в security (false/auto/…) больше не валит config load «Unknown security» ---

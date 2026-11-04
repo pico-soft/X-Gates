@@ -189,7 +189,7 @@ object XrayConfigBuilder {
             "tcp" -> if (p.headerType == "http") parts += """"tcpSettings": { "header": { "type": "http" } }"""
             "xhttp" -> parts += """"xhttpSettings": ${xhttpBlock(p)}"""
             "httpupgrade" -> parts += """"httpupgradeSettings": ${httpUpgradeBlock(p)}"""
-            "mkcp" -> parts += """"kcpSettings": ${kcpBlock(p)}"""
+            "mkcp" -> parts += """"kcpSettings": {}, "finalmask": ${kcpFinalmask(p)}"""
         }
         if (fragmented(p)) parts += """"sockopt": { "dialerProxy": ${j(FRAGMENT_TAG)} }"""
         return "{ ${parts.joinToString(", ")} }"
@@ -214,13 +214,25 @@ object XrayConfigBuilder {
         return """{ "path": ${j(p.path ?: "/")}, "host": ${j(host)} }"""
     }
 
-    // mkcp: тип обфускации заголовка (headerType, деф. none) + необязательный seed.
-    private fun kcpBlock(p: ServerProfile): String {
-        val fields = mutableListOf(
-            """"header": { "type": ${j(p.headerType?.takeIf { it.isNotBlank() } ?: "none")} }""",
-        )
-        if (!p.seed.isNullOrBlank()) fields += """"seed": ${j(p.seed)}"""
-        return "{ ${fields.joinToString(", ")} }"
+    // mkcp: header и seed ядро v26 убрало («migrated to finalmask»), с ними конфиг не загружается. Формат на проводе прежний, но
+    // задаётся масками mkcp-legacy (не mkcp-original, как пишет ошибка ядра: в v26.7.28 такого типа нет). Проверено туннелем со
+    // старым сервером v25.10.15 на всех заголовках, с seed и без: маска нужна всегда, порядок только такой, шифр, затем заголовок.
+    // Без масок конфиг загружается, но связи нет.
+    private fun kcpFinalmask(p: ServerProfile): String {
+        val cipher = if (p.seed.isNullOrBlank()) """{ "type": "mkcp-legacy" }"""
+                     else """{ "type": "mkcp-legacy", "settings": { "value": ${j(p.seed)} } }"""
+        return """{ "udp": [${listOfNotNull(cipher, kcpHeaderMask(p)).joinToString(", ")}] }"""
+    }
+
+    // Незнакомый тип заголовка пропускаем: ядро отвергло бы весь конфиг, а так сервер просто не пройдёт замер.
+    private fun kcpHeaderMask(p: ServerProfile): String? = when (val h = p.headerType?.trim()?.lowercase()) {
+        "srtp", "utp", "dtls", "wireguard" -> """{ "type": "mkcp-legacy", "settings": { "header": ${j(h)} } }"""
+        "wechat", "wechat-video" -> """{ "type": "mkcp-legacy", "settings": { "header": "wechat" } }"""
+        "dns" -> {
+            val domain = p.hostHeader?.takeIf { it.isNotBlank() }?.let { """, "value": ${j(it)}""" }.orEmpty()
+            """{ "type": "mkcp-legacy", "settings": { "header": "dns"$domain } }"""
+        }
+        else -> null
     }
 
     private fun tlsBlock(p: ServerProfile): String {

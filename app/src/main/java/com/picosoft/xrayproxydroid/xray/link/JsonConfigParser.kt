@@ -122,6 +122,17 @@ object JsonConfigParser {
             }
         }
 
+        // Конфиг под новое ядро: те же заголовок и шифр лежат в finalmask, кладём их в те же поля профиля.
+        if (network == "kcp" || network == "mkcp") st.optJSONObject("finalmask")?.optJSONArray("udp")?.let { masks ->
+            for (i in 0 until masks.length()) {
+                val m = masks.optJSONObject(i)?.takeIf { it.optString("type") == "mkcp-legacy" } ?: continue
+                val set = m.optJSONObject("settings") ?: continue
+                val header = set.optString("header").ifBlank { null }
+                if (header != null) headerType = header else seed = set.optString("value").ifBlank { null } ?: seed
+                if (header == "dns") hostHeader = set.optString("value").ifBlank { null } ?: hostHeader
+            }
+        }
+
         return ServerProfile(
             protocol = protocol,
             remarks = cfg.optString("remarks").ifBlank { address },
