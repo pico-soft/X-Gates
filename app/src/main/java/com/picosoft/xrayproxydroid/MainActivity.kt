@@ -2249,6 +2249,19 @@ private fun TrafficBlock() {
             style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
         )
 
+        // Опция фрагментации ClientHello: действует и на боевой конфиг, и на замеры (см. XrayConfigBuilder.fragmented).
+        Spacer(Modifier.height(6.dp))
+        SettingsGroupLabel("Блокировка по имени сайта")
+        BoolSettingRow("Дробить начало TLS-соединения на части", settings.tlsFragment, d.tlsFragment) {
+            SettingsStore.update(context, SettingsStore.current().copy(tlsFragment = it))
+            XrayProxyService.restartActive(context)   // опция входит в конфиг ядра
+        }
+        Text(
+            "Включайте, если серверы перестали подключаться: помогает, когда блокируют по имени сайта в начале соединения. " +
+                "Подключение и замеры станут чуть медленнее (примерно на 0,15 с).",
+            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+        )
+
         // Пр.140: режим белых списков РФ.
         Spacer(Modifier.height(6.dp))
         SettingsGroupLabel("Режим белых списков РФ")

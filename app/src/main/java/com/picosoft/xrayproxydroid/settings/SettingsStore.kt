@@ -156,6 +156,9 @@ data class AppSettings(
     // из «экономии» ИЛИ «Только Wi-Fi на батарее» просит щадящий → trafficSaveMode=true. Конфликта/приоритета нет.
     val wifiOnlyEnabled: Boolean = false,
 
+    // Дробить ClientHello (см. XrayConfigBuilder.fragmented). Нужно только при блокировке по имени сайта, поэтому выключено.
+    val tlsFragment: Boolean = false,
+
     // --- Пр.140: режим белых списков РФ ---
     // Фича (Настройки): если сеть пускает только «белый список» (yandex открыт, google — нет), приложение само
     // переходит на источники белого списка и раз в полчаса проверяет возврат google. ДЕФОЛТ ВКЛ.

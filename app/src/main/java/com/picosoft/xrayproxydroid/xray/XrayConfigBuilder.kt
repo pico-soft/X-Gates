@@ -1,5 +1,6 @@
 package com.picosoft.xrayproxydroid.xray
 
+import com.picosoft.xrayproxydroid.settings.SettingsStore
 import com.picosoft.xrayproxydroid.xray.link.Protocol
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
 import com.picosoft.xrayproxydroid.xray.link.XhttpExtra
@@ -23,6 +24,8 @@ object XrayConfigBuilder {
     //  • kcp/mkcp — одно и то же (нормализуем kcp→mkcp).
     private val SUPPORTED_NETWORKS = setOf("tcp", "raw", "ws", "grpc", "xhttp", "splithttp", "httpupgrade", "kcp", "mkcp")
 
+    private const val FRAGMENT_TAG = "fragment"
+
     /** Боевой конфиг: общий inbound (socks 10815 + http 10816) + outbound сервера. */
     fun build(p: ServerProfile): String = """
         {
@@ -32,7 +35,7 @@ object XrayConfigBuilder {
           ${XrayConfig.inbounds()},
           "outbounds": [
             ${outboundFor(p)},
-            { "tag": "direct", "protocol": "freedom" }
+            { "tag": "direct", "protocol": "freedom" }${fragmentOutbound(p)}
           ]
         }
     """.trimIndent()
@@ -56,7 +59,7 @@ object XrayConfigBuilder {
           ],
           "outbounds": [
             ${outboundFor(p)},
-            { "tag": "direct", "protocol": "freedom" }
+            { "tag": "direct", "protocol": "freedom" }${fragmentOutbound(p)}
           ]
         }
     """.trimIndent()
@@ -71,6 +74,16 @@ object XrayConfigBuilder {
             Protocol.SHADOWSOCKS -> shadowsocksOutbound(p)
         }
     }
+
+    // Фрагментация ClientHello: имя сайта идёт в нём открытым текстом, по нему блокировка и срабатывает. Ядро дробит только
+    // на freedom, поэтому соединение с сервером ведём через него (sockopt.dialerProxy). Параметры — обычные для клиентов
+    // Xray: +0,15 с на рукопожатие. Нужно только там, где есть TLS поверх TCP: mkcp — это UDP.
+    private fun fragmented(p: ServerProfile): Boolean =
+        SettingsStore.current().tlsFragment && normalizeStreamSecurity(p.security) != "none" && p.network != "kcp" && p.network != "mkcp"
+
+    private fun fragmentOutbound(p: ServerProfile): String = if (fragmented(p))
+        """, { "tag": ${j(FRAGMENT_TAG)}, "protocol": "freedom", "settings": { "fragment": { "packets": "tlshello", "length": "100-200", "interval": "10-20" } } }"""
+    else ""
 
     // --- outbound по протоколу (единый vnext/users для vless+vmess) ---
 
@@ -178,6 +191,7 @@ object XrayConfigBuilder {
             "httpupgrade" -> parts += """"httpupgradeSettings": ${httpUpgradeBlock(p)}"""
             "mkcp" -> parts += """"kcpSettings": ${kcpBlock(p)}"""
         }
+        if (fragmented(p)) parts += """"sockopt": { "dialerProxy": ${j(FRAGMENT_TAG)} }"""
         return "{ ${parts.joinToString(", ")} }"
     }
 
@@ -190,7 +204,7 @@ object XrayConfigBuilder {
         )
         if (!p.mode.isNullOrBlank()) fields += """"mode": ${j(p.mode)}"""
         // Профиль лежит на диске, поэтому фильтр проходит и здесь, а не только при разборе ссылки.
-        XhttpExtra.forConfig(p.xhttpExtra, p.mode)?.let { fields += """"extra": $it""" }
+        XhttpExtra.forConfig(p.xhttpExtra, p.mode, if (fragmented(p)) FRAGMENT_TAG else null)?.let { fields += """"extra": $it""" }
         return "{ ${fields.joinToString(", ")} }"
     }
 

@@ -652,6 +652,19 @@ class XrayProxyService : Service() {
             ContextCompat.startForegroundService(context, intent)
         }
 
+        /** Поднять работающий сервер заново: сменилась настройка, которая входит в конфиг ядра. Не запущен — нечего делать. */
+        fun restartActive(context: Context) {
+            val st = ProxyState.state.value
+            val key = st.serverKey
+            if (!st.running || key == null) return
+            val app = context.applicationContext
+            Thread {
+                val p = SubscriptionManager.allServers(app).firstOrNull { SubscriptionManager.serverKey(it) == key } ?: return@Thread
+                val cfg = runCatching { XrayConfigBuilder.build(p) }.getOrNull() ?: return@Thread
+                start(app, cfg, ServerLabels.full(p), key)
+            }.start()
+        }
+
         fun stop(context: Context) {
             val intent = Intent(context, XrayProxyService::class.java).setAction(ACTION_STOP)
             context.startService(intent)
