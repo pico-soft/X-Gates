@@ -678,7 +678,9 @@ object NetworkMonitor {
             MonitorLog.event(app, "monitor", "Связь прервалась (тишина ${humanDur(now() - lastLiveConfirmedMs)}) — ищу живой сервер", "ни трафика, ни пинга")
             when (runRecoveryLadder(app, cur)) {
                 SwitchResult.SWITCHED -> {
-                    lastSwitchMs = now(); failures = 0; backoffMs = 0; lastLiveConfirmedMs = now()   // Пр.150: связь восстановлена — сброс grace
+                    lastSwitchMs = now(); failures = 0; backoffMs = 0
+                    // Рейтинг после восстановления бросили, потому что подключённый замолчал: grace не продлеваем, сразу перепроверка.
+                    if (backgroundYielded) { resetBackgroundYield(); graceRecheck = true } else lastLiveConfirmedMs = now()   // Пр.150: связь восстановлена — сброс grace
                     val ip2 = ExternalIpChecker.fetch()   // подтвердить ФАКТОМ сразу
                     if (ip2 != null) { TunnelHealth.ok(ip2, now(), ProxyState.state.value.serverKey ?: ""); onRecovered(app) }
                     else TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "проверяю после переключения…")
@@ -835,6 +837,8 @@ object NetworkMonitor {
                     val minTagged = LinkedHashMap<String, Pair<Double, Boolean>>()
                     for (c in cands) {
                         if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey != ownedKey) return SwitchResult.SWITCHED
+                        // На зарядке по Wi-Fi мерим всех ответивших, это минуты: подключённый замолчал — рейтинг бросаем, цикл увидит обрыв.
+                        if (backgroundMustYield(app, connected)) return SwitchResult.SWITCHED
                         if (freshFullGood(c)) { minimalByKey[SubscriptionManager.serverKey(c)] = c.speedMbps ?: 0.0; continue }
                         val m = ServerSpeedTester.measureSpeedMinimal(app, c)
                         minimalByKey[SubscriptionManager.serverKey(c)] = m
@@ -847,6 +851,7 @@ object NetworkMonitor {
                     var bestFull = connectedMbps; var bestP: ServerProfile? = null
                     for (c in viable) {
                         if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey != ownedKey) return SwitchResult.SWITCHED
+                        if (backgroundMustYield(app, connected)) return SwitchResult.SWITCHED
                         val full = if (freshFullGood(c)) (c.speedMbps ?: 0.0)
                                    else ServerSpeedTester.measureSpeed(app, c).also { SubscriptionManager.applySpeedResultsTagged(app, mapOf(SubscriptionManager.serverKey(c) to (it to true))) }
                         if (full > bestFull) { bestFull = full; bestP = c }
