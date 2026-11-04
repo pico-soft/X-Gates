@@ -143,6 +143,8 @@ object NetworkMonitor {
     // обещано переключение за ~35 с. В фон не выносим (решение Elyor 2026-11-02): фону нужна своя блокировка сна, а временные ядра
     // живут в процессе приложения. Вместо этого между серверами спрашиваем активный: дважды не ответил — замеры бросаем, дальше решает цикл.
     private const val YIELD_PING_TIMEOUT_MS = 3_000
+    // Переживает пересоздание цикла: иначе отсчёт 6 ч начинался заново после каждого перезапуска, и проверка могла не случиться долго.
+    @Volatile private var lastOptimizeMs = System.currentTimeMillis()
     @Volatile private var backgroundYielded = false
 
     internal fun resetBackgroundYield() { backgroundYielded = false }
@@ -274,7 +276,6 @@ object NetworkMonitor {
         var noNetBackoffMs = 0L         // экспонента повтора прямого канала при «нет интернета» (1→2→4→…→30 мин)
         var cycles = 0
         var lastSwitchMs = 0L
-        var lastOptimizeMs = now()
         // Пр.126.A: «через туннель давно нет трафика» — предохранитель перемера. Считаем ФАКТ трафика по
         // приросту туннельных байт между циклами (temp-инстансы кандидатов сюда НЕ попадают; активная проба
         // плашки попадает, но она под screenInteractive — при выключенном экране ночью пула нет → детектор чист).
@@ -1183,7 +1184,7 @@ object NetworkMonitor {
      * Меряем ТОЛЬКО кандидатов в топ и ТОЛЬКО по поводам (Пр.132.C): ни разу не измерен / замер устарел (Пр.132.D:
      * старее topFreshSec — скорость НЕ действующая) / прошлый замер провалился. Плюс подмешиваем несколько ещё не
      * измеренных (Пр.132.B: пинг плохо предсказывает скорость под DPI — иначе быстрый сервер с плохим пингом не
-     * найдётся). Топ свежий → НЕ мерим. Пинг — только для первого приближения/сортировки неизмеренных. Замеры
+     * найдётся). Топ свежий → кандидатов не мерим, но решение о переходе принимаем. Пинг — только для первого приближения/сортировки неизмеренных. Замеры
      * сопоставимы (Пр.130: и активный, и кандидатов — temp-инстансом). Массового замера всех живых в фоне НЕТ.
      */
     private suspend fun optimizeToFastest(app: Context, s: AppSettings) {
@@ -1216,10 +1217,7 @@ object NetworkMonitor {
         // Пр.132.B: подмешать неизмеренных живых (иначе быстрый-с-плохим-пингом не найдём).
         var mixed = 0
         for (p in byPing) { if (mixed >= s.topMixUnmeasured) break; val k = key(p); if (p.speedMbps == null && k !in freshKeys && k !in toMeasure) { toMeasure[k] = p; mixed++ } }
-        if (toMeasure.isEmpty()) {                                          // топ свежий — повода мерить нет
-            MonitorLog.event(app, "monitor", "Топ свежий — перемер не нужен", "в топе ${freshKeys.size}/$topN, все ≤ ${freshHours}ч")
-            return
-        }
+        // Топ свежий: кандидатов не мерим, но решение о переходе принимаем всё равно, иначе быстрый сервер из списка не рассматривался бы вовсе.
         MonitorLog.event(app, "monitor", "Поддержание топа: мерю ${toMeasure.size} (топ $topN)", "свежих ${freshKeys.size}, подмешано $mixed · правило ×${s.keepBestMultiplier}")
         MonitorStatus.update(true, "поддержание топа: ${toMeasure.size} замер(ов)", now(), 0)
         MonitorCoordinator.monitorSearchRunning = true
@@ -1249,18 +1247,17 @@ object NetworkMonitor {
             // лучший из СВЕЖЕГО топа тоже участвует в решении (его не перемеряли — он свежий); нестабильных не берём.
             // Число из памяти — только повод проверить, не основание уйти с живого туннеля: «свежим» считается замер до
             // topFreshSec (6 ч), сервер мог давно умереть (Windows 10, Elyor 2026-11-01: монитор раз за разом уводил на мёртвый №1).
-            val bestStored = freshTop.firstOrNull { p ->
-                val sp = p.speedMbps ?: 0.0
-                key(p) != curKey && key(p) !in results && !isUnstableKey(key(p)) && sp > bestMbps && curMbps > 0 && sp >= curMbps * s.keepBestMultiplier
-            }
-            if (bestStored != null) {
-                val k = key(bestStored)
-                val mbps = ServerSpeedTester.measureSufficiency(app, bestStored, enough)
+            // Идём от быстрого к медленному: мёртвый первый не закрывает путь следующему.
+            for (p in freshTop.filter { key(it) != curKey && key(it) !in results && !isUnstableKey(key(it)) }) {
+                if (!storedWorthChecking(p.speedMbps ?: 0.0, bestMbps, curMbps, s)) break   // список по убыванию: дальше только медленнее
+                val k = key(p)
+                val mbps = ServerSpeedTester.measureSufficiency(app, p, enough)
                 if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey != curKey) return
                 results[k] = mbps
                 if (mbps > bestMbps) { bestMbps = mbps; bestKey = k }
                 // Провал скорость в реестре не затирает (Пр.88), поэтому из «Живых» его убирает пинг, иначе он так и стоял бы первым.
                 if (mbps <= 0.0) SubscriptionManager.applyPingResults(app, mapOf(k to -1))
+                if (mbps >= curMbps * s.keepBestMultiplier) break   // подтвердился, дальше мерить незачем
             }
             SubscriptionManager.applySpeedResults(app, results)
             // ПРАВИЛО «ДЕРЖАТЬ ЛУЧШИЙ» (Промпт 90.A): переключаемся, если лучший быстрее текущего КРАТНО
@@ -1554,6 +1551,9 @@ object NetworkMonitor {
      * Правило Elyor: с живого туннеля уходим, только если уверены, что другой намного быстрее. [candMbps] — замер сейчас,
      * не число из памяти. Медленный туннель всё равно живой: «чуть быстрее» не повод его рвать.
      */
+    internal fun storedWorthChecking(storedMbps: Double, bestMbps: Double, curMbps: Double, s: AppSettings): Boolean =
+        curMbps > 0 && storedMbps > bestMbps && storedMbps >= curMbps * s.keepBestMultiplier
+
     internal fun worthLeaving(candMbps: Double, curMbps: Double, s: AppSettings): Boolean =
         candMbps >= s.degradationMinMbps && candMbps >= curMbps * s.keepBestMultiplier
 

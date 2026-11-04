@@ -31,6 +31,14 @@ class LeaveLiveTunnelTest {
         assertFalse(NetworkMonitor.worthLeaving(candMbps = 3.0, curMbps = maxOf(15.0, 0.7), s))
     }
 
+    @Test fun stored_speed_is_a_reason_to_check_only_while_it_could_beat_the_tunnel() {
+        val s3 = s.copy(keepBestMultiplier = 3.0)
+        assertTrue(NetworkMonitor.storedWorthChecking(storedMbps = 30.0, bestMbps = 0.0, curMbps = 1.0, s3))
+        assertFalse("медленнее ×3", NetworkMonitor.storedWorthChecking(storedMbps = 2.0, bestMbps = 0.0, curMbps = 1.0, s3))
+        assertFalse("не лучше уже найденного", NetworkMonitor.storedWorthChecking(storedMbps = 30.0, bestMbps = 40.0, curMbps = 1.0, s3))
+        assertFalse("активный не измерен", NetworkMonitor.storedWorthChecking(storedMbps = 30.0, bestMbps = 0.0, curMbps = -1.0, s3))
+    }
+
     @Test fun failed_automatic_switch_returns_to_previous_server() {
         assertTrue(XrayProxyService.canRestore(auto = true, prevKey = "a", failedKey = "b"))
     }
