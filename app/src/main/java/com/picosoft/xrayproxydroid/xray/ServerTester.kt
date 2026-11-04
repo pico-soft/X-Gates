@@ -45,6 +45,7 @@ object ServerTester {
      * [timeoutMs] — мягкий верхний предел (из настроек); брошенный JNI-замер сам погасит temp-инстанс.
      */
     fun ping(context: Context, profile: ServerProfile, timeoutMs: Int = SettingsStore.current().pingTimeoutMs): Long {
+        if (isUdp(profile)) return udpPing(context, profile, timeoutMs.coerceIn(1000, 6000))
         // ТЗ Elyor (2026-10-15): tcping — TCP-коннект до host:port сервера (как «real/tcp ping» в v2rayN на ноутбуке).
         // Пингует ВСЕ URL быстро, показывает ДОСТИЖИМЫЕ серверы, НЕ виснет и НЕ переполняет пул (чистый таймаут
         // коннекта) — в отличие от прежнего gstatic-204 через ХОЛОДНЫЙ temp-инстанс (ложно падал на xhttp/reality/
@@ -63,6 +64,26 @@ object ServerTester {
             -1L
         } finally {
             try { sock?.close() } catch (_: Exception) {}
+        }
+    }
+
+    /** Транспорт поверх UDP: TCP-коннект к такому серверу не проходит никогда, какой бы живой он ни был. */
+    fun isUdp(profile: ServerProfile): Boolean = profile.network == "kcp" || profile.network == "mkcp"
+
+    // Временные ядра живут в процессе приложения: подписка из многих UDP-серверов не должна поднять десятки сразу (Пр.88, OOM на мёртвом пуле).
+    private val udpPings = java.util.concurrent.Semaphore(3)
+
+    /** UDP-сервер проверяем настоящей передачей данных через временное ядро; в отклик входит его подъём. */
+    private fun udpPing(context: Context, profile: ServerProfile, timeoutMs: Int): Long {
+        try { udpPings.acquire() } catch (e: InterruptedException) { return -1L }
+        try {
+            val t0 = System.nanoTime()
+            if (!ServerSpeedTester.probeAlive(context, profile, maxProbes = 1, timeoutMs = timeoutMs)) return -1L
+            return ((System.nanoTime() - t0) / 1_000_000).coerceAtLeast(1L)
+        } catch (t: Throwable) {
+            return -1L
+        } finally {
+            udpPings.release()
         }
     }
 

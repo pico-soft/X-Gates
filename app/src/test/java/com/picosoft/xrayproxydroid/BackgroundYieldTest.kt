@@ -6,6 +6,7 @@ import com.picosoft.xrayproxydroid.service.ProxyState
 import com.picosoft.xrayproxydroid.xray.link.Protocol
 import com.picosoft.xrayproxydroid.xray.link.ServerProfile
 import org.junit.After
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -34,6 +35,15 @@ class BackgroundYieldTest {
         assertTrue(NetworkMonitor.backgroundMustYield(ctx, profile(port)))
         // Следующий сервер в том же рейтинге: без новых пингов, флаг уже стоит.
         assertTrue(NetworkMonitor.backgroundMustYield(ctx, null))
+    }
+
+    @Test fun udp_active_server_is_judged_through_tunnel_not_by_tcp() {
+        // Порт закрыт, и у живого UDP-сервера так всегда: TCP-пинг дал бы -1 и рабочий туннель считался бы оборванным.
+        val port = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1")).use { it.localPort }
+        val udp = profile(port).copy(network = "kcp")
+        assertEquals(42, NetworkMonitor.activePing(ctx, udp, 1000) { 42 })
+        assertEquals(-1, NetworkMonitor.activePing(ctx, udp.copy(network = "mkcp"), 1000) { -1 })
+        assertEquals("tcp идёт обычным пингом", -1, NetworkMonitor.activePing(ctx, profile(port), 1000) { 42 })
     }
 
     @Test fun stopped_proxy_stops_background_work() {

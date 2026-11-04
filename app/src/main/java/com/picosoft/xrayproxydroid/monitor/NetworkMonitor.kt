@@ -147,11 +147,23 @@ object NetworkMonitor {
 
     internal fun resetBackgroundYield() { backgroundYielded = false }
 
+    /**
+     * Живость активного. TCP-пинг к UDP-серверу не проходит никогда: рабочий mKCP-туннель в простое считался бы оборванным. Временное
+     * ядро на каждую проверку (на зарядке раз в 10 с) слишком дорого, поэтому для UDP спрашиваем внешний IP через сам туннель.
+     */
+    internal fun activePing(app: Context, p: com.picosoft.xrayproxydroid.xray.link.ServerProfile, timeoutMs: Int, udpPing: (Int) -> Int = ::tunnelPing): Int =
+        if (ServerTester.isUdp(p)) udpPing(timeoutMs) else ServerTester.ping(app, p, timeoutMs).toInt()
+
+    private fun tunnelPing(timeoutMs: Int): Int {
+        val t0 = now()
+        return if (ExternalIpChecker.fetch(timeoutMs = timeoutMs, maxEndpoints = 2) != null) (now() - t0).coerceAtLeast(1L).toInt() else -1
+    }
+
     /** Прервать ли фоновые замеры: ручной тест, прокси остановлен или активный [active] молчит. */
     internal fun backgroundMustYield(app: Context, active: com.picosoft.xrayproxydroid.xray.link.ServerProfile?): Boolean {
         if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey == null || backgroundYielded) return true
         if (active == null) return false
-        if (ServerTester.ping(app, active, YIELD_PING_TIMEOUT_MS) >= 0 || ServerTester.ping(app, active, YIELD_PING_TIMEOUT_MS) >= 0) return false
+        if (activePing(app, active, YIELD_PING_TIMEOUT_MS) >= 0 || activePing(app, active, YIELD_PING_TIMEOUT_MS) >= 0) return false
         backgroundYielded = true
         return true
     }
@@ -457,7 +469,7 @@ object NetworkMonitor {
             // Пинг активного — tcping его host:port (ServerTester.ping, быстро, реально; latencyMs давал абсурд 5888мс).
             var activePm = -1
             if (curSrv0 != null) {
-                activePm = ServerTester.ping(app, curSrv0, PING_LIVENESS_TIMEOUT_MS).toInt()
+                activePm = activePing(app, curSrv0, PING_LIVENESS_TIMEOUT_MS)
                 if (activePingSaveDue(fastChecksOnCharger(app, cur), activePm, lastPingSaved, now() - lastPingSavedMs)) {
                     SubscriptionManager.applyPingResults(app, mapOf(curKey0!! to activePm))   // плашка/список — реальный пинг
                     lastPingSaved = activePm; lastPingSavedMs = now()

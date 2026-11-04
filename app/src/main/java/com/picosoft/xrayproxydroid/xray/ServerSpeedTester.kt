@@ -274,7 +274,7 @@ object ServerSpeedTester {
      * Жив ли сервер по РЕАЛЬНОЙ передаче: поднять temp-инстанс на эфемерном порту, скачать несколько КБ
      * через его socks. true — пришло ≥ [PROBE_ALIVE_MIN_BYTES]. Не трогает активный прокси. Трафик → «Тест».
      */
-    fun probeAlive(context: Context, profile: ServerProfile): Boolean {
+    fun probeAlive(context: Context, profile: ServerProfile, maxProbes: Int = Int.MAX_VALUE, timeoutMs: Int = PROBE_ALIVE_TIMEOUT_MS): Boolean {
         XrayController.ensureEnv(context)
         val verbose = SettingsStore.current().verboseLogs
         fun log(msg: String) { if (verbose) Log.i(TAG, msg) }
@@ -294,8 +294,8 @@ object ServerSpeedTester {
                 }
                 val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", port))
                 var testBytes = 0L
-                for (probe in probes) {
-                    val got = downloadSome(probe, proxy, PROBE_ALIVE_TARGET_BYTES, PROBE_ALIVE_TIMEOUT_MS)
+                for (probe in probes.take(maxProbes)) {
+                    val got = downloadSome(probe, proxy, PROBE_ALIVE_TARGET_BYTES, timeoutMs)
                     testBytes += got
                     if (got >= PROBE_ALIVE_MIN_BYTES) {
                         TrafficTracker.addTest(testBytes)
