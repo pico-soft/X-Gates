@@ -3266,9 +3266,13 @@ private fun OptimizeChecksBlock(settings: AppSettings, onChange: (AppSettings) -
             "Поддержание топа: ${fmtData(TrafficEstimate.optimizeMbPerMonth(settings, TrafficEstimate.FAST_MBPS))} на быстром сервере (от 10 Мбит/с), ${fmtData(TrafficEstimate.optimizeMbPerMonth(settings, TrafficEstimate.SLOW_MBPS))} на очень медленном (ниже 1 Мбит/с): там на зарядке по Wi-Fi более быстрый ищем каждую минуту.",
             style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
         )
-        BoolSettingRow("Перемер только по Wi-Fi", settings.monitorOptimizeWifiOnly, dd.monitorOptimizeWifiOnly) {
+        BoolSettingRow("Перемер только на безлимитной сети", settings.monitorOptimizeWifiOnly, dd.monitorOptimizeWifiOnly) {
             onChange(settings.copy(monitorOptimizeWifiOnly = it))
         }
+        Text(
+            "Лимитную сеть определяет Android: мобильная связь всегда лимитная, и Wi-Fi, раздаваемый с другого телефона, Android по умолчанию тоже считает лимитным — даже при безлимитном тарифе. Тогда перемер не идёт. Если тариф безлимитный, выключите здесь или отметьте эту сеть в настройках Wi-Fi телефона как безлимитную.",
+            style = MaterialTheme.typography.bodySmall, color = TABLE_GRAY,
+        )
         IntSettingRow("Не перемерять при простое дольше", "мин (0=всегда)", settings.monitorOptimizeIdleSkipSec / 60, dd.monitorOptimizeIdleSkipSec / 60, 0, 240) {
             onChange(settings.copy(monitorOptimizeIdleSkipSec = it * 60))
         }

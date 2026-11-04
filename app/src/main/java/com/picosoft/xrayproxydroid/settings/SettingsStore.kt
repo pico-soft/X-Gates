@@ -108,7 +108,7 @@ data class AppSettings(
     // меньше трафика, чем полный замер (верхняя граница 13 МБ на быстрый сервер). Ориентир 5-10 Мбит/с — хватает на видео.
     val sufficientMbps: Double = 8.0,
     // Пр.126.A: предохранители перемера (работают, когда активный интервал > 0). ОБЩИЕ для обоих режимов.
-    val monitorOptimizeWifiOnly: Boolean = true,      // не перемерять на мобильной/платной сети — только Wi-Fi
+    val monitorOptimizeWifiOnly: Boolean = true,      // не перемерять на лимитной по Android сети (мобильная, раздача с телефона)
     val monitorOptimizeIdleSkipSec: Int = 1800,       // не перемерять, если через туннель давно нет трафика, с (0=не пропускать)
     val monitorOptimizeSkipAboveMbps: Double = 10.0,  // не перемерять, если текущий уже быстрый (≥), Мбит/с (0=не пропускать)
     val monitorDirectThreshold: Double = 1.0,   // порог прямого канала, Мбит/с (эталон direct_speed_threshold)

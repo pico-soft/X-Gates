@@ -1191,7 +1191,7 @@ object NetworkMonitor {
         }
     }
 
-    /** Активная сеть — платная (мобильная/лимитный хотспот)? Гейт «только Wi-Fi» для дорогого перемера (Пр.126.A). */
+    /** Активная сеть — лимитная по Android (мобильная/раздача с телефона)? Гейт «только на безлимитной» для дорогого перемера (Пр.126.A). */
     private fun isMeteredNetwork(app: Context): Boolean =
         (app.getSystemService(ConnectivityManager::class.java))?.isActiveNetworkMetered ?: false
 
@@ -1200,7 +1200,7 @@ object NetworkMonitor {
      * против дорогого трафика в фоне: платная сеть, давно нет трафика через туннель, текущий сервер уже быстрый.
      */
     private fun optimizeSkipReason(app: Context, s: AppSettings, lastUserTrafficMs: Long, chargingWifi: Boolean): String? {
-        if (s.monitorOptimizeWifiOnly && isMeteredNetwork(app)) return "мобильная/платная сеть — только по Wi-Fi"
+        if (s.monitorOptimizeWifiOnly && isMeteredNetwork(app)) return "сеть лимитная по Android (мобильная или раздача с телефона) — перемер только на безлимитной"
         if (s.monitorOptimizeIdleSkipSec > 0 && now() - lastUserTrafficMs > s.monitorOptimizeIdleSkipSec * 1000L)
             return "через туннель давно нет трафика (${humanDur(now() - lastUserTrafficMs)}) — нечего оптимизировать"
         if (s.monitorOptimizeSkipAboveMbps > 0 && !chargingWifi) {   // на зарядке по Wi-Fi быстрый сервер не исключение, а редкая проверка
