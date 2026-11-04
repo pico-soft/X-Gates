@@ -413,30 +413,30 @@ object SubscriptionManager {
     fun applyPingResults(context: Context, pingByKey: Map<String, Int>) {
         if (pingByKey.isEmpty()) return
         val ts = now()
-        val file = SubscriptionStore.load(context)
-        val servers = file.servers.map { rec ->
-            val ms = pingByKey[serverKey(rec.profile)]
-            if (ms != null) rec.copy(profile = rec.profile.copy(pingMs = ms, lastTestedTs = ts)) else rec
+        SubscriptionStore.update(context) { file ->
+            file.copy(servers = file.servers.map { rec ->
+                val ms = pingByKey[serverKey(rec.profile)]
+                if (ms != null) rec.copy(profile = rec.profile.copy(pingMs = ms, lastTestedTs = ts)) else rec
+            })
         }
-        SubscriptionStore.save(context, file.copy(servers = servers))
     }
 
     /** Обновить speedMbps (ключ→Mbps) в реестре и сохранить ОДИН раз. speedFull НЕ трогаем (легаси/неизвестно). */
     fun applySpeedResults(context: Context, speedByKey: Map<String, Double>) {
         if (speedByKey.isEmpty()) return
         val ts = now()
-        val file = SubscriptionStore.load(context)
-        val servers = file.servers.map { rec ->
-            val mbps = speedByKey[serverKey(rec.profile)]
-            when {
-                mbps == null -> rec
-                // Провал замера (-1) НЕ затирает прежнюю ВАЛИДНУЮ скорость (Пр.88: не терять данные при массовом
-                // провале temp-инстансов). Обновляем измерение только валидным результатом (≥0) или если раньше данных не было.
-                mbps < 0 && (rec.profile.speedMbps ?: -1.0) >= 0.0 -> rec
-                else -> rec.copy(profile = rec.profile.copy(speedMbps = mbps, speedTestedTs = ts))
-            }
+        SubscriptionStore.update(context) { file ->
+            file.copy(servers = file.servers.map { rec ->
+                val mbps = speedByKey[serverKey(rec.profile)]
+                when {
+                    mbps == null -> rec
+                    // Провал замера (-1) НЕ затирает прежнюю ВАЛИДНУЮ скорость (Пр.88: не терять данные при массовом
+                    // провале temp-инстансов). Обновляем измерение только валидным результатом (≥0) или если раньше данных не было.
+                    mbps < 0 && (rec.profile.speedMbps ?: -1.0) >= 0.0 -> rec
+                    else -> rec.copy(profile = rec.profile.copy(speedMbps = mbps, speedTestedTs = ts))
+                }
+            })
         }
-        SubscriptionStore.save(context, file.copy(servers = servers))
     }
 
     /** Как [applySpeedResults], но с КАЧЕСТВОМ замера: ключ→(Mbps, full). full=true — полный/точный замер,
@@ -444,17 +444,17 @@ object SubscriptionManager {
     fun applySpeedResultsTagged(context: Context, speedByKey: Map<String, Pair<Double, Boolean>>) {
         if (speedByKey.isEmpty()) return
         val ts = now()
-        val file = SubscriptionStore.load(context)
-        val servers = file.servers.map { rec ->
-            val pair = speedByKey[serverKey(rec.profile)]
-            when {
-                pair == null -> rec
-                // Тот же guard: провал (-1) не затирает прежнюю валидную скорость (и её качество).
-                pair.first < 0 && (rec.profile.speedMbps ?: -1.0) >= 0.0 -> rec
-                else -> rec.copy(profile = rec.profile.copy(speedMbps = pair.first, speedTestedTs = ts, speedFull = pair.second))
-            }
+        SubscriptionStore.update(context) { file ->
+            file.copy(servers = file.servers.map { rec ->
+                val pair = speedByKey[serverKey(rec.profile)]
+                when {
+                    pair == null -> rec
+                    // Тот же guard: провал (-1) не затирает прежнюю валидную скорость (и её качество).
+                    pair.first < 0 && (rec.profile.speedMbps ?: -1.0) >= 0.0 -> rec
+                    else -> rec.copy(profile = rec.profile.copy(speedMbps = pair.first, speedTestedTs = ts, speedFull = pair.second))
+                }
+            })
         }
-        SubscriptionStore.save(context, file.copy(servers = servers))
     }
 
     // ─────────────────────────── управление источниками ───────────────────────────

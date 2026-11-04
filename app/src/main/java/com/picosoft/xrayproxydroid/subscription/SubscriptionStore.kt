@@ -55,6 +55,12 @@ object SubscriptionStore {
         }
     }
 
+    /** Чтение и запись одним шагом: замеры пишут из нескольких потоков, и между load и save чужой результат терялся. */
+    @Synchronized
+    fun update(context: Context, change: (SourcesFile) -> SourcesFile) {
+        save(context, change(load(context)))
+    }
+
     /** Сырое чтение СТАРОГО формата (`subscriptions.json` = список [Subscription] со вложенными
      *  серверами) — только для однократной миграции. Пусто, если файла нет или он не в старой схеме. */
     fun readLegacy(context: Context): List<Subscription> {
