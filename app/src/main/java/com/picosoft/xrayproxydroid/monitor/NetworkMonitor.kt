@@ -1585,18 +1585,21 @@ object NetworkMonitor {
         MonitorLog.event(app, "monitor", "Туннель медленный (${fmt(passiveDown)}) — проверяю кандидатов (${ordered.size})",
             ordered.joinToString(", ") { ServerLabels.display(it) })
         MonitorCoordinator.monitorSearchRunning = true
+        val seen = ArrayList<String>()
         try {
             for (cand in ordered) {
                 if (ProxyState.state.value.serverKey != curKey) return   // пользователь/лестница сменили — не вмешиваемся
                 val candMbps = ServerSpeedTester.measureSpeed(app, cand) // замер temp-инстансом (активный не дёргаем)
                 SubscriptionManager.applySpeedResults(app, mapOf(SubscriptionManager.serverKey(cand) to candMbps))
                 if (ProxyState.state.value.serverKey != curKey) return
+                seen += "${ServerLabels.display(cand)} ${fmt(candMbps)}"
                 if (worthLeaving(candMbps, passiveDown, cur)) {
                     // Потребление — ещё не скорость: браузер читает страницу, а туннель тянет 15 Мбит/с. Правило Elyor — уходить, только
                     // если уверены, поэтому перед уходом меряем сам туннель. Замер не состоялся — уверенности нет, остаёмся.
                     val curProfile = SubscriptionManager.allServers(app).firstOrNull { SubscriptionManager.serverKey(it) == curKey }
-                    val curMbps = if (curProfile != null) ServerSpeedTester.measureSufficiency(app, curProfile, candMbps) else -1.0
+                    val curMbps = if (curProfile != null) ServerSpeedTester.measureSpeed(app, curProfile) else -1.0   // тем же замером, что кандидата: короткий с ним несравним
                     if (ProxyState.state.value.serverKey != curKey) return
+                    seen += "сам туннель ${fmt(curMbps)}"
                     if (curMbps <= 0.0 || !worthLeaving(candMbps, maxOf(curMbps, passiveDown), cur)) continue
                     val cfg = runCatching { XrayConfigBuilder.build(cand) }.getOrNull() ?: continue
                     val from = ServerLabels.displayForKey(app, curKey)
@@ -1608,7 +1611,7 @@ object NetworkMonitor {
                 }
             }
             MonitorLog.event(app, "monitor", "Никто из кандидатов не лучше — остаюсь",
-                "порог ${fmt(cur.degradationMinMbps)}, сейчас ${fmt(passiveDown)}")
+                "порог ${fmt(cur.degradationMinMbps)}, сейчас ${fmt(passiveDown)}; ${seen.joinToString(", ")}")
         } finally {
             MonitorCoordinator.monitorSearchRunning = false
         }
