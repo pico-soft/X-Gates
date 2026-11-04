@@ -296,7 +296,8 @@ class XrayProxyService : Service() {
             ACTION_START -> handleStart(intent)
             ACTION_STOP -> handleStop()
             ACTION_RETRY_BYPASS -> { bypassRetryAfterMs = 0L; scheduleVpnBypass() }   // «Повторить» из статус-бокса
-            ACTION_BOOT -> handleRestartAfterKill(boot = true)   // Пр.134: автозапуск после перезагрузки телефона
+            ACTION_BOOT -> handleRestartAfterKill(Revival.BOOT)   // Пр.134: автозапуск после перезагрузки телефона
+            ACTION_UPDATED -> handleRestartAfterKill(Revival.UPDATE)   // приложение обновили, пока прокси работал
             // Промпт 115: intent==null при START_STICKY = система ВЕРНУЛА сервис после убийства (данные в
             // намерении не передаются). Поднимаем последний сервер из LastServerStore, а не стопаемся.
             null -> if (intent == null) handleRestartAfterKill() else stopSelfAndForeground()
@@ -316,6 +317,7 @@ class XrayProxyService : Service() {
             stopSelfAndForeground()
             return
         }
+        LastServerStore.markStopped(applicationContext, false)
 
         // В foreground нужно уйти в течение ~5с после старта — иначе ANR.
         startForeground(NotificationHelper.NOTIFICATION_ID, NotificationHelper.buildNotification(this, label))
@@ -342,17 +344,23 @@ class XrayProxyService : Service() {
      * теста: это не открытие человеком). Нет сохранённого сервера/профиля/конфига — ядро вслепую НЕ поднимаем,
      * а завершаем сервис и пишем событие. Записываем и факт восстановления с оценкой простоя (по heartbeat).
      */
-    private fun handleRestartAfterKill(boot: Boolean = false) {
+    private enum class Revival { KILLED, BOOT, UPDATE }
+
+    private fun handleRestartAfterKill(why: Revival = Revival.KILLED) {
         // Сразу в foreground (иначе ANR/таймаут FGS), затем в фоне поднимаем последний сервер.
-        val fgText = if (boot) "автозапуск…" else "восстановление…"
+        val fgText = when (why) { Revival.BOOT -> "автозапуск…"; Revival.UPDATE -> "после обновления…"; Revival.KILLED -> "восстановление…" }
         startForeground(NotificationHelper.NOTIFICATION_ID, NotificationHelper.buildNotification(this, fgText))
-        ProxyState.update(running = false, label = null, serverKey = null, message = if (boot) "автозапуск после включения…" else "восстановление после сбоя…")
+        ProxyState.update(running = false, label = null, serverKey = null, message = when (why) {
+            Revival.BOOT -> "автозапуск после включения…"; Revival.UPDATE -> "запуск после обновления…"; Revival.KILLED -> "восстановление после сбоя…"
+        })
         coreActive = true
         bypassRetryAfterMs = 0L
         // ТЗ Elyor «Только Wi-Fi»: возврат сервиса (START_STICKY/автозагрузка) на МОБИЛЬНОЙ сети → не поднимаем ядро,
         // сразу пауза. Когда появится Wi-Fi — сетевой колбэк возобновит (поднимет последний сервер из LastServerStore).
         if (SettingsStore.current().wifiOnlyEnabled && com.picosoft.xrayproxydroid.monitor.EconomyNet.currentMobile(applicationContext)) {
-            enterWifiOnlyPause(null, null, if (boot) "автозапуск на мобильной сети" else "восстановление на мобильной сети")
+            enterWifiOnlyPause(null, null, when (why) {
+                Revival.BOOT -> "автозапуск на мобильной сети"; Revival.UPDATE -> "обновление на мобильной сети"; Revival.KILLED -> "восстановление на мобильной сети"
+            })
             return
         }
         val downtimeMs = LastServerStore.lastAlive(applicationContext).let { if (it > 0L) System.currentTimeMillis() - it else -1L }
@@ -375,7 +383,10 @@ class XrayProxyService : Service() {
                 if (profile == null || config == null) {
                     MonitorLog.event(
                         applicationContext, "monitor",
-                        if (boot) "Автозагрузка — поднимать нечем" else "Сервис убит системой — восстановить нечем",
+                        when (why) {
+                            Revival.BOOT -> "Автозагрузка — поднимать нечем"; Revival.UPDATE -> "После обновления — поднимать нечем"
+                            Revival.KILLED -> "Сервис убит системой — восстановить нечем"
+                        },
                         if (lastKey == null) "нет сохранённого сервера" else "последнего сервера нет в списке / конфиг не собрался",
                     )
                     runCatching { stopSelfAndForeground() }
@@ -385,8 +396,15 @@ class XrayProxyService : Service() {
                 val serverKey = SubscriptionManager.serverKey(profile)
                 val downtimeStr = if (downtimeMs in 0..(48L * 3600_000L)) "простой ~${downtimeMs / 1000}с" else "простой неизвестен"
                 MonitorLog.event(applicationContext, "monitor",
-                    if (boot) "Автозапуск после включения телефона" else "Сервис был убит системой — восстанавливаюсь",
-                    if (boot) "последний сервер: $label" else "$downtimeStr · сервер: $label")
+                    when (why) {
+                        Revival.BOOT -> "Автозапуск после включения телефона"; Revival.UPDATE -> "Приложение обновлено — поднимаю прокси"
+                        Revival.KILLED -> "Сервис был убит системой — восстанавливаюсь"
+                    },
+                    if (why == Revival.KILLED) "$downtimeStr · сервер: $label" else "последний сервер: $label")
+                runCatching {   // в уведомлении вместо «автозапуск…» — сервер, как при возобновлении «Только Wi-Fi»
+                    androidx.core.app.NotificationManagerCompat.from(this)
+                        .notify(NotificationHelper.NOTIFICATION_ID, NotificationHelper.buildNotification(this, label))
+                }
                 runCoreStart(config, label, serverKey, gen)
             } catch (e: Exception) {
                 Log.w("XrayProxyService", "восстановление после убийства упало (проглочено): ${e.message}", e)
@@ -478,6 +496,7 @@ class XrayProxyService : Service() {
     }
 
     private fun handleStop() {
+        LastServerStore.markStopped(applicationContext, true)   // после обновления приложения прокси сам не поднимется
         stopMonitor()
         wifiOnlyPaused = false   // пользователь нажал Стоп — выходим из «Только Wi-Fi» паузы (сервис завершается полностью)
         com.picosoft.xrayproxydroid.monitor.TunnelHealth.reset()   // Промпт 95: прокси остановлен — статус не зелёный
@@ -666,6 +685,7 @@ class XrayProxyService : Service() {
         const val ACTION_STOP = "com.picosoft.xrayproxydroid.action.STOP"
         const val ACTION_RETRY_BYPASS = "com.picosoft.xrayproxydroid.action.RETRY_BYPASS"
         const val ACTION_BOOT = "com.picosoft.xrayproxydroid.action.BOOT"   // Пр.134: автозапуск после перезагрузки
+        const val ACTION_UPDATED = "com.picosoft.xrayproxydroid.action.UPDATED"   // подъём после обновления приложения
         const val EXTRA_CONFIG = "config"
         const val EXTRA_LABEL = "label"
         const val EXTRA_SERVERKEY = "serverKey"
@@ -713,6 +733,12 @@ class XrayProxyService : Service() {
         /** Пр.134: старт из BootReceiver — поднять последний сервер (без конфига в intent, как sticky-рестарт). */
         fun startFromBoot(context: Context) {
             val intent = Intent(context, XrayProxyService::class.java).setAction(ACTION_BOOT)
+            ContextCompat.startForegroundService(context, intent)
+        }
+
+        /** Старт из [UpdateReceiver]: приложение обновили, пока прокси работал — поднять последний сервер. */
+        fun startAfterUpdate(context: Context) {
+            val intent = Intent(context, XrayProxyService::class.java).setAction(ACTION_UPDATED)
             ContextCompat.startForegroundService(context, intent)
         }
 

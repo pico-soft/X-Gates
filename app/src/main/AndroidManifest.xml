@@ -82,6 +82,16 @@
             </intent-filter>
         </receiver>
 
+        <!-- Подъём прокси после обновления приложения (решение Elyor 2026-11-03). MY_PACKAGE_REPLACED шлёт только система
+             и только этому приложению; из него разрешено поднять foreground-сервис. -->
+        <receiver
+            android:name=".service.UpdateReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
         <!-- Статус установки через системный PackageInstaller (session API — запасной путь для устройств без
              активити-обработчика ACTION_VIEW, напр. автомагнитолы). Не экспортируем: адресуем по компоненту. -->
         <receiver

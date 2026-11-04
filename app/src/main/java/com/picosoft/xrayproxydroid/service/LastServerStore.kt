@@ -17,6 +17,8 @@ object LastServerStore {
     private const val PREFS = "last_server"
     private const val KEY = "serverKey"
     private const val KEY_ALIVE = "aliveHeartbeatMs"   // Промпт 115: «пульс живости» сервиса — для оценки простоя
+    private const val KEY_STOPPED = "stoppedByUser"    // «Стоп» или «Завершить приложение»: после обновления прокси не поднимаем
+    private const val PULSE_FRESH_MS = 60_000L         // пульс пишется раз в 15 с, пока туннель поднят
 
     private fun prefs(context: Context) =
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -37,4 +39,19 @@ object LastServerStore {
 
     /** Время последнего «пульса» (мс) или 0, если сервис ещё ни разу не отмечался. */
     fun lastAlive(context: Context): Long = prefs(context).getLong(KEY_ALIVE, 0L)
+
+    /** Пользователь остановил прокси (true) или прокси запущен (false). Читает [runningBeforeUpdate]. */
+    fun markStopped(context: Context, stopped: Boolean) {
+        prefs(context).edit().putBoolean(KEY_STOPPED, stopped).apply()
+    }
+
+    /**
+     * Работал ли прокси, когда обновление приложения убило процесс. Версии до 0.64 флага [KEY_STOPPED] не писали:
+     * тогда судим по пульсу, свежий пульс значит, что туннель был поднят.
+     */
+    fun runningBeforeUpdate(context: Context): Boolean {
+        val p = prefs(context)
+        if (p.contains(KEY_STOPPED)) return !p.getBoolean(KEY_STOPPED, false)
+        return System.currentTimeMillis() - lastAlive(context) < PULSE_FRESH_MS
+    }
 }
