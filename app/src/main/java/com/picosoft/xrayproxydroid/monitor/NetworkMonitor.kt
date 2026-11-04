@@ -268,6 +268,7 @@ object NetworkMonitor {
         var lastFullCycleMs = 0L           // дебаунс паразитных пробуждений: когда последний раз делали ДОРОГУЮ работу цикла (пинг/IP/замер)
         var lastTopPingMs = 0L             // фоновый рейтинг: когда последний раз пинговали ТОП (держим его живость)
         var lastTopRateMs = 0L             // фоновый рейтинг: когда последний раз делали ПОЛНЫЙ замер топа (перестройка)
+        var ipUnconfirmed = false          // внешний IP не получен: зелёной плашки не будет, пока не получим
         var lastIpRefreshMs = 0L           // Пр.150: когда последний раз тянули внешний IP для ПОКАЗА на плашке
         var screenOffSinceMs = 0L          // лестница интервалов: когда экран ПОГАС (0 = экран включён/ещё не гас)
         val cycleLock = MonitorAlarm.newWakeLock(app)   // держит CPU на время ОДНОГО цикла (иначе уснёт посреди пробы)
@@ -467,7 +468,9 @@ object NetworkMonitor {
                         if (mbps < cur.minUsableMbps) {
                             // пинг есть, но трафик реально НЕ идёт (полу-мёртвый) → в восстановление. Таймер НЕ двигаем:
                             // следующий цикл перемерит; устойчивый провал → grace истечёт → лестница сменит сервер.
-                            aliveNow = false
+                            // Замер идёт отдельным временным ядром и мог упасть сам по себе: судим по самому туннелю.
+                            aliveNow = ExternalIpChecker.fetch() != null
+                            if (aliveNow) lastLivenessMeasureMs = now()   // туннель жив: временное ядро каждый цикл не гоняем
                         } else {
                             lastLivenessMeasureMs = now()         // успешный замер — держим редкий интервал
                             // АПГРЕЙД С МЕДЛЕННОГО (Q3 Elyor): активный ниже порога деградации → зафиксировать низкую
@@ -486,10 +489,16 @@ object NetworkMonitor {
                 lastLiveConfirmedMs = now(); graceRecheck = false
                 onRecovered(app)
                 // Внешний IP — ТОЛЬКО для показа, реже (флап не влияет на вердикт). Не вышло — держим прежний.
-                val ipShown = if (now() - lastIpRefreshMs >= IP_REFRESH_MS) {
-                    lastIpRefreshMs = now(); ExternalIpChecker.fetch() ?: TunnelHealth.snapshot().ip
-                } else TunnelHealth.snapshot().ip
-                TunnelHealth.ok(ipShown, now(), curKey0 ?: "")   // Пр.123.B: подтверждение принадлежит активному серверу
+                // Зелёная плашка — только по факту: открытый порт сервера ещё не значит, что через него идут данные.
+                var ipShown = TunnelHealth.snapshot().ip
+                if (ipUnconfirmed || now() - lastIpRefreshMs >= IP_REFRESH_MS) {
+                    lastIpRefreshMs = now()
+                    val fresh = ExternalIpChecker.fetch()
+                    ipUnconfirmed = fresh == null
+                    if (fresh != null) ipShown = fresh
+                }
+                if (ipUnconfirmed) TunnelHealth.setPhase(TunnelHealth.Phase.VERIFYING, now(), "связь не подтверждена — проверяю")
+                else TunnelHealth.ok(ipShown, now(), curKey0 ?: "")   // Пр.123.B: подтверждение принадлежит активному серверу
                 failures = 0; backoffMs = 0; restartedKeySinceOk = null   // Промпт 102: связь ок — сбросить «уже перезапускали»
                 MonitorStatus.update(true, "ок", now(), cycles)
                 // ЖИВАЯ скорость плашки (гибрид): раз в цикл сэмплируем — реальный трафик даёт скорость
@@ -1186,7 +1195,7 @@ object NetworkMonitor {
             // переключимся, лишь когда текущий перестал быть достаточным (порог/низкий → ×N сработает).
             val enough = s.sufficientMbps.coerceAtLeast(0.1)
             val curProfile = all.firstOrNull { key(it) == curKey }
-            val curMbps = if (curProfile != null) ServerSpeedTester.measureSufficiency(app, curProfile, enough) else -1.0
+            var curMbps = if (curProfile != null) ServerSpeedTester.measureSufficiency(app, curProfile, enough) else -1.0
             val results = HashMap<String, Double>()
             if (curMbps > 0) results[curKey] = curMbps
             var bestKey: String? = null; var bestMbps = 0.0
@@ -1201,10 +1210,28 @@ object NetworkMonitor {
                 if (mbps > bestMbps && !isUnstableKey(k)) { bestMbps = mbps; bestKey = k }
             }
             // лучший из СВЕЖЕГО топа тоже участвует в решении (его не перемеряли — он свежий); нестабильных не берём.
-            for (p in freshTop) { val sp = p.speedMbps ?: 0.0; if (sp > bestMbps && !isUnstableKey(key(p))) { bestMbps = sp; bestKey = key(p) } }
+            // Число из памяти — только повод проверить, не основание уйти с живого туннеля: «свежим» считается замер до
+            // topFreshSec (6 ч), сервер мог давно умереть (Windows 10, Elyor 2026-11-01: монитор раз за разом уводил на мёртвый №1).
+            val bestStored = freshTop.firstOrNull { p ->
+                val sp = p.speedMbps ?: 0.0
+                key(p) != curKey && key(p) !in results && !isUnstableKey(key(p)) && sp > bestMbps && curMbps > 0 && sp >= curMbps * s.keepBestMultiplier
+            }
+            if (bestStored != null) {
+                val k = key(bestStored)
+                val mbps = ServerSpeedTester.measureSufficiency(app, bestStored, enough)
+                if (MonitorCoordinator.fullTestRunning || ProxyState.state.value.serverKey != curKey) return
+                results[k] = mbps
+                if (mbps > bestMbps) { bestMbps = mbps; bestKey = k }
+                // Провал скорость в реестре не затирает (Пр.88), поэтому из «Живых» его убирает пинг, иначе он так и стоял бы первым.
+                if (mbps <= 0.0) SubscriptionManager.applyPingResults(app, mapOf(k to -1))
+            }
             SubscriptionManager.applySpeedResults(app, results)
             // ПРАВИЛО «ДЕРЖАТЬ ЛУЧШИЙ» (Промпт 90.A): переключаемся, если лучший быстрее текущего КРАТНО
             // (в keepBestMultiplier раз), даже когда текущий выше порога. Кратно — чтобы шум не дёргал.
+            // Короткий замер шумит: на стенде Windows-версии два одинаковых сервера показали разницу больше ×3. Перед тем как рвать
+            // живой туннель, перемеряем текущий и уходим, только если разрыв подтвердился (правило Elyor: только если уверены).
+            if (bestKey != null && bestKey != curKey && curMbps > 0 && bestMbps >= curMbps * s.keepBestMultiplier)
+                curMbps = maxOf(curMbps, ServerSpeedTester.measureSufficiency(app, curProfile!!, enough))
             if (bestKey != null && bestKey != curKey && curMbps > 0 && bestMbps >= curMbps * s.keepBestMultiplier) {
                 val target = all.firstOrNull { key(it) == bestKey } ?: return
                 val cfg = runCatching { XrayConfigBuilder.build(target) }.getOrNull() ?: return
@@ -1482,6 +1509,13 @@ object NetworkMonitor {
     }
 
     /**
+     * Правило Elyor: с живого туннеля уходим, только если уверены, что другой намного быстрее. [candMbps] — замер сейчас,
+     * не число из памяти. Медленный туннель всё равно живой: «чуть быстрее» не повод его рвать.
+     */
+    internal fun worthLeaving(candMbps: Double, curMbps: Double, s: AppSettings): Boolean =
+        candMbps >= s.degradationMinMbps && candMbps >= curMbps * s.keepBestMultiplier
+
+    /**
      * Пр.127.C: «живой, но медленный». Наблюдаемая по ПАССИВНОМУ трафику скорость [passiveDown] ниже порога
      * полезности → сделать ОДИН шаг: замерить ЛУЧШЕГО по СОХРАНЁННОЙ скорости кандидата (не текущего) и перейти,
      * если он приемлемо быстрее того, что человек реально получает сейчас. Один кандидат, один замер, не перебор.
@@ -1518,7 +1552,7 @@ object NetworkMonitor {
                 val candMbps = ServerSpeedTester.measureSpeed(app, cand) // замер temp-инстансом (активный не дёргаем)
                 SubscriptionManager.applySpeedResults(app, mapOf(SubscriptionManager.serverKey(cand) to candMbps))
                 if (ProxyState.state.value.serverKey != curKey) return
-                if (candMbps >= cur.degradationMinMbps && candMbps > passiveDown) {
+                if (worthLeaving(candMbps, passiveDown, cur)) {
                     val cfg = runCatching { XrayConfigBuilder.build(cand) }.getOrNull() ?: continue
                     val from = ServerLabels.displayForKey(app, curKey)
                     XrayProxyService.start(app, cfg, ServerLabels.full(cand), SubscriptionManager.serverKey(cand))
