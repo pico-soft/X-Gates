@@ -1,7 +1,9 @@
 package com.picosoft.xrayproxydroid
 
 import com.picosoft.xrayproxydroid.monitor.NetworkMonitor
+import com.picosoft.xrayproxydroid.monitor.TunnelSpeed
 import com.picosoft.xrayproxydroid.settings.AppSettings
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -28,6 +30,30 @@ class LeaveLiveTunnelTest {
         // Страница в браузере: за 6 с скачано 0,7 Мбит/с, а туннель тянет 15. Кандидат на 3 проходит только против потребления.
         assertTrue(NetworkMonitor.worthLeaving(candMbps = 3.0, curMbps = 0.7, s))
         assertFalse(NetworkMonitor.worthLeaving(candMbps = 3.0, curMbps = maxOf(15.0, 0.7), s))
+    }
+
+    @Test fun the_slower_the_active_server_the_more_often_we_look_for_a_faster_one() {
+        assertEquals(60_000L, NetworkMonitor.upgradeCheckMs(null))
+        assertEquals(60_000L, NetworkMonitor.upgradeCheckMs(0.5))
+        assertEquals(5 * 60_000L, NetworkMonitor.upgradeCheckMs(1.0))
+        assertEquals(5 * 60_000L, NetworkMonitor.upgradeCheckMs(2.9))
+        assertEquals(15 * 60_000L, NetworkMonitor.upgradeCheckMs(3.0))
+        assertEquals(15 * 60_000L, NetworkMonitor.upgradeCheckMs(9.9))
+        assertEquals(60 * 60_000L, NetworkMonitor.upgradeCheckMs(10.0))
+        assertEquals(60 * 60_000L, NetworkMonitor.upgradeCheckMs(300.0))
+    }
+
+    @Test fun schedule_applies_only_on_charger_with_wifi() {
+        assertEquals(21_600_000L, NetworkMonitor.upgradeIntervalMs(chargingWifi = false, activeMbps = 0.5, optimizeSec = 21600))
+        assertEquals(60_000L, NetworkMonitor.upgradeIntervalMs(chargingWifi = true, activeMbps = 0.5, optimizeSec = 21600))
+        assertEquals("интервал из настроек короче расписания", 1_800_000L, NetworkMonitor.upgradeIntervalMs(chargingWifi = true, activeMbps = 50.0, optimizeSec = 1800))
+    }
+
+    @Test fun measured_speed_of_this_server_wins_over_stored() {
+        val ts = TunnelSpeed.Speed(tunnelDownMbps = 15.0, measuredAtMs = 1000L, serverKey = "a")
+        assertEquals(15.0, NetworkMonitor.activeSpeedForChecks(ts, "a") { 2.0 }!!, 0.0)
+        assertEquals(2.0, NetworkMonitor.activeSpeedForChecks(ts, "b") { 2.0 }!!, 0.0)
+        assertEquals(2.0, NetworkMonitor.activeSpeedForChecks(TunnelSpeed.Speed(serverKey = "a"), "a") { 2.0 }!!, 0.0)
     }
 
     @Test fun stored_speed_is_a_reason_to_check_only_while_it_could_beat_the_tunnel() {

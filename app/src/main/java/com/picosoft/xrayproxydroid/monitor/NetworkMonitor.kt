@@ -284,6 +284,7 @@ object NetworkMonitor {
         var lastSpeedSampleMs = 0L      // живая скорость плашки: когда последний раз сэмплировали
         var lastActiveProbeMs = 0L      // когда последний раз делали АКТИВНУЮ пробу (в простое)
         var sampledKey: String? = null  // чью скорость мерили: другой сервер не ждёт интервала
+        var optimizeSkipLogged = false  // причину пропуска перемера пишем один раз
         var lastExactAlarm = false      // Промпт 118: последний тик поставлен ТОЧНЫМ будильником? (для лога/диагностики)
         var lastWhiteEvalMs = 0L        // Пр.140: когда последний раз оценивали режим белых списков
         var lastWhiteRefreshMs = 0L     // Пр.140: когда последний раз обновляли источники белого списка
@@ -554,19 +555,6 @@ object NetworkMonitor {
                     runCatching { refreshAllPings(app, cur) }
                         .onFailure { MonitorLog.event(app, "error", "Ошибка пинга всех", it.message ?: "") }
                 }
-                // Вторичное: «держать лучший». Пр.126.B: ДЕФОЛТ ВЫКЛ (monitorOptimizeSec=0) — замеры активного и
-                // кандидата несопоставимы, решения шли бы по шуму. Пр.125.E: в экономии тоже выкл. Когда пользователь
-                // включил — предохранители Пр.126.A (Wi-Fi / давно-нет-трафика / текущий-уже-быстрый) + не во время
-                // активной загрузки (чтобы не делить канал и не портить замер).
-                if (!cur.trafficSaveMode && cur.monitorEnabled && cur.activeOptimizeSec > 0 && heavyMeasureAllowed(app) && now() - lastOptimizeMs >= cur.activeOptimizeSec * 1000L) {
-                    lastOptimizeMs = now()
-                    val skip = optimizeSkipReason(app, cur, lastUserTrafficMs)
-                    when {
-                        skip != null -> MonitorLog.event(app, "monitor", "Перемер пропущен (Пр.126)", skip)
-                        userTrafficActive() -> { /* идёт загрузка — не мешаем и не портим замер */ }
-                        else -> runCatching { optimizeToFastest(app, cur) }.onFailure { MonitorLog.event(app, "error", "Ошибка оптимизации", it.message ?: "") }
-                    }
-                }
                 // Пр.141: в ЭКОНОМИИ автоперемер выше выключен, поэтому полу-живой сервер (IP-чек проходит, но
                 // реально плохо) сам не чинится. Раз в economyRecheckSec — ОДИН дешёвый замер достаточности активного;
                 // если ниже порога деградации, шагаем на лучшего кандидата (переиспользуем maybeStepFromDegraded).
@@ -603,6 +591,7 @@ object NetworkMonitor {
                 // Батарея: весь фон-рейтинг (пинг топа + полный замер) — оптимизация «держать лучший», НЕ связь.
                 // На «экран выкл + батарея» откладываем целиком до зарядки/экрана (гейт был только у интервала цикла —
                 // а сам rebuildAndRateTop на батарея+Wi-Fi крутился каждые 30 мин и сажал батарею; см. heavyMeasureAllowed).
+                var rated = false
                 if (!userTrafficActive() && heavyMeasureAllowed(app) &&
                     !MonitorCoordinator.monitorSearchRunning && !MonitorCoordinator.fullTestRunning) {
                     val charging = isCharging(app)
@@ -632,6 +621,31 @@ object NetworkMonitor {
                         lastTopRateMs = now()
                         runCatching { rebuildAndRateTop(app, cur) }
                             .onFailure { MonitorLog.event(app, "error", "Ошибка фон-рейтинга топа", it.message ?: "") }
+                        rated = true
+                    }
+                }
+                // «Держать лучший». Пр.125.E: в экономии выключено. Предохранители Пр.126.A: платная сеть, давно нет трафика, а на батарее ещё
+                // «текущий уже быстрый». На зарядке по Wi-Fi правило Elyor 2026-11-02: сразу после рейтинга и тем чаще, чем медленнее сервер, см.
+                // [upgradeIntervalMs]. Не во время загрузки, чтобы не делить канал и не портить замер; ниже 1 Мбит/с загрузка не повод ждать.
+                if (!backgroundYielded && !cur.trafficSaveMode && cur.monitorEnabled && cur.activeOptimizeSec > 0 && heavyMeasureAllowed(app)) {
+                    val chargingWifi = chargingAndWifi(app)
+                    val activeMbps = if (chargingWifi) activeSpeedForChecks(TunnelSpeed.snapshot(), curKey0) {
+                        SubscriptionManager.allServers(app).firstOrNull { SubscriptionManager.serverKey(it) == curKey0 }?.speedMbps
+                    } else null
+                    if ((chargingWifi && rated) || now() - lastOptimizeMs >= upgradeIntervalMs(chargingWifi, activeMbps, cur.activeOptimizeSec)) {
+                        lastOptimizeMs = now()
+                        val skip = optimizeSkipReason(app, cur, lastUserTrafficMs, chargingWifi)
+                        when {
+                            skip != null -> {
+                                if (!optimizeSkipLogged) MonitorLog.event(app, "monitor", "Перемер пропущен (Пр.126)", skip)   // при частых проверках не засоряем журнал
+                                optimizeSkipLogged = true
+                            }
+                            (!chargingWifi || (activeMbps ?: 0.0) >= 1.0) && userTrafficActive() -> { /* идёт загрузка — не мешаем */ }
+                            else -> {
+                                optimizeSkipLogged = false
+                                runCatching { optimizeToFastest(app, cur) }.onFailure { MonitorLog.event(app, "error", "Ошибка оптимизации", it.message ?: "") }
+                            }
+                        }
                     }
                 }
                 if (backgroundYielded) {   // замеры заметили, что активный молчит: следующая проверка сразу, без обычного интервала
@@ -1180,11 +1194,11 @@ object NetworkMonitor {
      * Пр.126.A: причина ПРОПУСТИТЬ периодический перемер «держать лучший» (null — можно мерить). Предохранители
      * против дорогого трафика в фоне: платная сеть, давно нет трафика через туннель, текущий сервер уже быстрый.
      */
-    private fun optimizeSkipReason(app: Context, s: AppSettings, lastUserTrafficMs: Long): String? {
+    private fun optimizeSkipReason(app: Context, s: AppSettings, lastUserTrafficMs: Long, chargingWifi: Boolean): String? {
         if (s.monitorOptimizeWifiOnly && isMeteredNetwork(app)) return "мобильная/платная сеть — только по Wi-Fi"
         if (s.monitorOptimizeIdleSkipSec > 0 && now() - lastUserTrafficMs > s.monitorOptimizeIdleSkipSec * 1000L)
             return "через туннель давно нет трафика (${humanDur(now() - lastUserTrafficMs)}) — нечего оптимизировать"
-        if (s.monitorOptimizeSkipAboveMbps > 0) {
+        if (s.monitorOptimizeSkipAboveMbps > 0 && !chargingWifi) {   // на зарядке по Wi-Fi быстрый сервер не исключение, а редкая проверка
             val curKey = ProxyState.state.value.serverKey
             val curSpeed = curKey?.let { k ->
                 SubscriptionManager.allServers(app).firstOrNull { SubscriptionManager.serverKey(it) == k }?.speedMbps
@@ -1567,6 +1581,24 @@ object NetworkMonitor {
      * Правило Elyor: с живого туннеля уходим, только если уверены, что другой намного быстрее. [candMbps] — замер сейчас,
      * не число из памяти. Медленный туннель всё равно живой: «чуть быстрее» не повод его рвать.
      */
+    /** Правило Elyor 2026-11-02: чем медленнее активный, тем чаще ищем быстрее. */
+    internal fun upgradeCheckMs(activeMbps: Double?): Long = when {
+        activeMbps == null || activeMbps < 1.0 -> 60_000L
+        activeMbps < 3.0 -> 5 * 60_000L
+        activeMbps < 10.0 -> 15 * 60_000L
+        else -> 60 * 60_000L
+    }
+
+    /** На зарядке по Wi-Fi — расписание [upgradeCheckMs]; на батарее и мобильной как раньше: там каждая проверка стоит заряда и трафика. */
+    internal fun upgradeIntervalMs(chargingWifi: Boolean, activeMbps: Double?, optimizeSec: Int): Long {
+        val base = optimizeSec * 1000L
+        return if (chargingWifi) minOf(upgradeCheckMs(activeMbps), base) else base
+    }
+
+    /** Скорость активного для расписания: последний замер этого сервера, а его ещё нет — сохранённая. */
+    internal fun activeSpeedForChecks(ts: TunnelSpeed.Speed, key: String?, stored: () -> Double?): Double? =
+        if (key != null && ts.serverKey == key && ts.measuredAtMs > 0L) ts.tunnelDownMbps else stored()
+
     internal fun storedWorthChecking(storedMbps: Double, bestMbps: Double, curMbps: Double, s: AppSettings): Boolean =
         curMbps > 0 && storedMbps > bestMbps && storedMbps >= curMbps * s.keepBestMultiplier
 

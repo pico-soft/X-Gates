@@ -3253,7 +3253,7 @@ private fun OptimizeChecksBlock(settings: AppSettings, onChange: (AppSettings) -
         IntSettingRow("Не перемерять при простое дольше", "мин (0=всегда)", settings.monitorOptimizeIdleSkipSec / 60, dd.monitorOptimizeIdleSkipSec / 60, 0, 240) {
             onChange(settings.copy(monitorOptimizeIdleSkipSec = it * 60))
         }
-        DoubleSettingRow("Не перемерять, если текущий быстрее", "Мбит/с (0=всегда)", settings.monitorOptimizeSkipAboveMbps, dd.monitorOptimizeSkipAboveMbps, 0.0, 1000.0) {
+        DoubleSettingRow("Не перемерять на батарее, если текущий быстрее", "Мбит/с (0=всегда)", settings.monitorOptimizeSkipAboveMbps, dd.monitorOptimizeSkipAboveMbps, 0.0, 1000.0) {
             onChange(settings.copy(monitorOptimizeSkipAboveMbps = it))
         }
     } else {
