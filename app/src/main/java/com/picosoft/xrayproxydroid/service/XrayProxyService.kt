@@ -57,6 +57,11 @@ class XrayProxyService : Service() {
     // одновременных старта («первый рабочий» → «точный топ») могли оставить поднятым НЕ последний сервер (второй
     // видел «уже запущено»), а опоздавший старт — поднять ядро ПОСЛЕ «Стоп». Теперь каждая операция берёт номер в
     // момент ЗАПРОСА и выполняется под одной блокировкой, только если она всё ещё последняя.
+    private class CoreTarget(val config: String, val label: String?, val serverKey: String?)
+
+    // Последний поднятый сервер: к нему возвращаемся, если автоматическое переключение не удалось (решение Elyor 2026-11-02).
+    @Volatile private var lastGood: CoreTarget? = null
+
     private val coreOpLock = Any()
     private val coreOpGen = AtomicLong(0)
 
@@ -328,7 +333,8 @@ class XrayProxyService : Service() {
         coreActive = true
         bypassRetryAfterMs = 0L   // ручной (пере)запуск = действие пользователя → снять троттлинг отката
         val gen = newCoreOp()
-        Thread { runCoreStart(config, label, serverKey, gen) }.start()
+        val auto = intent.getBooleanExtra(EXTRA_AUTO, false)
+        Thread { runCoreStart(config, label, serverKey, gen, auto) }.start()
     }
 
     /**
@@ -391,10 +397,26 @@ class XrayProxyService : Service() {
     }
 
     /** Блокирующий подъём ядра (обход VPN → старт xray → пробы портов). Зовётся из ФОНОВОГО потока. */
-    private fun runCoreStart(config: String, label: String?, serverKey: String?, gen: Long) =
-        runCoreOp(gen, "старт «$label»") { runCoreStartLocked(config, label, serverKey) }
+    private fun runCoreStart(config: String, label: String?, serverKey: String?, gen: Long, auto: Boolean = false) =
+        runCoreOp(gen, "старт «$label»") { runCoreStartLocked(config, label, serverKey, gen, auto) }
 
-    private fun runCoreStartLocked(config: String, label: String?, serverKey: String?) {
+    /**
+     * Автоматическое переключение не удалось: прежнее ядро к этому моменту уже остановлено, а без запущенного сервера нет и
+     * монитора, так что прокси лежал бы до нажатия ▶. Поднимаем прежний сервер, неудавшемуся ставим пинг -1, иначе монитор
+     * выберет его снова. false — возвращать некого: дальше обычная ошибка старта.
+     */
+    private fun restoreAfterFailedSwitch(gen: Long, auto: Boolean, failedLabel: String?, failedKey: String?, why: String?): Boolean {
+        val prev = lastGood
+        if (!canRestore(auto, prev?.serverKey, failedKey)) return false
+        if (gen != coreOpGen.get()) return true   // уже есть более поздний запрос: состояние определит он
+        failedKey?.let { SubscriptionManager.applyPingResults(applicationContext, mapOf(it to -1)) }
+        MonitorLog.event(applicationContext, "monitor", "Сервер не поднялся — возвращаю прежний", "$failedLabel: ${why ?: "ядро не запустилось"}")
+        runCatching { startForeground(NotificationHelper.NOTIFICATION_ID, NotificationHelper.buildNotification(this, prev!!.label)) }
+        runCoreStartLocked(prev!!.config, prev.label, prev.serverKey, gen, auto = false)
+        return true
+    }
+
+    private fun runCoreStartLocked(config: String, label: String?, serverKey: String?, gen: Long, auto: Boolean) {
           // Весь поток старта под перехватом: любая ошибка (в т.ч. сетевого API) → сообщение + стоп, НЕ падение.
           try {
             // Привязку МИМО чужого VPN ставим ДО старта ядра (его первый дозвон уже мимо VPN). На фоне,
@@ -420,16 +442,19 @@ class XrayProxyService : Service() {
                             message = "", socksOk = socks, httpOk = http,   // порты — отдельными флагами (одна строка в UI)
                         )
                         LastServerStore.save(applicationContext, serverKey)   // запомнить для автозапуска
+                        lastGood = CoreTarget(config, label, serverKey)
                         startTrafficPolling()
                         // Монитор поднимается РЕАКТИВНО (combine settings+ProxyState в onCreate) — здесь не зовём.
-                    } else {
+                    } else if (!restoreAfterFailedSwitch(gen, auto, label, serverKey, null)) {
                         ProxyState.update(running = false, label = label, serverKey = serverKey, message = "ядро не запустилось")
                         stopSelfAndForeground()
                     }
                 },
                 onFailure = { e ->
-                    ProxyState.update(running = false, label = label, serverKey = serverKey, message = "ОШИБКА: ${e.message}")
-                    stopSelfAndForeground()
+                    if (!restoreAfterFailedSwitch(gen, auto, label, serverKey, e.message)) {
+                        ProxyState.update(running = false, label = label, serverKey = serverKey, message = "ОШИБКА: ${e.message}")
+                        stopSelfAndForeground()
+                    }
                 }
             )
           } catch (e: Exception) {
@@ -641,14 +666,23 @@ class XrayProxyService : Service() {
         const val EXTRA_CONFIG = "config"
         const val EXTRA_LABEL = "label"
         const val EXTRA_SERVERKEY = "serverKey"
+        const val EXTRA_AUTO = "auto"
 
-        /** Запуск сервиса с готовым конфигом (из видимой Activity — startForegroundService разрешён). */
-        fun start(context: Context, config: String, label: String, serverKey: String) {
+        /** Вернуть прежний сервер можно при автоматическом переключении, если он есть и это не тот же сервер, что не поднялся. */
+        internal fun canRestore(auto: Boolean, prevKey: String?, failedKey: String?): Boolean =
+            auto && prevKey != null && prevKey != failedKey
+
+        /**
+         * Запуск сервиса с готовым конфигом (из видимой Activity — startForegroundService разрешён).
+         * [auto]: сервер выбрал монитор, а не человек; не поднялся — вернёмся к прежнему. Человеку, наоборот, показываем ошибку.
+         */
+        fun start(context: Context, config: String, label: String, serverKey: String, auto: Boolean = false) {
             val intent = Intent(context, XrayProxyService::class.java)
                 .setAction(ACTION_START)
                 .putExtra(EXTRA_CONFIG, config)
                 .putExtra(EXTRA_LABEL, label)
                 .putExtra(EXTRA_SERVERKEY, serverKey)
+                .putExtra(EXTRA_AUTO, auto)
             ContextCompat.startForegroundService(context, intent)
         }
 

@@ -827,7 +827,7 @@ object NetworkMonitor {
                     restartedKeySinceOk = curKey
                     MonitorLog.event(app, "monitor", "Восстановление: перезапуск ядра (запасной)", ServerLabels.display(curSrv))
                     TunnelHealth.setPhase(TunnelHealth.Phase.RECOVERING, now(), "пробую переподключиться к серверу")
-                    XrayProxyService.start(app, cfg, ServerLabels.full(curSrv), curKey)
+                    XrayProxyService.start(app, cfg, ServerLabels.full(curSrv), curKey, auto = true)
                     var waited = 0
                     while (waited < 8000 && (!ProxyState.state.value.running || ProxyState.state.value.serverKey != curKey)) { delay(500); waited += 500 }
                     delay(1500)
@@ -851,7 +851,7 @@ object NetworkMonitor {
         val cfg = runCatching { XrayConfigBuilder.build(c) }.getOrNull()
             ?: run { MonitorLog.event(app, "error", "Кандидат ${ServerLabels.display(c)}: ошибка конфига", ""); return -1.0 to false }
         val from = ServerLabels.displayForKey(app, fromKey)
-        XrayProxyService.start(app, cfg, ServerLabels.full(c), key)
+        XrayProxyService.start(app, cfg, ServerLabels.full(c), key, auto = true)
         MonitorLog.switch(app, from, ServerLabels.display(c), "монитор", "обрыв → подключение по пингу")
         var waited = 0
         while (waited < 8000 && (!ProxyState.state.value.running || ProxyState.state.value.serverKey != key)) { delay(500); waited += 500 }
@@ -996,7 +996,7 @@ object NetworkMonitor {
             val cfg = runCatching { XrayConfigBuilder.build(c) }.getOrNull()
             if (cfg == null) { MonitorLog.event(app, "error", "Кандидат ${ServerLabels.display(c)}: ошибка конфига", ""); return null }
             val from = ServerLabels.displayForKey(app, startKey)
-            XrayProxyService.start(app, cfg, ServerLabels.full(c), SubscriptionManager.serverKey(c))
+            XrayProxyService.start(app, cfg, ServerLabels.full(c), SubscriptionManager.serverKey(c), auto = true)
             MonitorLog.switch(app, from, ServerLabels.display(c), "монитор", "первый живой (проход $round)")
             measureAfterConnect(app, c)
             return SwitchResult.SWITCHED
@@ -1236,7 +1236,7 @@ object NetworkMonitor {
                 val target = all.firstOrNull { key(it) == bestKey } ?: return
                 val cfg = runCatching { XrayConfigBuilder.build(target) }.getOrNull() ?: return
                 val from = ServerLabels.displayForKey(app, curKey)
-                XrayProxyService.start(app, cfg, ServerLabels.full(target), bestKey!!)
+                XrayProxyService.start(app, cfg, ServerLabels.full(target), bestKey!!, auto = true)
                 MonitorLog.switch(app, from, ServerLabels.display(target), "монитор: держать лучший",
                     "было ${fmt(curMbps)} → стало ${fmt(bestMbps)} (×${s.keepBestMultiplier})")
             } else {
@@ -1561,7 +1561,7 @@ object NetworkMonitor {
                     if (curMbps <= 0.0 || !worthLeaving(candMbps, maxOf(curMbps, passiveDown), cur)) continue
                     val cfg = runCatching { XrayConfigBuilder.build(cand) }.getOrNull() ?: continue
                     val from = ServerLabels.displayForKey(app, curKey)
-                    XrayProxyService.start(app, cfg, ServerLabels.full(cand), SubscriptionManager.serverKey(cand))
+                    XrayProxyService.start(app, cfg, ServerLabels.full(cand), SubscriptionManager.serverKey(cand), auto = true)
                     MonitorLog.switch(app, from, ServerLabels.display(cand), "деградация: кандидат приемлемо быстрее",
                         "${fmt(passiveDown)} → ${fmt(candMbps)}")
                     measureAfterConnect(app, cand)

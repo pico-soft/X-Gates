@@ -1,6 +1,7 @@
 package com.picosoft.xrayproxydroid
 
 import com.picosoft.xrayproxydroid.monitor.NetworkMonitor
+import com.picosoft.xrayproxydroid.service.XrayProxyService
 import com.picosoft.xrayproxydroid.settings.AppSettings
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -28,5 +29,18 @@ class LeaveLiveTunnelTest {
         // Страница в браузере: за 6 с скачано 0,7 Мбит/с, а туннель тянет 15. Кандидат на 3 проходит только против потребления.
         assertTrue(NetworkMonitor.worthLeaving(candMbps = 3.0, curMbps = 0.7, s))
         assertFalse(NetworkMonitor.worthLeaving(candMbps = 3.0, curMbps = maxOf(15.0, 0.7), s))
+    }
+
+    @Test fun failed_automatic_switch_returns_to_previous_server() {
+        assertTrue(XrayProxyService.canRestore(auto = true, prevKey = "a", failedKey = "b"))
+    }
+
+    @Test fun server_chosen_by_hand_shows_its_error_instead_of_going_back() {
+        assertFalse(XrayProxyService.canRestore(auto = false, prevKey = "a", failedKey = "b"))
+    }
+
+    @Test fun nothing_to_return_to_stays_an_ordinary_start_error() {
+        assertFalse(XrayProxyService.canRestore(auto = true, prevKey = null, failedKey = "b"))
+        assertFalse(XrayProxyService.canRestore(auto = true, prevKey = "a", failedKey = "a"))   // перезапуск того же сервера
     }
 }
