@@ -166,8 +166,10 @@ object FullTestRunner {
                 // на ОТДЕЛЬНОМ потоке с потолком времени — он может длиться ~2 мин на провалах отдачи, и раньше это
                 // «подвешивало» бар на 0/N без обратной связи. Теперь: явный текст фазы + join не дольше потолка
                 // (замер, если долгий, дойдёт сам в фоне — плашка обновится позже, перебор не ждёт его вечно).
-                val activeServerKey = ProxyState.state.value.serverKey
-                if (ProxyState.state.value.running && activeServerKey != null) {
+                // serverKey назначается раньше, чем поднимется ядро, и остаётся после ошибки старта и на паузе «Только Wi-Fi»:
+                // активен только запущенный. Иначе ниже такой сервер пропускался бы как «уже измеренный» и не мерился вовсе.
+                val activeServerKey = ProxyState.state.value.let { if (it.running) it.serverKey else null }
+                if (activeServerKey != null) {
                     onPhase("Этап 2: замер активного туннеля…")
                     beat()
                     // Промпт 104.B: отдача (↑) — display-only и сток → не делаем. Промпт 108: замер на отдельном
