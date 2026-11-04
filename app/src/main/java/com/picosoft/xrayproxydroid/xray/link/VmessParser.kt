@@ -31,7 +31,7 @@ object VmessParser : LinkParser {
             return null
         }
 
-        val o = try { JSONObject(json) } catch (e: Exception) { return null }
+        val o = try { JSONObject(json) } catch (e: Exception) { return null } catch (e: StackOverflowError) { return null }
 
         val address = o.optString("add").takeIf { it.isNotBlank() } ?: return null
         val id = o.optString("id").takeIf { it.isNotBlank() } ?: return null

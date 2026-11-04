@@ -25,6 +25,7 @@ object JsonConfigParser {
                 else -> listOf(JSONObject(t))
             }
         } catch (e: Exception) { return emptyList() }
+        catch (e: StackOverflowError) { return emptyList() }   // org.json рекурсивен: глубокая вложенность в чужом теле — не повод падать
         val out = ArrayList<ServerProfile>()
         for (cfg in configs) profileFromConfig(cfg)?.let { out.add(it) }
         return out
