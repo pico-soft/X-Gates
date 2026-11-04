@@ -1303,7 +1303,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                 if (down >= 1.0) {
                     // ≥1 Мбит/с → ДЕРЖИМ. Сохранить скорость (ПОЛНЫЙ замер) + подтвердить живость (плашка зелёная).
                     SubscriptionManager.applySpeedResultsTagged(context, mapOf(curKey to (down to true)))
-                    TunnelSpeed.setLive(down, if (up > 0) up else 0.0, System.currentTimeMillis(), curKey)
+                    TunnelSpeed.setProbe(TunnelSpeed.snapshot().directDownMbps, down, if (up > 0) up else 0.0, System.currentTimeMillis(), curKey)
                     TunnelHealth.ok(TunnelHealth.snapshot().ip, System.currentTimeMillis(), curKey)
                     ui {
                         speedResults = speedResults + (curKey to down)
@@ -1648,8 +1648,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                 // ЭТОГО сервера недавно (≤3мин) реально шли байты (живая ↓>0) — это тоже ФАКТ рабочего туннеля, не
                 // реестр (не регрессит Пр.123). Убирает «серую/янтарную плашку при высоких скоростях», когда IP-проба
                 // на миг устарела/сменился сервер, а туннель жив.
-                val liveTunnelFresh = (ts.tunnelDownMbps ?: 0.0) > 0.0 && ts.measuredAtMs > 0 &&
-                    (System.currentTimeMillis() - ts.measuredAtMs) <= HEALTH_FRESH_MS
+                val liveTunnelFresh = freshMbps(ts.tunnelDownMbps, ts.measuredAtMs) > 0.0 || freshMbps(ts.flowDownMbps, ts.flowAtMs) > 0.0
                 val connConfirmed = ipVerified || liveTunnelFresh
                 StatusBox(
                     running = proxy.running, verified = connConfirmed,
@@ -1670,6 +1669,9 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                     tunnelDownMbps = ts.tunnelDownMbps,
                     tunnelUpMbps = ts.tunnelUpMbps,
                     liveMeasuredAtMs = ts.measuredAtMs,
+                    flowDownMbps = ts.flowDownMbps,
+                    flowUpMbps = ts.flowUpMbps,
+                    flowAtMs = ts.flowAtMs,
                     tunnelOk = connConfirmed,
                     hidden = activeHidden, blocked = activeBlocked,
                     problem = proxy.running && (
@@ -2002,6 +2004,9 @@ private fun StatusBox(
     tunnelDownMbps: Double?,
     tunnelUpMbps: Double?,
     liveMeasuredAtMs: Long,
+    flowDownMbps: Double?,
+    flowUpMbps: Double?,
+    flowAtMs: Long,
     tunnelOk: Boolean,
     hidden: Boolean,
     blocked: Boolean,
@@ -2023,9 +2028,9 @@ private fun StatusBox(
     // Мбит/с сейчас») красился по устаревшему низкому замеру (~4.3) → сине-серый/коричневый вместо зелёного —
     // ЧИСЛО и ЦВЕТ спорили (жалоба Elyor). Берём max, чтобы: быстрый живой = зелёный сразу; в простое (живой ↓
     // проседает без нагрузки) сохранённый замер держит правильный цвет, не давая плашке «пляске» в коричневый.
-    val liveFreshForColor = (tunnelDownMbps ?: 0.0) > 0.0 && liveMeasuredAtMs > 0 &&
-        (System.currentTimeMillis() - liveMeasuredAtMs) <= HEALTH_FRESH_MS
-    val colorSpeed = maxOf(if (liveFreshForColor) (tunnelDownMbps ?: 0.0) else 0.0, speedMbps ?: 0.0)
+    // Поток тоже считается: сколько реально прошло, столько туннель точно тянет (важно в экономии: там плановой пробы нет).
+    val flowFresh = freshMbps(flowDownMbps, flowAtMs) > 0.0
+    val colorSpeed = maxOf(freshMbps(tunnelDownMbps, liveMeasuredAtMs), freshMbps(flowDownMbps, flowAtMs), speedMbps ?: 0.0)
     val (bg, fg) = when {
         !running -> Color(0xFF3A3A3A) to Color(0xFFBDBDBD)             // серый — выключен
         problem -> Color(0xFF7F1D1D) to Color(0xFFFFCDD2)             // тёмно-красный — полный обрыв связи
@@ -2076,12 +2081,16 @@ private fun StatusBox(
                 style = MaterialTheme.typography.bodySmall, color = fg)
             // Туннель: ВСЕГДА оба слота ↓/↑ («—» при неудаче/недоступности отдачи — чтобы отдача не «пропадала»).
             // «замеряю…» — только пока ещё ни разу не мерили (measuredAtMs==0).
-            val tunLine = if (liveMeasuredAtMs <= 0L) "замеряю скорость…" else {
+            // Замера ещё нет, а трафик идёт (в экономии плановой пробы нет): скорость не выдумываем, остаётся одна строка потока.
+            val tunLine = if (liveMeasuredAtMs <= 0L) { if (flowFresh) null else "замеряю скорость…" } else {
                 val dnStr = tDn?.let { "↓${r1(it)}" } ?: "↓—"
                 val upStr = tUp?.let { "↑${r1(it)}" } ?: "↑—"
                 "Туннель: $dnStr / $upStr Мбит/с" + (ageStr?.let { " · $it" } ?: "")
             }
-            Text(tunLine, style = MaterialTheme.typography.bodySmall, color = fg)
+            tunLine?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = fg) }
+            // Решение Elyor 2026-11-02: потребление отдельно от скорости. Браузер качает 0.7, а туннель тянет 15.
+            if (flowFresh) Text("Сейчас идёт: ↓${r1(flowDownMbps ?: 0.0)} / ↑${r1(flowUpMbps ?: 0.0)} Мбит/с",
+                style = MaterialTheme.typography.bodySmall, color = fg)
         }
         // Промпт 95.D: связь НЕ подтверждена фактом → ЯВНЫЙ текст (проверяется/восстанавливается/нет серверов).
         // Не бывает «зелёный молча»: если тут есть строка — блок НЕ зелёный (verified=false).
@@ -3021,6 +3030,10 @@ private val monitorTimeFmt = SimpleDateFormat("dd.MM HH:mm:ss", Locale.getDefaul
 // переднем плане refreshIp каждые 12с и мгновенно при возврате (resumeTick) держат зелёным. Реальный обрыв ловит
 // монитор (фаза RECOVERING → красная плашка) независимо от этого окна — «зелёный при мёртвом» не удлиняется.
 private const val HEALTH_FRESH_MS = 330_000L
+
+/** Число, если оно свежее (не старше [HEALTH_FRESH_MS]), иначе 0. */
+private fun freshMbps(mbps: Double?, atMs: Long): Double =
+    if (mbps != null && mbps > 0.0 && atMs > 0L && System.currentTimeMillis() - atMs <= HEALTH_FRESH_MS) mbps else 0.0
 
 // Пр.127.B: оценка байт на ОДНУ проверку живости (внешний IP через SOCKS + keepalive ядра). Для расчётной строки
 // «расход проверок за месяц». КАЛИБРОВАНО замером D (Пр.127): 10 мин простоя = 28.6 КБ на 10 циклов ≈ 2.9 КБ/цикл.

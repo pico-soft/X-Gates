@@ -9,7 +9,7 @@ import kotlinx.coroutines.flow.asStateFlow
  *  • НАПРЯМУЮ — скорость прямого канала (без туннеля), только скачивание ↓.
  *  • В ТУННЕЛЕ — скорость через активный прокси: скачивание ↓ и отдача ↑.
  *
- * ГИБРИД (решение Elyor): когда идёт реальный трафик пользователя — ТУННЕЛЬНУЮ скорость берём БЕСПЛАТНО из
+ * ГИБРИД (решение Elyor): когда идёт реальный трафик пользователя — ПОТОК (см. [setFlow], это не скорость туннеля) берём БЕСПЛАТНО из
  * счётчиков ядра (дельта туннельных байт) → source=LIVE (прямую при этом сохраняем от последней пробы). Когда
  * простой — раз в несколько минут одна активная проба меряет ВСЁ: прямой канал + туннель ↓/↑ → source=PROBE.
  * Заполняется из [NetworkMonitor]. UI берёт ТОЛЬКО отсюда + время замера.
@@ -19,7 +19,6 @@ import kotlinx.coroutines.flow.asStateFlow
 object TunnelSpeed {
     enum class Source {
         NONE,   // ещё не замеряли (только подключились)
-        LIVE,   // туннель из реального трафика пользователя — бесплатно
         PROBE,  // активная проба в простое — стоит трафика
     }
 
@@ -35,6 +34,9 @@ object TunnelSpeed {
         // берёт пинг ОТСЮДА, а не из сессионного pingResults (тот затеняет свежий монитора старым -1 из полного теста).
         val pingMs: Int? = null,
         val pingAtMs: Long = 0L,              // wall-clock живого пинга (для «N сек/мин назад» на плашке)
+        val flowDownMbps: Double? = null,     // СЕЙЧАС ИДЁТ ↓ (потребление, не скорость); null = тишина
+        val flowUpMbps: Double? = null,       // СЕЙЧАС ИДЁТ ↑
+        val flowAtMs: Long = 0L,              // wall-clock потока (0 = тишина)
     )
 
     private val _state = MutableStateFlow(Speed())
@@ -45,7 +47,9 @@ object TunnelSpeed {
         val sameSrv = _state.value.serverKey == serverKey
         val prevPing = if (sameSrv) _state.value.pingMs else null
         val prevPingAt = if (sameSrv) _state.value.pingAtMs else 0L
-        _state.value = Speed(directDownMbps, tunnelDownMbps, tunnelUpMbps, nowMs, Source.PROBE, serverKey, prevPing, prevPingAt)
+        val s = _state.value.takeIf { sameSrv }
+        _state.value = Speed(directDownMbps, tunnelDownMbps, tunnelUpMbps, nowMs, Source.PROBE, serverKey, prevPing, prevPingAt,
+            s?.flowDownMbps, s?.flowUpMbps, s?.flowAtMs ?: 0L)
     }
 
     /** Живой пинг активного (мс; -1 ✗; null неизвестно) + время — монитор ставит каждый цикл. Смена сервера сбрасывает прочие поля. */
@@ -55,12 +59,31 @@ object TunnelSpeed {
                        else Speed(pingMs = pingMs, pingAtMs = nowMs, serverKey = serverKey)
     }
 
-    /** Живой трафик: обновляем только ТУННЕЛЬ для сервера [serverKey], прямую сохраняем от прошлой пробы. */
-    fun setLive(tunnelDownMbps: Double?, tunnelUpMbps: Double?, nowMs: Long, serverKey: String) {
-        _state.value = _state.value.copy(
-            tunnelDownMbps = tunnelDownMbps, tunnelUpMbps = tunnelUpMbps,
-            measuredAtMs = nowMs, source = Source.LIVE, serverKey = serverKey,
+    /**
+     * Что идёт через туннель сейчас. Это потребление, а не скорость: страница в браузере даёт 0.7 при туннеле на 15, поэтому
+     * число замера оно не заменяет (решение Elyor 2026-11-02). Поднимает его, только если реально прошло больше: значит, туннель
+     * это тянет. Замера ещё не было — он остаётся пустым.
+     */
+    fun setFlow(downMbps: Double, upMbps: Double, nowMs: Long, serverKey: String) {
+        val old = _state.value
+        val same = old.serverKey == serverKey
+        val tunDown = if (same) old.tunnelDownMbps else null
+        val tunUp = if (same) old.tunnelUpMbps else null
+        val raiseDown = tunDown != null && downMbps > tunDown
+        val raiseUp = tunUp != null && upMbps > tunUp
+        _state.value = old.copy(
+            tunnelDownMbps = if (raiseDown) downMbps else tunDown,
+            tunnelUpMbps = if (raiseUp) upMbps else tunUp,
+            measuredAtMs = if (raiseDown || raiseUp) nowMs else if (same) old.measuredAtMs else 0L,
+            serverKey = serverKey,
+            flowDownMbps = downMbps, flowUpMbps = upMbps, flowAtMs = nowMs,
         )
+    }
+
+    /** Тишина: «сейчас идёт» убираем, замер остаётся. */
+    fun clearFlow(serverKey: String) {
+        val s = _state.value
+        if (s.serverKey == serverKey && s.flowAtMs > 0L) _state.value = s.copy(flowDownMbps = null, flowUpMbps = null, flowAtMs = 0L)
     }
 
     /** Прокси остановлен / статус сброшен — живой скорости нет. */

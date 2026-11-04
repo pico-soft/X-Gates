@@ -1516,12 +1516,13 @@ object NetworkMonitor {
         if (dtSec > 0 && dRx + dTx > SPEED_PASSIVE_MIN_BYTES) {
             val down = dRx * 8.0 / dtSec / 1_000_000.0
             val up = dTx * 8.0 / dtSec / 1_000_000.0
-            TunnelSpeed.setLive(down, up, now(), curKey)   // прямую скорость сохраняем от прошлой пробы
+            TunnelSpeed.setFlow(down, up, now(), curKey)   // прямую скорость сохраняем от прошлой пробы
             // Пр.127.C: деградация по УЖЕ идущему трафику (бесплатно). Только при СУЩЕСТВЕННОМ трафике — иначе
             // низкая скорость = «мало качали», а не медленный туннель. Тишину (иначе — ниже порога байт) НЕ трактуем.
             if (dRx + dTx >= DEGRADATION_MIN_TRAFFIC_BYTES) maybeStepFromDegraded(app, cur, curKey, down)
             return lastActiveProbeMs
         }
+        TunnelSpeed.clearFlow(curKey)
 
         // (2) Простой: активная проба — только если пришло время И экран включён (иначе не тратим трафик).
         // Пр.125.E: в режиме экономии ПЛАНОВАЯ проба плашки в простое ОТКЛЮЧЕНА — замер активного туннеля только
