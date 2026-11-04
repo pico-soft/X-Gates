@@ -105,6 +105,7 @@ class XrayProxyService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        alive = true
         // Промпт 95: цикл НЕПРЕРЫВНОСТИ СВЯЗИ работает ВСЕГДА, пока прокси активен (НЕ гейтится monitorEnabled —
         // это ОСНОВНОЙ принцип, а не опция; monitorEnabled внутри цикла гейтит лишь вторичную оптимизацию).
         monitorScope.launch {
@@ -624,6 +625,7 @@ class XrayProxyService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        alive = false
         newCoreOp()   // опоздавшие старты/стоп после уничтожения сервиса не выполняются (блокировку на main не ждём)
         stopTrafficPolling()
         coreActive = false
@@ -668,6 +670,10 @@ class XrayProxyService : Service() {
         const val EXTRA_LABEL = "label"
         const val EXTRA_SERVERKEY = "serverKey"
         const val EXTRA_AUTO = "auto"
+
+        /** Сервис создан и ещё не уничтожен (для [AppExit]: завершать процесс можно только после остановки сервиса). */
+        @Volatile var alive = false
+            private set
 
         // Каждая попытка — вложенный вызов на стеке потока старта, а десятки отказов подряд значат, что дело не в серверах.
         private const val MAX_REJECTED_IN_SWITCH = 32

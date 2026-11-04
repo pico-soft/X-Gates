@@ -3,7 +3,9 @@ package com.picosoft.xrayproxydroid
 import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.app.Activity
 import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
@@ -120,6 +122,7 @@ import com.picosoft.xrayproxydroid.service.LastServerStore
 import com.picosoft.xrayproxydroid.service.ProxyState
 import com.picosoft.xrayproxydroid.service.SystemVpnState
 import com.picosoft.xrayproxydroid.service.VpnStatus
+import com.picosoft.xrayproxydroid.service.AppExit
 import com.picosoft.xrayproxydroid.service.XrayProxyService
 import com.picosoft.xrayproxydroid.monitor.EconomyNet
 import com.picosoft.xrayproxydroid.monitor.LogEvent
@@ -1731,6 +1734,7 @@ private fun BootScreen(modifier: Modifier = Modifier, onOpenUpdate: () -> Unit =
                     onCancelFull = { if (refreshingSubs) subRefreshCancel = true else onCancelFull() },
                     onStop = { onStop() },
                 )
+                QuitAppButton("Завершить приложение", removeFromAutostart = false, modifier = Modifier.align(Alignment.End))
                 FullTestProgressBar()
                 if (subStatus.isNotEmpty()) Text(subStatus, style = MaterialTheme.typography.bodySmall)
             }
@@ -2339,6 +2343,36 @@ private fun VpnStatusCard(vpn: VpnStatus, onRetry: () -> Unit) {
  * Промпт 91.D: кнопка «Подписки» убрана — «Самый быстрый» сам обновляет источники перед тестом;
  * ручное обновление осталось во вкладке «Настройки» → секция подписок.
  */
+/**
+ * Завершить приложение (решение Elyor 2026-11-03), с подтверждением: случайное нажатие не должно обрывать связь.
+ * [removeFromAutostart] — ещё и выключить «Запускать при включении телефона».
+ */
+@Composable
+private fun QuitAppButton(label: String, removeFromAutostart: Boolean, modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    var ask by remember { mutableStateOf(false) }
+    TextButton(onClick = { ask = true }, modifier = modifier) { Text(label) }
+    if (ask) AlertDialog(
+        onDismissRequest = { ask = false },
+        title = { Text(label) },
+        text = {
+            Text(
+                if (removeFromAutostart) "Прокси остановится, приложение закроется и не будет запускаться при включении телефона. " +
+                    "Вернуть автозапуск — в «Работа в фоне»."
+                else "Прокси остановится, приложение закроется. Автозапуск при включении телефона останется как есть."
+            )
+        },
+        confirmButton = { TextButton(onClick = { ask = false; context.findActivity()?.let { AppExit.quit(it, removeFromAutostart) } }) { Text("Завершить") } },
+        dismissButton = { TextButton(onClick = { ask = false }) { Text("Отмена") } },
+    )
+}
+
+private fun Context.findActivity(): Activity? {
+    var c: Context? = this
+    while (c != null) { if (c is Activity) return c; c = (c as? ContextWrapper)?.baseContext }
+    return null
+}
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ActionsBar(
@@ -4160,6 +4194,7 @@ private fun BackgroundWorkSection() {
                 else -> TABLE_GRAY
             },
         )
+        QuitAppButton("Убрать из автозагрузки и завершить приложение", removeFromAutostart = true)
         Spacer(Modifier.height(2.dp))
 
         // Индикатор готовности — честно, по факту isIgnoringBatteryOptimizations.
