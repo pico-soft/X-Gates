@@ -33,6 +33,10 @@ object FullTestRunner {
      * Этап 3 сравнивает точное с точным. Быстрый замер в 100 КБ завышает: журнал Elyor 2026-11-02, Windows-версия, оценка ≈53,3,
      * точные других её не превысили, и программа осталась на сервере, у которого проба вскоре не уложилась в 45 с.
      */
+    /** Ход проверки простыми словами (решение Elyor 2026-11-02). Y — потолок просмотра, как у полосы хода. */
+    internal fun progressText(checked: Int, ceiling: Int, working: Int): String =
+        "Проверено серверов $checked из $ceiling, рабочих: $working"
+
     internal fun exactConnectedSpeed(connectedKey: String?, measuredKey: String, full: Double, current: Double): Double =
         if (connectedKey == measuredKey) maxOf(full, 0.0) else current
 
@@ -252,7 +256,7 @@ object FullTestRunner {
                             connect(p)
                         }
                     }
-                    onPhase("Этап 2: замер $measured/${candidates.size} · живых ${goodOnes.size} · пробник ${ServerSpeedTester.activeProbeHost.ifBlank { "…" }} · подключён: ${connected?.let(::label) ?: "—"}")
+                    onPhase(progressText(measured, maxScan, goodOnes.size))
                     emitProgress(measured, maxScan)
                     beat()   // Промпт 103: шаг прогресса — «пульс» для сторожа
                 }

@@ -20,6 +20,10 @@ class FullTestExactTest {
         assertEquals(0.0, FullTestRunner.exactConnectedSpeed("a", "a", -1.0, 50.0), 0.0)
     }
 
+    @Test fun progress_is_written_in_plain_words() {
+        assertEquals("Проверено серверов 12 из 180, рабочих: 3", FullTestRunner.progressText(12, 180, 3))
+    }
+
     @Test fun nothing_connected_yet_changes_nothing() {
         assertEquals(0.0, FullTestRunner.exactConnectedSpeed(null, "a", 30.0, 0.0), 0.0)
     }
