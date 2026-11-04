@@ -8,6 +8,7 @@ import android.net.Network
 import android.os.IBinder
 import android.util.Log
 import androidx.core.content.ContextCompat
+import com.picosoft.xrayproxydroid.AppStores
 import com.picosoft.xrayproxydroid.monitor.MonitorCoordinator
 import com.picosoft.xrayproxydroid.monitor.MonitorLog
 import com.picosoft.xrayproxydroid.monitor.NetworkMonitor
@@ -106,6 +107,7 @@ class XrayProxyService : Service() {
     override fun onCreate() {
         super.onCreate()
         alive = true
+        AppStores.ensureLoaded(applicationContext)   // процесс мог подняться без экрана (перезагрузка, убийство, обновление)
         // Промпт 95: цикл НЕПРЕРЫВНОСТИ СВЯЗИ работает ВСЕГДА, пока прокси активен (НЕ гейтится monitorEnabled —
         // это ОСНОВНОЙ принцип, а не опция; monitorEnabled внутри цикла гейтит лишь вторичную оптимизацию).
         monitorScope.launch {

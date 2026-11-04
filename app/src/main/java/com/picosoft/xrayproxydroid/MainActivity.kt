@@ -208,12 +208,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         intent?.getStringExtra(EXTRA_OPEN)?.let { pendingOpen.value = it }
-        SettingsStore.init(applicationContext)   // загрузить настройки до первого замера
-        BlocklistStore.init(applicationContext)  // стоп-лист (первый запуск → засев дефолтом RU/BY)
-        MonitorLog.init(applicationContext)      // журнал автомониторинга (переживает перезапуск)
-        SubscriptionManager.init(applicationContext)   // миграция старой подписки в мультиподписки (однократно)
-        TrafficTracker.init(applicationContext)  // загрузить дневные корзины трафика
-        UpdateStore.init(applicationContext)     // результат последней проверки обновления + время
+        AppStores.load(applicationContext)       // настройки, стоп-лист, журнал, подписки, трафик, обновление
         // Авто-проверка обновления при холодном старте, но не чаще раза в сутки (несколько КБ через каскад;
         // САМ APK без согласия не качаем). Метаданные — в поток «Тест». Ошибка не мешает запуску.
         // Промпт 80.B: ВСЁ в фоновом потоке — экран открывается сразу (setContent ниже не ждёт). Ждём подъёма
