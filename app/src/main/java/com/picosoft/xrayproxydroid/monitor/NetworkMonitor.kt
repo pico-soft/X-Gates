@@ -1100,6 +1100,22 @@ object NetworkMonitor {
      * Пр.143: «вероятно живой» кандидат для быстрого подбора — свежий пинг ≥0 ИЛИ известная скорость >0.
      * Пинг вслепую по серверам без данных смысла нет: гейтом служит реальный ПИНГ при переборе (Фаза 1 восст.).
      */
+    /** Следующий живой сервер от быстрого к медленному, если ядро не приняло выбранный; те, чей конфиг не собирается, идут в [rejected]. */
+    internal fun nextAliveAfterFailedStart(app: Context, rejected: MutableSet<String>): Pair<com.picosoft.xrayproxydroid.xray.link.ServerProfile, String>? {
+        val s = SettingsStore.current()
+        val bl = BlocklistStore.current()
+        val pool = SubscriptionManager.allServers(app).filter {
+            SubscriptionManager.serverKey(it) !in rejected &&
+                ServerFilter.protocolAllowed(it, s) && !ServerFilter.isBlocked(it, bl) && !ServerFilter.isPaused(it, bl)
+        }
+        for (p in orderFastCandidates(pool) { isUnstableKey(SubscriptionManager.serverKey(it)) }) {
+            val cfg = runCatching { XrayConfigBuilder.build(p) }.getOrNull()
+            if (cfg != null) return p to cfg
+            rejected += SubscriptionManager.serverKey(p)
+        }
+        return null
+    }
+
     internal fun isLikelyAlive(p: com.picosoft.xrayproxydroid.xray.link.ServerProfile): Boolean =
         (p.pingMs ?: -1) >= 0 || (p.speedMbps ?: 0.0) > 0.0
 

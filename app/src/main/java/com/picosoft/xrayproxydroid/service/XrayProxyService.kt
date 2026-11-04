@@ -57,10 +57,8 @@ class XrayProxyService : Service() {
     // одновременных старта («первый рабочий» → «точный топ») могли оставить поднятым НЕ последний сервер (второй
     // видел «уже запущено»), а опоздавший старт — поднять ядро ПОСЛЕ «Стоп». Теперь каждая операция берёт номер в
     // момент ЗАПРОСА и выполняется под одной блокировкой, только если она всё ещё последняя.
-    private class CoreTarget(val config: String, val label: String?, val serverKey: String?)
-
-    // Последний поднятый сервер: к нему возвращаемся, если автоматическое переключение не удалось (решение Elyor 2026-11-02).
-    @Volatile private var lastGood: CoreTarget? = null
+    // Серверы, которых ядро не приняло в этой цепочке автопереключения (только под coreOpLock).
+    private val rejectedInSwitch = HashSet<String>()
 
     private val coreOpLock = Any()
     private val coreOpGen = AtomicLong(0)
@@ -401,18 +399,21 @@ class XrayProxyService : Service() {
         runCoreOp(gen, "старт «$label»") { runCoreStartLocked(config, label, serverKey, gen, auto) }
 
     /**
-     * Автоматическое переключение не удалось: прежнее ядро к этому моменту уже остановлено, а без запущенного сервера нет и
-     * монитора, так что прокси лежал бы до нажатия ▶. Поднимаем прежний сервер, неудавшемуся ставим пинг -1, иначе монитор
-     * выберет его снова. false — возвращать некого: дальше обычная ошибка старта.
+     * Ядро не приняло сервер, выбранный монитором. Прежнее ядро к этому моменту уже остановлено, а без запущенного сервера нет и монитора,
+     * так что прокси лежал бы до нажатия ▶. Решение Elyor 2026-11-02: идём по живым от самого быстрого к самому медленному, а не назад на
+     * прежний: с него обычно потому и ушли. Отказавшему ставим пинг -1. false — идти некуда: дальше обычная ошибка старта.
      */
-    private fun restoreAfterFailedSwitch(gen: Long, auto: Boolean, failedLabel: String?, failedKey: String?, why: String?): Boolean {
-        val prev = lastGood
-        if (!canRestore(auto, prev?.serverKey, failedKey)) return false
+    private fun nextAfterFailedSwitch(gen: Long, auto: Boolean, failedLabel: String?, failedKey: String?, why: String?): Boolean {
+        if (!auto || failedKey == null) return false
         if (gen != coreOpGen.get()) return true   // уже есть более поздний запрос: состояние определит он
-        failedKey?.let { SubscriptionManager.applyPingResults(applicationContext, mapOf(it to -1)) }
-        MonitorLog.event(applicationContext, "monitor", "Сервер не поднялся — возвращаю прежний", "$failedLabel: ${why ?: "ядро не запустилось"}")
-        runCatching { startForeground(NotificationHelper.NOTIFICATION_ID, NotificationHelper.buildNotification(this, prev!!.label)) }
-        runCoreStartLocked(prev!!.config, prev.label, prev.serverKey, gen, auto = false)
+        rejectedInSwitch += failedKey
+        SubscriptionManager.applyPingResults(applicationContext, mapOf(failedKey to -1))
+        val next = if (rejectedInSwitch.size < MAX_REJECTED_IN_SWITCH) NetworkMonitor.nextAliveAfterFailedStart(applicationContext, rejectedInSwitch) else null
+        if (next == null) { rejectedInSwitch.clear(); return false }
+        val label = ServerLabels.full(next.first)
+        MonitorLog.event(applicationContext, "monitor", "Сервер не поднялся — беру следующий по скорости", "$failedLabel: ${why ?: "ядро не запустилось"}")
+        runCatching { startForeground(NotificationHelper.NOTIFICATION_ID, NotificationHelper.buildNotification(this, label)) }
+        runCoreStartLocked(next.second, label, SubscriptionManager.serverKey(next.first), gen, auto = true)
         return true
     }
 
@@ -442,16 +443,16 @@ class XrayProxyService : Service() {
                             message = "", socksOk = socks, httpOk = http,   // порты — отдельными флагами (одна строка в UI)
                         )
                         LastServerStore.save(applicationContext, serverKey)   // запомнить для автозапуска
-                        lastGood = CoreTarget(config, label, serverKey)
+                        rejectedInSwitch.clear()
                         startTrafficPolling()
                         // Монитор поднимается РЕАКТИВНО (combine settings+ProxyState в onCreate) — здесь не зовём.
-                    } else if (!restoreAfterFailedSwitch(gen, auto, label, serverKey, null)) {
+                    } else if (!nextAfterFailedSwitch(gen, auto, label, serverKey, null)) {
                         ProxyState.update(running = false, label = label, serverKey = serverKey, message = "ядро не запустилось")
                         stopSelfAndForeground()
                     }
                 },
                 onFailure = { e ->
-                    if (!restoreAfterFailedSwitch(gen, auto, label, serverKey, e.message)) {
+                    if (!nextAfterFailedSwitch(gen, auto, label, serverKey, e.message)) {
                         ProxyState.update(running = false, label = label, serverKey = serverKey, message = "ОШИБКА: ${e.message}")
                         stopSelfAndForeground()
                     }
@@ -668,13 +669,12 @@ class XrayProxyService : Service() {
         const val EXTRA_SERVERKEY = "serverKey"
         const val EXTRA_AUTO = "auto"
 
-        /** Вернуть прежний сервер можно при автоматическом переключении, если он есть и это не тот же сервер, что не поднялся. */
-        internal fun canRestore(auto: Boolean, prevKey: String?, failedKey: String?): Boolean =
-            auto && prevKey != null && prevKey != failedKey
+        // Каждая попытка — вложенный вызов на стеке потока старта, а десятки отказов подряд значат, что дело не в серверах.
+        private const val MAX_REJECTED_IN_SWITCH = 32
 
         /**
          * Запуск сервиса с готовым конфигом (из видимой Activity — startForegroundService разрешён).
-         * [auto]: сервер выбрал монитор, а не человек; не поднялся — вернёмся к прежнему. Человеку, наоборот, показываем ошибку.
+         * [auto]: сервер выбрал монитор, а не человек; не поднялся — берём следующий живой. Человеку, наоборот, показываем ошибку.
          */
         fun start(context: Context, config: String, label: String, serverKey: String, auto: Boolean = false) {
             val intent = Intent(context, XrayProxyService::class.java)
